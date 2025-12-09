@@ -1529,6 +1529,11 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                     agent_orch = None
                 if agent_mode == 'COMPLETE' and (safeget(activity, 'orchestration', None) == 'none' or safeget(activity, 'orchestration', None) == None):
                     agent_orch = 'crewai-deep-research'
+                    
+                if agent_mode is not None and agent_mode != "none" and agent_mode != "None" and agent_mode != "":
+                    agent_mode = agent_mode.upper()
+                else:
+                    agent_mode = None
 
                 status = "TODO"
                 
