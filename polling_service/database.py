@@ -1339,6 +1339,11 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     if instruction:
                         query += f"[Instruction]\n{instruction}\n\n"
                 
+                if agent_mode is not None and agent_mode != "none" and agent_mode != "None" and agent_mode != "":
+                    agent_mode = agent_mode.upper()
+                else:
+                    agent_mode = None
+                
                 workitem = WorkItem(
                     id=str(uuid.uuid4()),
                     proc_inst_id=process_instance_data['proc_inst_id'],

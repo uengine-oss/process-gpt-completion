@@ -965,15 +965,11 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                             assignees.append(role_binding)
                 
                 agent_mode = None
-                if activity.agentMode is not None:
+                if activity.agentMode is not None and activity.agentMode != "":
                     if activity.agentMode != "none" and activity.agentMode != "None":
-                        mode = activity.agentMode.upper()
-                        agent_mode = None if mode == "A2A" else mode
+                        agent_mode = activity.agentMode.upper()
                 elif activity.agentMode is None and user_id:
                     assignee_info = fetch_assignee_info(user_id)
-                    if assignee_info['type'] == "a2a":
-                        # A2A 모드는 agent_mode에서 제외
-                        agent_mode = None
                 
                 workitem = WorkItem(
                     id=f"{str(uuid.uuid4())}",
@@ -1190,9 +1186,7 @@ def fetch_assignee_info(assignee_id: str) -> Dict[str, str]:
             user_info = fetch_user_info(assignee_id)
             type = "user"
             if user_info.get("is_agent") == True:
-                type = "agent"
-                if user_info.get("url") is not None and user_info.get("url").strip() != "":
-                    type = "a2a"
+                type = user_info.get("agent_type")
             return {
                 "type": type,
                 "id": user_info.get("id", assignee_id),
