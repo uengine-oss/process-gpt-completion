@@ -1407,16 +1407,16 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 workitem_dict["due_date"] = workitem.due_date.isoformat() if workitem.due_date else None
 
                 # browser-automation-agent인 경우 상세한 description 생성
-                if workitem.agent_orch == 'browser-automation-agent':
-                    print(f"[DEBUG] Generating browser automation description for workitem: {workitem.id}")
-                    try:
-                        updated_query = _generate_browser_automation_description(
-                            process_instance_data, workitem.id, tenant_id
-                        )
-                        if updated_query and updated_query != workitem.query:
-                            workitem_dict["query"] = updated_query
-                    except Exception as e:
-                        print(f"[ERROR] Failed to generate browser automation description: {str(e)}")
+                # if workitem.agent_orch == 'browser-automation-agent':
+                #     print(f"[DEBUG] Generating browser automation description for workitem: {workitem.id}")
+                #     try:
+                #         updated_query = _generate_browser_automation_description(
+                #             process_instance_data, workitem.id, tenant_id
+                #         )
+                #         if updated_query and updated_query != workitem.query:
+                #             workitem_dict["query"] = updated_query
+                #     except Exception as e:
+                #         print(f"[ERROR] Failed to generate browser automation description: {str(e)}")
 
                 supabase = supabase_client_var.get()
                 if supabase is None:
