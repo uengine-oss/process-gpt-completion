@@ -965,11 +965,15 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                             assignees.append(role_binding)
                 
                 agent_mode = None
+                
                 if activity.agentMode is not None and activity.agentMode != "":
                     if activity.agentMode != "none" and activity.agentMode != "None":
                         agent_mode = activity.agentMode.upper()
                 elif activity.agentMode is None and user_id:
                     assignee_info = fetch_assignee_info(user_id)
+                
+                if activity.agent is not None and activity.agent != "":
+                    user_id = activity.agent
                 
                 workitem = WorkItem(
                     id=f"{str(uuid.uuid4())}",

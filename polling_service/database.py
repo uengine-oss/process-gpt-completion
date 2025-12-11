@@ -1270,10 +1270,13 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
             workitem.status = activity_data['result']
             workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul')) if activity_data['result'] == 'DONE' else None
             if workitem.user_id == '' or workitem.user_id == None:
-                user_info = fetch_assignee_info(activity_data['nextUserEmail'])
-                if user_info:
-                    workitem.user_id = user_info.get('id')
-                    workitem.username = user_info.get('name')
+                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
+                    workitem.user_id = safeget(activity, 'agent', None)
+                else:
+                    user_info = fetch_assignee_info(activity_data['nextUserEmail'])
+                    if user_info:
+                        workitem.user_id = user_info.get('id')
+                        workitem.username = user_info.get('name')
             if workitem.agent_mode == None:
                 workitem.agent_mode = determine_agent_mode(workitem.user_id, workitem.agent_mode)
                 if workitem.agent_mode == 'COMPLETE' and (workitem.agent_orch == 'none' or workitem.agent_orch == None):
@@ -1327,6 +1330,9 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     agent_orch = 'crewai-deep-research'
                 
                 user_info = fetch_assignee_info(activity_data['nextUserEmail'])
+                user_id = user_info.get('id')
+                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
+                    user_id = safeget(activity, 'agent', None)
                 
                 if workitem and workitem.query:
                     query = workitem.query
@@ -1350,7 +1356,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     proc_def_id=process_result_data['processDefinitionId'].lower(),
                     activity_id=safeget(activity, 'id', ''),
                     activity_name= f"{safeget(activity, 'name', '')}{scope_name}",
-                    user_id=user_info.get('id'),
+                    user_id=user_id,
                     username=user_info.get('name'),
                     status=activity_data['result'],
                     start_date=start_date,
@@ -1553,6 +1559,9 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 activity_type = safeget(activity, 'type', '').lower()
                 if not activity_tool and 'task' in activity_type:
                     activity_tool = 'formHandler:defaultForm'
+                    
+                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
+                    user_id = safeget(activity, 'agent', None)
 
                 workitem = WorkItem(
                     id=f"{str(uuid.uuid4())}",

@@ -42,6 +42,7 @@ class ProcessActivity(BaseModel):
     properties: Optional[str] = None
     duration: Optional[int] = None
     srcTrg: Optional[str] = None
+    agent: Optional[str] = None
     agentMode: Optional[str] = None
     orchestration: Optional[str] = None
     
