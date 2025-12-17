@@ -3537,69 +3537,67 @@ async def handle_workitem(workitem):
             completed_json["completedActivities"] = llm_completed_json.get("completedActivities", [])
             
         if len(completed_json["completedActivities"]) > 0:
-            isDone = completed_json["completedActivities"][0].get("result") == "DONE"
-            if isDone:
-                completed_activities_from_step = (
-                    completed_json.get("completedActivities")
-                    or completed_json.get("completedActivitiesDelta")
-                    or []
-                )
-        
-                organizations = fetch_organization_chart(tenant_id)
-                next_activity_payloads = resolve_next_activity_payloads(
-                    process_definition,
-                    activity_id,
-                    workitem,
-                    sequence_condition_data,
-                )
+            completed_activities_from_step = (
+                completed_json.get("completedActivities")
+                or completed_json.get("completedActivitiesDelta")
+                or []
+            )
+    
+            organizations = fetch_organization_chart(tenant_id)
+            next_activity_payloads = resolve_next_activity_payloads(
+                process_definition,
+                activity_id,
+                workitem,
+                sequence_condition_data,
+            )
 
 
 
-                chain_input_next = {
-                    "activities": process_definition.activities,
-                    "gateways": process_definition_json.get('gateways', []),
-                    "events": process_definition_json.get('events', []),
-                    "subProcesses": process_definition.subProcesses,
-                    "sequences": process_definition.sequences,
-                    "instance_id": process_instance_id,
-                    "activity_id": activity_id,
-                    "process_definition_id": process_definition_id,
-                    "output": output,
-                    "ui_definitions": ui_definitions,
-                    "next_activities": next_near_activities,
-                    "role_bindings": workitem.get('assignees', []),
-                    "organizations": organizations,
-                    "instance_name_pattern": process_definition_json.get("instanceNamePattern") or "",
-                    "today": today,
-                    "previous_outputs": workitem_input_data,
-                    "all_workitem_input_data": all_workitem_input_data,
-                    "user_feedback_message": workitem.get('temp_feedback', ''),
-                    "branch_merged_workitems": merged_workitems_from_step,
-                    "completedActivities": completed_activities_from_step,
-                    "attached_activities": attached_activities,
-                    "sequence_conditions": sequence_condition_data
-                }
-                
-                next_activity_payloads = inject_boundary_events_as_next(
-                    next_activity_payloads,
-                    attached_activities,
-                    process_definition,
-                    process_definition_json.get('events', [])
-                )
-                
-                next_activity_payloads = await check_event_expression(next_activity_payloads, chain_input_next)
+            chain_input_next = {
+                "activities": process_definition.activities,
+                "gateways": process_definition_json.get('gateways', []),
+                "events": process_definition_json.get('events', []),
+                "subProcesses": process_definition.subProcesses,
+                "sequences": process_definition.sequences,
+                "instance_id": process_instance_id,
+                "activity_id": activity_id,
+                "process_definition_id": process_definition_id,
+                "output": output,
+                "ui_definitions": ui_definitions,
+                "next_activities": next_near_activities,
+                "role_bindings": workitem.get('assignees', []),
+                "organizations": organizations,
+                "instance_name_pattern": process_definition_json.get("instanceNamePattern") or "",
+                "today": today,
+                "previous_outputs": workitem_input_data,
+                "all_workitem_input_data": all_workitem_input_data,
+                "user_feedback_message": workitem.get('temp_feedback', ''),
+                "branch_merged_workitems": merged_workitems_from_step,
+                "completedActivities": completed_activities_from_step,
+                "attached_activities": attached_activities,
+                "sequence_conditions": sequence_condition_data
+            }
             
-                next_activity_payloads = await check_subprocess_expression(next_activity_payloads, chain_input_next)
+            next_activity_payloads = inject_boundary_events_as_next(
+                next_activity_payloads,
+                attached_activities,
+                process_definition,
+                process_definition_json.get('events', [])
+            )
+            
+            next_activity_payloads = await check_event_expression(next_activity_payloads, chain_input_next)
+        
+            next_activity_payloads = await check_subprocess_expression(next_activity_payloads, chain_input_next)
 
-                next_activity_payloads = await check_task_status(next_activity_payloads, chain_input_next)
-                
-                next_activity_payloads = await check_role_binding(next_activity_payloads, chain_input_next)
+            next_activity_payloads = await check_task_status(next_activity_payloads, chain_input_next)
+            
+            next_activity_payloads = await check_role_binding(next_activity_payloads, chain_input_next)
 
-                completed_json["nextActivities"] = next_activity_payloads
+            completed_json["nextActivities"] = next_activity_payloads
 
-                execute_next_activity(completed_json, tenant_id)
-                
-                process_output(workitem, tenant_id)
+            execute_next_activity(completed_json, tenant_id)
+            
+            process_output(workitem, tenant_id)
 
     except Exception as e:
         print(f"[ERROR] Error in handle_workitem for workitem {workitem['id']}: {str(e)}")

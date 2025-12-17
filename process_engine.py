@@ -500,12 +500,19 @@ Sequences: {sequences}
 Feedback: {feedback}
 Feedback Result: {feedback_result}
 
+IMPORTANT RULES FOR conditionExamples:
+- The sequenceId must be a sequence where the target is one of the activities (from the Activities list)
+- The source can be a gateway (from the Gateways list) or an activity (from the Activities list)
+- Do NOT use sequences where:
+  * The target is an endEvent
+  * The target is not an activity
+
 Based on the feedback, provide the before and after values for the following modifiable properties:
 - inputData: Data fields that the activity receives as input
 - checkpoints: Verification points that need to be completed
 - description: Description of what the activity does
 - instruction: Instructions for completing the activity
-- conditionExamples: Condition examples of the sequence that is related to the activity
+- conditionExamples: Condition examples of the sequence that connects to an activity (as target). The sequenceId must be from the Sequences list where the target is an activity ID. The source can be a gateway ID or an activity ID.
 
 Output format (must be wrapped in ```json and ``` markers. Do not include any other text):
 {{
@@ -541,7 +548,7 @@ Output format (must be wrapped in ```json and ``` markers. Do not include any ot
             "changed": true/false
         }},
         "conditionExamples": {{
-            "sequenceId": "sequence id",
+            "sequenceId": "sequence id where target is an activity (source can be a gateway or activity, but target must be an activity, NOT endEvent)",
             "before": {{
                 "good_example": [
                     {{
@@ -626,13 +633,20 @@ async def handle_get_feedback_diff(request: Request):
         next_item = process_definition.find_next_item(activity_id)
         if 'Task' not in next_item.type:
             gateways.append(next_item.model_dump())
-            sequences = process_definition.find_sequences(next_item.id, None)
-            sequences = [seq.model_dump() for seq in sequences]
+            # 게이트웨이를 소스로 하는 시퀀스 중에서 액티비티를 타겟으로 하는 시퀀스만 필터링
+            gateway_sequences = process_definition.find_sequences(next_item.id, None)
+            for seq in gateway_sequences:
+                # 타겟이 액티비티인 시퀀스만 포함
+                if process_definition.find_activity_by_id(seq.target):
+                    sequences.append(seq.model_dump())
         else:
             activities.append(next_item.model_dump())
+        # 액티비티를 소스로 하는 시퀀스 중에서도 타겟이 액티비티인 시퀀스 포함
         activity_sequences = process_definition.find_sequences(activity_id, None)
-        if len(activity_sequences) > 0:
-            sequences.extend([seq.model_dump() for seq in activity_sequences])
+        for seq in activity_sequences:
+            # 타겟이 액티비티인 시퀀스만 포함 (종료 이벤트 등은 제외)
+            if process_definition.find_activity_by_id(seq.target):
+                sequences.append(seq.model_dump())
 
         chain_input = {
             "activities": activities,
