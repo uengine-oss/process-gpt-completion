@@ -281,6 +281,44 @@ def fetch_process_definition_latest_version(def_id, tenant_id: Optional[str] = N
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"No process definition latest version found with ID {def_id}: {e}")
 
+
+def update_proc_def_prod_version(def_id: str, prod_version: str, tenant_id: Optional[str] = None):
+    """
+    proc_def 테이블의 prod_version 컬럼을 업데이트합니다.
+    배포 승인 시 해당 버전을 프로덕션 버전으로 설정합니다.
+    
+    Args:
+        def_id (str): 프로세스 정의 ID
+        prod_version (str): 프로덕션 버전으로 설정할 버전 (arcv_id)
+        tenant_id (Optional[str]): 테넌트 ID
+    
+    Returns:
+        bool: 업데이트 성공 여부
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+        
+        subdomain = subdomain_var.get()
+        if not tenant_id:
+            tenant_id = subdomain
+        
+        response = supabase.table('proc_def').update({
+            'prod_version': prod_version
+        }).eq('id', def_id.lower()).eq('tenant_id', tenant_id).execute()
+        
+        if response.data:
+            print(f"[INFO] Updated prod_version for {def_id} to {prod_version}")
+            return True
+        else:
+            print(f"[WARN] No rows updated for proc_def {def_id}")
+            return False
+    except Exception as e:
+        print(f"[ERROR] Failed to update prod_version for {def_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update prod_version for {def_id}: {e}")
+
+
 def fetch_ui_definition(def_id):
     try:
         supabase = supabase_client_var.get()
@@ -1324,7 +1362,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 due_date = start_date + timedelta(days=safeget(activity, 'duration', 0)) if safeget(activity, 'duration', 0) else None
                 agent_mode = determine_agent_mode(activity_data['nextUserEmail'], safeget(activity, 'agentMode', None))
                 agent_orch = safeget(activity, 'orchestration', None)
-                if agent_orch == 'none':
+                if agent_orch is None or agent_orch == 'none' or agent_orch == 'None' or agent_orch == '':
                     agent_orch = None
                 if agent_mode == 'COMPLETE' and (safeget(activity, 'orchestration', None) == 'none' or safeget(activity, 'orchestration', None) == None):
                     agent_orch = 'crewai-deep-research'
@@ -1531,7 +1569,7 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 
                 agent_mode = determine_agent_mode(user_id, safeget(activity, 'agentMode', None))
                 agent_orch = safeget(activity, 'orchestration', None)
-                if agent_orch == 'none':
+                if agent_orch is None or agent_orch == 'none' or agent_orch == 'None' or agent_orch == '':
                     agent_orch = None
                 if agent_mode == 'COMPLETE' and (safeget(activity, 'orchestration', None) == 'none' or safeget(activity, 'orchestration', None) == None):
                     agent_orch = 'crewai-deep-research'
