@@ -1129,6 +1129,7 @@ def upsert_chat_message(chat_room_id: str, data: Any, is_system: bool, tenant_id
                     email=data["email"],
                     image="",
                     content=data["command"],
+                    jsonContent=data.get("jsonData") if "jsonData" in data else None,
                     timeStamp=int(datetime.now(pytz.timezone('Asia/Seoul')).timestamp() * 1000)
                 )
 
