@@ -514,16 +514,11 @@ Runtime Context:
 - sequence_conditions: {sequence_conditions}
 - instance_name_pattern: {instance_name_pattern}
 
-
---- OPTIONAL USER FEEDBACK ---
-- user feedback message: {user_feedback_message}
-
 Instructions:
 1) 기본 완료 조건
 - submitted_output 이 activities 의 checkpoints 만족하는지를 기준으로 결과를 "DONE" 과 "PENDING" 중에서 출력한다.
 - checkpoints 가 없으면 출력 결과를 "DONE" 으로 출력한다.
 - 현재 activity_id를 type="activity" 으로 completedActivities에 추가한다.
-- user feedback message 옵션이 빈 값이 아닌 경우 checkpoints 와 마찬가지로 submitted_output 이 user feedback message 를 만족하는지 확인하여 결과를 출력한다.
 
 2) Instance Name
 - Use instance_name_pattern if provided; otherwise fallback to "processDefinitionId.key" from submitted_output, with total length ≤ 20 characters.
@@ -3519,7 +3514,6 @@ async def handle_workitem(workitem):
             "activity_id": activity_id,
             "user_email": user_email_for_prompt,
             "output": output,
-            "user_feedback_message": workitem.get('temp_feedback', ''),
             "today": today,
             "previous_outputs": workitem_input_data,
             "gateway_condition_data": gateway_condition_data,
@@ -3571,7 +3565,6 @@ async def handle_workitem(workitem):
                 "today": today,
                 "previous_outputs": workitem_input_data,
                 "all_workitem_input_data": all_workitem_input_data,
-                "user_feedback_message": workitem.get('temp_feedback', ''),
                 "branch_merged_workitems": merged_workitems_from_step,
                 "completedActivities": completed_activities_from_step,
                 "attached_activities": attached_activities,

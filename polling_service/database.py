@@ -941,7 +941,6 @@ def upsert_workitem_completed_log(completed_workitems: List[WorkItem], process_r
             raise Exception("Supabase client is not configured for this request")
         
         process_instance_id = None
-        appliedFeedback = False
         if completed_workitems:
             for completed_workitem in completed_workitems:
                 if process_instance_id is None:
@@ -967,13 +966,10 @@ def upsert_workitem_completed_log(completed_workitems: List[WorkItem], process_r
                     "workitemId": completed_workitem.id
                 }
                 upsert_chat_message(completed_workitem.proc_inst_id, message_data, tenant_id)
-                if completed_workitem.temp_feedback and completed_workitem.temp_feedback not in [None, ""]:
-                    appliedFeedback = True
 
             description = {
                 "completedActivities": process_result_data.get("completedActivities", []),
-                "nextActivities": process_result_data.get("nextActivities", []),
-                "appliedFeedback": appliedFeedback
+                "nextActivities": process_result_data.get("nextActivities", [])
             }
             message_json = json.dumps({
                 "role": "system",
