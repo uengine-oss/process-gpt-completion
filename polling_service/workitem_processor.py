@@ -26,7 +26,7 @@ from database import (
     upsert_todo_workitems, upsert_workitem, ProcessInstance,
     fetch_todolist_by_proc_inst_id, execute_rpc, upsert_cancelled_workitem, insert_process_instance,
     fetch_child_instances_by_parent, fetch_organization_chart, fetch_workitems_by_root_proc_inst_id,
-    get_field_value, group_fields_by_form, get_input_data
+    get_field_value, group_fields_by_form, get_input_data, update_proc_def_prod_version
 )
 from process_definition import load_process_definition
 from code_executor import execute_python_code
@@ -3319,6 +3319,144 @@ def inject_boundary_events_as_next(
     except Exception:
         return next_activity_payloads
 
+
+def _handle_deploy_approval(
+    activity_id: str,
+    process_definition: Any,
+    output: Dict[str, Any],
+    all_workitem_input_data: Dict[str, Any],
+    tenant_id: str
+) -> bool:
+    """
+    배포 승인 처리: isDeploy가 true인 activity가 완료되고 승인 상태일 때
+    inputData에서 bpmn-uengine-field를 찾아 해당 프로세스의 prod_version을 업데이트합니다.
+    
+    Args:
+        activity_id: 현재 완료된 activity ID
+        process_definition: 프로세스 정의 객체
+        output: 현재 워크아이템의 출력 데이터
+        all_workitem_input_data: 모든 워크아이템 입력 데이터
+        tenant_id: 테넌트 ID
+    
+    Returns:
+        bool: 배포 처리 성공 여부
+    """
+    try:
+        # 1. activity에서 isDeploy 속성 확인
+        activity = process_definition.find_activity_by_id(activity_id)
+        if not activity:
+            print(f"[DEBUG] _handle_deploy_approval: Activity {activity_id} not found")
+            return False
+        
+        # 디버깅: activity 객체의 속성 확인
+        print(f"[DEBUG] _handle_deploy_approval: Activity found - id={activity.id}, name={activity.name}")
+        print(f"[DEBUG] _handle_deploy_approval: hasattr isDeploy={hasattr(activity, 'isDeploy')}")
+        
+        is_deploy = getattr(activity, 'isDeploy', None)
+        print(f"[DEBUG] _handle_deploy_approval: isDeploy value={is_deploy}, type={type(is_deploy)}")
+        
+        if not is_deploy:
+            print(f"[DEBUG] _handle_deploy_approval: isDeploy is falsy ({is_deploy}), skipping")
+            return False
+        
+        print(f"[INFO] Activity {activity_id} has isDeploy=true, checking approval status...")
+        
+        # 2. output에서 review_result가 approved인지 확인
+        review_result = None
+        
+        # output이 dict인 경우 review_result 찾기
+        if isinstance(output, dict):
+            # 직접 review_result 확인
+            review_result = output.get('review_result')
+            
+            # 중첩된 구조에서 찾기
+            if not review_result:
+                for key, value in output.items():
+                    if isinstance(value, dict):
+                        review_result = value.get('review_result')
+                        if review_result:
+                            break
+        
+        if review_result != 'accept':
+            print(f"[INFO] Review result is '{review_result}', not 'approved'. Skipping deploy.")
+            return False
+        
+        print(f"[INFO] Review result is 'approved', processing deployment...")
+        
+        # 3. inputData에서 bpmn-uengine-field 찾기
+        input_data = getattr(activity, 'inputData', None) or []
+        bpmn_field_path = None
+        
+        for input_item in input_data:
+            if isinstance(input_item, str) and 'bpmn-uengine-field' in input_item:
+                bpmn_field_path = input_item
+                break
+        
+        if not bpmn_field_path:
+            print(f"[WARN] No bpmn-uengine-field found in inputData for activity {activity_id}")
+            return False
+        
+        # 4. all_workitem_input_data에서 해당 필드 값 추출
+        # bpmn_field_path 형식: "form_id.bpmn-uengine-field"
+        parts = bpmn_field_path.split('.')
+        if len(parts) < 2:
+            print(f"[WARN] Invalid bpmn-uengine-field path: {bpmn_field_path}")
+            return False
+        
+        form_id = parts[0]
+        field_name = '.'.join(parts[1:])  # bpmn-uengine-field
+        
+        bpmn_data = None
+        
+        # all_workitem_input_data에서 폼 데이터 찾기
+        if isinstance(all_workitem_input_data, dict):
+            form_data = all_workitem_input_data.get(form_id)
+            if isinstance(form_data, dict):
+                bpmn_data = form_data.get(field_name) or form_data.get('bpmn-uengine-field')
+        
+        if not bpmn_data:
+            print(f"[WARN] No BPMN data found at {bpmn_field_path}")
+            return False
+        
+        # 5. bpmn_data에서 processDefinitionId와 version 추출
+        if isinstance(bpmn_data, str):
+            try:
+                bpmn_data = json.loads(bpmn_data)
+            except json.JSONDecodeError:
+                print(f"[WARN] Failed to parse BPMN data as JSON")
+                return False
+        
+        if not isinstance(bpmn_data, dict):
+            print(f"[WARN] BPMN data is not a dict: {type(bpmn_data)}")
+            return False
+        
+        target_proc_def_id = bpmn_data.get('definition_id')
+        target_version = bpmn_data.get('version')
+        
+        if not target_proc_def_id:
+            print(f"[WARN] No processDefinitionId found in BPMN data")
+            return False
+        
+        if not target_version:
+            print(f"[WARN] No version found in BPMN data, cannot update prod_version")
+            return False
+        
+        # 6. prod_version 업데이트
+        print(f"[INFO] Updating prod_version for {target_proc_def_id} to {target_version}")
+        result = update_proc_def_prod_version(target_proc_def_id, str(target_version), tenant_id)
+        
+        if result:
+            print(f"[INFO] Successfully updated prod_version for {target_proc_def_id} to {target_version}")
+        else:
+            print(f"[WARN] Failed to update prod_version for {target_proc_def_id}")
+        
+        return result
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to handle deploy approval: {str(e)}")
+        return False
+
+
 async def handle_workitem(workitem):
     is_first, is_last = get_workitem_position(workitem)
 
@@ -3587,6 +3725,15 @@ async def handle_workitem(workitem):
             next_activity_payloads = await check_role_binding(next_activity_payloads, chain_input_next)
 
             completed_json["nextActivities"] = next_activity_payloads
+
+            # 배포 승인 처리: isDeploy가 true이고 승인 상태인 경우 prod_version 업데이트
+            _handle_deploy_approval(
+                activity_id,
+                process_definition,
+                output,
+                all_workitem_input_data,
+                tenant_id
+            )
 
             execute_next_activity(completed_json, tenant_id)
             
