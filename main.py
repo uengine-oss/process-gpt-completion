@@ -17,6 +17,8 @@ from database import update_tenant_id
 # notification_polling_task는 FCM 서비스로 분리됨
 from mcp_config_api import add_routes_to_app as add_mcp_routes_to_app
 from agent_chat import add_routes_to_app as add_agent_chat_routes_to_app
+from agent_intervention import add_routes_to_app as add_agent_intervention_routes_to_app
+from chat_to_process import add_routes_to_app as add_chat_to_process_routes_to_app
 
 from dotenv import load_dotenv
 
@@ -79,6 +81,8 @@ add_process_def_search_routes_to_app(app)
 add_process_chat_routes_to_app(app)
 add_mcp_routes_to_app(app)
 add_agent_chat_routes_to_app(app)
+add_agent_intervention_routes_to_app(app)
+add_chat_to_process_routes_to_app(app)
 
 import asyncio
 
