@@ -4,6 +4,8 @@ from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 import os
 import json
+import re
+import asyncio
 from langchain.prompts import PromptTemplate
 from langchain.schema.output_parser import StrOutputParser
 from langchain.schema.runnable import RunnablePassthrough
@@ -27,9 +29,9 @@ if os.getenv("ENV") != "production":
 # LLM 객체 생성
 llm = create_llm(model="gpt-4.1", streaming=False)
 
-# 1단계: 개입 여부 판단 프롬프트
-intervention_decision_prompt = PromptTemplate.from_template(
-    """당신은 채팅방에서 사용자 메시지를 분석하고, 에이전트의 개입이 필요한지 판단하는 AI입니다.
+# 통합 프롬프트: 개입 여부 판단 + 에이전트 선택 (1번의 LLM 호출로 처리)
+intervention_and_selection_prompt = PromptTemplate.from_template(
+    """당신은 채팅방에서 사용자 메시지를 분석하고, 에이전트의 개입이 필요한지 판단하고, 필요하다면 가장 적절한 에이전트를 선택하는 AI입니다.
 **중요: 확실하지 않으면 개입하지 마세요. 보수적으로 판단하세요.**
 
 ## 사용자 메시지:
@@ -74,41 +76,25 @@ intervention_decision_prompt = PromptTemplate.from_template(
 - 사용자가 특정 작업을 요청하고, 에이전트가 그 작업을 수행할 수 있는 경우
 
 ## 응답 형식 (JSON만 반환):
+개입이 필요한 경우:
 {{
-    "should_intervene": true 또는 false,
-    "reason": "개입 여부 판단 이유를 간단히 설명. 개입하는 경우 어떤 에이전트가 왜 필요한지 명확히 설명"
+    "should_intervene": true,
+    "reason": "개입 여부 판단 이유를 간단히 설명",
+    "selected_agent_id": "에이전트 ID 또는 'default'",
+    "confidence": 0.0-1.0 사이의 값,
+    "agent_selection_reason": "에이전트 선택 이유를 간단히 설명"
+}}
+
+개입이 불필요한 경우:
+{{
+    "should_intervene": false,
+    "reason": "개입하지 않는 이유를 간단히 설명",
+    "selected_agent_id": null,
+    "confidence": null,
+    "agent_selection_reason": null
 }}
 
 **중요: 확실하지 않으면 should_intervene을 false로 설정하세요.**
-
-JSON 형식으로만 응답하세요."""
-)
-
-# 2단계: 에이전트 선택 프롬프트
-agent_selection_prompt = PromptTemplate.from_template(
-    """당신은 채팅방에서 사용자 메시지를 분석하고, 가장 적절한 에이전트를 선택하는 AI입니다.
-
-## 사용자 메시지:
-{user_message}
-
-## 최근 대화 히스토리:
-{recent_history}
-
-## 참여 중인 에이전트 목록:
-{agents_info}
-
-## 선택 기준:
-1. 사용자 메시지의 내용과 가장 관련이 높은 에이전트를 선택
-2. 에이전트의 기능과 역할을 고려
-3. 대화 맥락을 고려하여 가장 도움이 되는 에이전트 선택
-4. 명확하게 선택할 수 없으면 "default" 선택
-
-## 응답 형식 (JSON만 반환):
-{{
-    "selected_agent_id": "에이전트 ID 또는 'default'",
-    "confidence": 0.0-1.0 사이의 값,
-    "reason": "에이전트 선택 이유를 간단히 설명"
-}}
 
 JSON 형식으로만 응답하세요."""
 )
@@ -126,16 +112,10 @@ default_llm_prompt = PromptTemplate.from_template(
 사용자의 메시지에 대해 도움이 되는 응답을 제공해주세요. 자연스럽고 친절하게 답변하세요."""
 )
 
-intervention_chain = (
+# 통합 체인: 개입 판단 + 에이전트 선택 (1번의 LLM 호출)
+intervention_and_selection_chain = (
     RunnablePassthrough() |
-    intervention_decision_prompt |
-    llm |
-    StrOutputParser()
-)
-
-agent_selection_chain = (
-    RunnablePassthrough() |
-    agent_selection_prompt |
+    intervention_and_selection_prompt |
     llm |
     StrOutputParser()
 )
@@ -441,12 +421,23 @@ def get_agent_capabilities(agent_type: str, username: str = "") -> str:
     return f"에이전트의 전문 분야에 따른 도움 제공 (타입: {agent_type})"
 
 
-async def check_intervention_needed(
+async def check_intervention_and_select_agent(
     user_message: str,
     chat_room_id: str,
     agents: List[Dict] = None
 ) -> Dict[str, Any]:
-    """1단계: 개입 여부 판단"""
+    """
+    통합 함수: 개입 여부 판단 + 에이전트 선택 (1번의 LLM 호출로 처리)
+    
+    Returns:
+        {
+            "should_intervene": bool,
+            "reason": str,
+            "selected_agent_id": str | None,
+            "confidence": float | None,
+            "agent_selection_reason": str | None
+        }
+    """
     try:
         chat_history = fetch_chat_history(chat_room_id)
         recent_history = format_recent_history(chat_history, limit=5)
@@ -458,7 +449,7 @@ async def check_intervention_needed(
         else:
             agents_info = "참여 중인 에이전트가 없습니다."
         
-        result = await intervention_chain.ainvoke({
+        result = await intervention_and_selection_chain.ainvoke({
             "user_message": user_message,
             "recent_history": recent_history,
             "agents_info": agents_info
@@ -474,60 +465,44 @@ async def check_intervention_needed(
                 json_str = json_str.replace("```", "").strip()
             
             decision = json.loads(json_str)
-            return decision
-        except:
+            
+            # 하위 호환성을 위해 기본값 설정
+            if decision.get("should_intervene", False):
+                # 개입이 필요한 경우
+                return {
+                    "should_intervene": True,
+                    "reason": decision.get("reason", "개입 필요"),
+                    "selected_agent_id": decision.get("selected_agent_id", "default"),
+                    "confidence": decision.get("confidence", 0.0),
+                    "agent_selection_reason": decision.get("agent_selection_reason", "")
+                }
+            else:
+                # 개입이 불필요한 경우
+                return {
+                    "should_intervene": False,
+                    "reason": decision.get("reason", "개입 불필요"),
+                    "selected_agent_id": None,
+                    "confidence": None,
+                    "agent_selection_reason": None
+                }
+        except Exception as e:
+            print(f"JSON 파싱 실패: {str(e)}, 원본 응답: {result[:200]}")
             # JSON 파싱 실패 시 기본값
             return {
                 "should_intervene": False,
-                "reason": "JSON 파싱 실패"
+                "reason": f"JSON 파싱 실패: {str(e)}",
+                "selected_agent_id": None,
+                "confidence": None,
+                "agent_selection_reason": None
             }
     except Exception as e:
-        print(f"Error checking intervention: {str(e)}")
+        print(f"Error checking intervention and selecting agent: {str(e)}")
         return {
             "should_intervene": False,
-            "reason": f"에러 발생: {str(e)}"
-        }
-
-
-async def select_agent(
-    user_message: str,
-    chat_room_id: str,
-    agents: List[Dict]
-) -> Dict[str, Any]:
-    """2단계: 적절한 에이전트 선택"""
-    try:
-        chat_history = fetch_chat_history(chat_room_id)
-        recent_history = format_recent_history(chat_history, limit=10)
-        agents_info = format_agents_info(agents)
-        
-        result = await agent_selection_chain.ainvoke({
-            "user_message": user_message,
-            "recent_history": recent_history,
-            "agents_info": agents_info
-        })
-        
-        # JSON 파싱 시도
-        try:
-            json_str = result.strip()
-            if json_str.startswith("```json"):
-                json_str = json_str.replace("```json", "").replace("```", "").strip()
-            elif json_str.startswith("```"):
-                json_str = json_str.replace("```", "").strip()
-            
-            selection = json.loads(json_str)
-            return selection
-        except:
-            return {
-                "selected_agent_id": "default",
-                "confidence": 0.0,
-                "reason": "JSON 파싱 실패"
-            }
-    except Exception as e:
-        print(f"Error selecting agent: {str(e)}")
-        return {
-            "selected_agent_id": "default",
-            "confidence": 0.0,
-            "reason": f"에러 발생: {str(e)}"
+            "reason": f"에러 발생: {str(e)}",
+            "selected_agent_id": None,
+            "confidence": None,
+            "agent_selection_reason": None
         }
 
 
@@ -557,28 +532,21 @@ async def process_user_message_with_intervention(
     user_id: str
 ) -> Dict[str, Any]:
     """
-    사용자 메시지 처리 및 에이전트 개입 로직
+    사용자 메시지 처리 및 에이전트 개입 로직 (비동기 처리)
+    
+    메시지를 저장한 후 즉시 반환하고, 개입 프로세스는 백그라운드에서 비동기로 처리합니다.
+    각 메시지는 UUID로 추적되어 독립적으로 처리됩니다.
     
     Returns:
         {
             "message_saved": bool,
+            "message_uuid": str,
             "intervention": {
-                "should_intervene": bool,
-                "selected_agent_id": str | None,
-                "agent_response": Dict | None,
-                "reason": str,
-                "debug_info": Dict (개발 모드에서만)
+                "status": "checking"  # 백그라운드에서 처리 중
             }
         }
     """
     try:
-        # 디버그 정보 수집
-        debug_info = {
-            "user_message": text,
-            "chat_room_id": chat_room_id,
-            "user_id": user_id
-        }
-        
         # 1. 메시지 저장 (개입 정보는 나중에 업데이트)
         # 개입 상태를 "checking"으로 설정하여 웹단에서 로딩 상태를 표시할 수 있도록 함
         message_data = {
@@ -593,7 +561,7 @@ async def process_user_message_with_intervention(
         }
         upsert_chat_message(chat_room_id, message_data, is_system=False, is_agent=False)
         
-        # 저장된 메시지의 UUID 조회 (로그 저장을 위해)
+        # 저장된 메시지의 UUID 조회
         message_uuid = None
         try:
             from database import supabase_client_var, subdomain_var
@@ -612,6 +580,51 @@ async def process_user_message_with_intervention(
                         message_uuid = latest.get('uuid')
         except Exception as e:
             print(f" 메시지 UUID 조회 실패 (무시): {str(e)}")
+        
+        # 2. 백그라운드에서 개입 프로세스 실행 (비동기)
+        if message_uuid:
+            # 각 메시지의 개입 프로세스를 독립적으로 실행
+            asyncio.create_task(process_intervention_async(
+                message_uuid=message_uuid,
+                text=text,
+                chat_room_id=chat_room_id,
+                user_id=user_id
+            ))
+        
+        # 3. 즉시 반환 (개입 프로세스는 백그라운드에서 처리)
+        return {
+            "message_saved": True,
+            "message_uuid": message_uuid,
+            "intervention": {
+                "status": "checking"
+            }
+        }
+        
+    except Exception as e:
+        print(f"\n 에러 발생: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def process_intervention_async(
+    message_uuid: str,
+    text: str,
+    chat_room_id: str,
+    user_id: str
+) -> None:
+    """
+    개입 프로세스를 비동기로 처리하는 함수
+    각 메시지의 UUID로 상태를 추적하여 독립적으로 처리합니다.
+    """
+    try:
+        # 디버그 정보 수집
+        debug_info = {
+            "user_message": text,
+            "chat_room_id": chat_room_id,
+            "user_id": user_id,
+            "message_uuid": message_uuid
+        }
         
         # 2. 채팅방 참여자 조회
         participants = get_chat_room_participants(chat_room_id)
@@ -636,15 +649,28 @@ async def process_user_message_with_intervention(
         }
         
         # 초기 로그 생성 (checking 상태)
-        if message_uuid:
-            save_intervention_log(
-                message_uuid=message_uuid,
-                chat_room_id=chat_room_id,
-                user_id=user_id,
-                user_message=text,
-                context_info=context_info,
-                status="checking"
-            )
+        save_intervention_log(
+            message_uuid=message_uuid,
+            chat_room_id=chat_room_id,
+            user_id=user_id,
+            user_message=text,
+            context_info=context_info,
+            status="checking"
+        )
+        
+        # 디버그 로그 출력
+        print(f"\n{'='*60}")
+        print(f" 에이전트 개입 디버그 정보 (비동기 처리)")
+        print(f"{'='*60}")
+        print(f" 메시지 UUID: {message_uuid}")
+        print(f" 사용자 메시지: {text}")
+        print(f" 채팅방 ID: {chat_room_id}")
+        print(f" 사용자 ID: {user_id}")
+        print(f" 참여자 - 사용자: {len(users)}명, 에이전트: {len(agents)}명")
+        if agents:
+            print(f" 참여 에이전트:")
+            for agent in agents:
+                print(f"   - {agent.get('username', 'Unknown')} ({agent.get('id')}) - 타입: {agent.get('agent_type', 'unknown')}")
         
         # 디버그 로그 출력
         print(f"\n{'='*60}")
@@ -659,56 +685,45 @@ async def process_user_message_with_intervention(
             for agent in agents:
                 print(f"   - {agent.get('username', 'Unknown')} ({agent.get('id')}) - 타입: {agent.get('agent_type', 'unknown')}")
         
-        # 3. 개입 활성화 조건 확인
-        condition_met = should_activate_intervention(users, agents)
-        debug_info["condition_met"] = condition_met
-        print(f" 개입 활성화 조건: {'충족' if condition_met else '미충족'}")
+        # 3. 멘션 확인 (멘션이 있으면 개입 여부 판단을 건너뜀)
+        mention_pattern = r'@(\w+)'
+        mentions = re.findall(mention_pattern, text)
+        mentioned_agent = None
+        if mentions and agents:
+            # 멘션된 이름이 참여 에이전트 중 하나인지 확인
+            for mention in mentions:
+                for agent in agents:
+                    agent_name = agent.get('username', '')
+                    if mention.lower() in agent_name.lower() or agent_name.lower() in mention.lower():
+                        mentioned_agent = agent
+                        break
+                if mentioned_agent:
+                    break
         
-        if not condition_met:
-            return {
-                "message_saved": True,
-                "intervention": {
-                    "should_intervene": False,
-                    "reason": f"개입 활성화 조건 미충족 (사용자: {len(users)}명, 에이전트: {len(agents)}명)",
-                    "debug_info": debug_info
-                }
+        if mentioned_agent:
+            print(f" 멘션 감지: {mentioned_agent.get('username')} 에이전트가 멘션되었습니다.")
+            print(f" 멘션이 있으므로 개입 여부 판단을 건너뜁니다.")
+            debug_info["mentioned_agent"] = {
+                "id": mentioned_agent.get('id'),
+                "name": mentioned_agent.get('username')
             }
-        
-        # 4. 개입 여부 판단 (에이전트 정보 포함)
-        print(f" 1단계: 개입 여부 판단 중...")
-        if agents:
-            print(f"   참여 에이전트 정보를 포함하여 판단합니다.")
-        intervention_decision = await check_intervention_needed(text, chat_room_id, agents)
-        debug_info["intervention_decision"] = intervention_decision
-        print(f"   결과: {'개입 필요' if intervention_decision.get('should_intervene') else '개입 불필요'}")
-        print(f"   이유: {intervention_decision.get('reason', '없음')}")
-        
-        if not intervention_decision.get("should_intervene", False):
-            # 개입하지 않은 경우에도 정보 저장
+            # 멘션이 있으면 개입 여부 판단을 하지 않고 직접 해당 에이전트에게 메시지를 보냄
+            # 상태를 not_intervening으로 업데이트하고 종료
             try:
                 from database import supabase_client_var, subdomain_var
                 supabase = supabase_client_var.get()
                 subdomain = subdomain_var.get()
                 
-                # 정렬 없이 모든 메시지를 가져온 후 Python에서 정렬
-                response = supabase.table("chats").select("*").eq('id', chat_room_id).eq('tenant_id', subdomain).execute()
-                
+                response = supabase.table("chats").select("*").eq('uuid', message_uuid).eq('tenant_id', subdomain).execute()
                 if response.data and len(response.data) > 0:
-                    # messages.timeStamp를 기준으로 정렬 (timeStamp가 있는 경우)
-                    sorted_messages = sorted(
-                        response.data,
-                        key=lambda x: x.get('messages', {}).get('timeStamp', 0) if isinstance(x.get('messages'), dict) else 0,
-                        reverse=True
-                    )
-                    latest_message = sorted_messages[0] if sorted_messages else response.data[0]
-                    if latest_message.get('messages') and latest_message['messages'].get('email') == user_id:
+                    message = response.data[0]
+                    if message.get('messages'):
                         intervention_info = {
                             "status": "not_intervening",
                             "should_intervene": False,
-                            "reason": intervention_decision.get("reason", "개입 불필요")
+                            "reason": f"에이전트 멘션 감지: {mentioned_agent.get('username')} 에이전트에게 직접 메시지 전송"
                         }
-                        
-                        existing_json = latest_message.get('messages', {}).get('jsonContent')
+                        existing_json = message.get('messages', {}).get('jsonContent')
                         if existing_json and isinstance(existing_json, dict):
                             existing_json['intervention'] = intervention_info
                         else:
@@ -716,72 +731,178 @@ async def process_user_message_with_intervention(
                         
                         supabase.table("chats").update({
                             "messages": {
-                                **latest_message['messages'],
+                                **message['messages'],
                                 "jsonContent": existing_json
                             }
-                        }).eq('uuid', latest_message['uuid']).execute()
+                        }).eq('uuid', message_uuid).execute()
                         
-                        # 개입 로그 업데이트 (개입하지 않음)
-                        if message_uuid:
-                            save_intervention_log(
-                                message_uuid=message_uuid,
-                                chat_room_id=chat_room_id,
-                                user_id=user_id,
-                                user_message=text,
-                                context_info=context_info,
-                                should_intervene=False,
-                                intervention_reason=intervention_decision.get("reason", "개입 불필요"),
-                                status="not_intervening"
-                            )
+                        save_intervention_log(
+                            message_uuid=message_uuid,
+                            chat_room_id=chat_room_id,
+                            user_id=user_id,
+                            user_message=text,
+                            context_info=context_info,
+                            should_intervene=False,
+                            intervention_reason=f"에이전트 멘션 감지: {mentioned_agent.get('username')}",
+                            status="not_intervening"
+                        )
+            except Exception as e:
+                print(f" 멘션 처리 중 업데이트 실패 (무시): {str(e)}")
+            
+            print(f" 멘션 처리 완료 (메시지 UUID: {message_uuid})")
+            print(f"{'='*60}\n")
+            return
+        
+        # 4. 개입 활성화 조건 확인
+        condition_met = should_activate_intervention(users, agents)
+        debug_info["condition_met"] = condition_met
+        print(f" 개입 활성화 조건: {'충족' if condition_met else '미충족'}")
+        
+        if not condition_met:
+            # 상태를 not_intervening으로 업데이트하고 종료
+            try:
+                from database import supabase_client_var, subdomain_var
+                supabase = supabase_client_var.get()
+                subdomain = subdomain_var.get()
+                
+                response = supabase.table("chats").select("*").eq('uuid', message_uuid).eq('tenant_id', subdomain).execute()
+                if response.data and len(response.data) > 0:
+                    message = response.data[0]
+                    if message.get('messages'):
+                        intervention_info = {
+                            "status": "not_intervening",
+                            "should_intervene": False,
+                            "reason": f"개입 활성화 조건 미충족 (사용자: {len(users)}명, 에이전트: {len(agents)}명)"
+                        }
+                        existing_json = message.get('messages', {}).get('jsonContent')
+                        if existing_json and isinstance(existing_json, dict):
+                            existing_json['intervention'] = intervention_info
+                        else:
+                            existing_json = {"intervention": intervention_info}
+                        
+                        supabase.table("chats").update({
+                            "messages": {
+                                **message['messages'],
+                                "jsonContent": existing_json
+                            }
+                        }).eq('uuid', message_uuid).execute()
+                        
+                        save_intervention_log(
+                            message_uuid=message_uuid,
+                            chat_room_id=chat_room_id,
+                            user_id=user_id,
+                            user_message=text,
+                            context_info=context_info,
+                            should_intervene=False,
+                            intervention_reason=f"개입 활성화 조건 미충족 (사용자: {len(users)}명, 에이전트: {len(agents)}명)",
+                            status="not_intervening"
+                        )
             except Exception as e:
                 print(f" 개입 정보 업데이트 실패 (무시): {str(e)}")
             
-            print(f" 개입하지 않음")
+            print(f" 개입하지 않음 (조건 미충족, 메시지 UUID: {message_uuid})")
             print(f"{'='*60}\n")
-            return {
-                "message_saved": True,
-                "intervention": {
-                    "should_intervene": False,
-                    "reason": intervention_decision.get("reason", "개입 불필요"),
-                    "debug_info": debug_info
-                }
-            }
+            return
         
-        # 5. 에이전트 선택
-        print(f" 2단계: 에이전트 선택 중...")
-        agent_selection = await select_agent(text, chat_room_id, agents)
-        selected_agent_id = agent_selection.get("selected_agent_id", "default")
-        debug_info["agent_selection"] = agent_selection
-        print(f"   선택된 에이전트: {selected_agent_id}")
-        print(f"   신뢰도: {agent_selection.get('confidence', 0.0):.2f}")
-        print(f"   이유: {agent_selection.get('reason', '없음')}")
+        # 5. 개입 여부 판단 + 에이전트 선택 (통합: 1번의 LLM 호출)
+        print(f" 통합 단계: 개입 여부 판단 및 에이전트 선택 중...")
+        if agents:
+            print(f"   참여 에이전트 정보를 포함하여 판단합니다.")
+        intervention_result = await check_intervention_and_select_agent(text, chat_room_id, agents)
+        debug_info["intervention_decision"] = {
+            "should_intervene": intervention_result.get("should_intervene", False),
+            "reason": intervention_result.get("reason", "")
+        }
+        debug_info["agent_selection"] = {
+            "selected_agent_id": intervention_result.get("selected_agent_id"),
+            "confidence": intervention_result.get("confidence"),
+            "reason": intervention_result.get("agent_selection_reason", "")
+        }
+        
+        should_intervene = intervention_result.get("should_intervene", False)
+        selected_agent_id = intervention_result.get("selected_agent_id", "default") if should_intervene else None
+        agent_selection_reason = intervention_result.get("agent_selection_reason", "")
+        confidence = intervention_result.get("confidence", 0.0) if should_intervene else None
+        
+        print(f"   결과: {'개입 필요' if should_intervene else '개입 불필요'}")
+        print(f"   이유: {intervention_result.get('reason', '없음')}")
+        if should_intervene:
+            print(f"   선택된 에이전트: {selected_agent_id}")
+            confidence_value = confidence if confidence is not None else 0.0
+            print(f"   신뢰도: {confidence_value:.2f}")
+            print(f"   선택 이유: {agent_selection_reason}")
+        
+        if not should_intervene:
+            # 개입하지 않은 경우에도 정보 저장 (UUID로 직접 업데이트)
+            try:
+                from database import supabase_client_var, subdomain_var
+                supabase = supabase_client_var.get()
+                subdomain = subdomain_var.get()
+                
+                # UUID로 메시지 조회
+                response = supabase.table("chats").select("*").eq('uuid', message_uuid).eq('tenant_id', subdomain).execute()
+                
+                if response.data and len(response.data) > 0:
+                    message = response.data[0]
+                    if message.get('messages'):
+                        intervention_info = {
+                            "status": "not_intervening",
+                            "should_intervene": False,
+                            "reason": intervention_result.get("reason", "개입 불필요")
+                        }
+                        
+                        existing_json = message.get('messages', {}).get('jsonContent')
+                        if existing_json and isinstance(existing_json, dict):
+                            existing_json['intervention'] = intervention_info
+                        else:
+                            existing_json = {"intervention": intervention_info}
+                        
+                        supabase.table("chats").update({
+                            "messages": {
+                                **message['messages'],
+                                "jsonContent": existing_json
+                            }
+                        }).eq('uuid', message_uuid).execute()
+                        
+                        # 개입 로그 업데이트 (개입하지 않음)
+                        save_intervention_log(
+                            message_uuid=message_uuid,
+                            chat_room_id=chat_room_id,
+                            user_id=user_id,
+                            user_message=text,
+                            context_info=context_info,
+                            should_intervene=False,
+                            intervention_reason=intervention_result.get("reason", "개입 불필요"),
+                            status="not_intervening"
+                        )
+            except Exception as e:
+                print(f" 개입 정보 업데이트 실패 (무시): {str(e)}")
+            
+            print(f" 개입하지 않음 (메시지 UUID: {message_uuid})")
+            print(f"{'='*60}\n")
+            return
         
         # 개입이 결정되었으므로 사용자 메시지의 jsonContent 업데이트 (should_intervene: true)
+        # UUID로 직접 업데이트하여 해당 메시지에만 반영
         try:
             from database import supabase_client_var, subdomain_var
             supabase = supabase_client_var.get()
             subdomain = subdomain_var.get()
             
-            # 정렬 없이 모든 메시지를 가져온 후 Python에서 정렬
-            response = supabase.table("chats").select("*").eq('id', chat_room_id).eq('tenant_id', subdomain).execute()
+            # UUID로 메시지 조회
+            response = supabase.table("chats").select("*").eq('uuid', message_uuid).eq('tenant_id', subdomain).execute()
             
             if response.data and len(response.data) > 0:
-                # messages.timeStamp를 기준으로 정렬
-                sorted_messages = sorted(
-                    response.data,
-                    key=lambda x: x.get('messages', {}).get('timeStamp', 0) if isinstance(x.get('messages'), dict) else 0,
-                    reverse=True
-                )
-                latest_message = sorted_messages[0] if sorted_messages else response.data[0]
-                if latest_message.get('messages') and latest_message['messages'].get('email') == user_id:
+                message = response.data[0]
+                if message.get('messages'):
                     intervention_info = {
                         "status": "intervening",  # 에이전트 응답 대기 중
                         "should_intervene": True,  # 개입 결정됨
-                        "reason": intervention_decision.get("reason", "개입 필요"),
+                        "reason": intervention_result.get("reason", "개입 필요"),
                         "selected_agent_id": selected_agent_id if selected_agent_id != "default" else None
                     }
                     
-                    existing_json = latest_message.get('messages', {}).get('jsonContent')
+                    existing_json = message.get('messages', {}).get('jsonContent')
                     if existing_json and isinstance(existing_json, dict):
                         existing_json['intervention'] = intervention_info
                     else:
@@ -789,13 +910,13 @@ async def process_user_message_with_intervention(
                     
                     update_result = supabase.table("chats").update({
                         "messages": {
-                            **latest_message['messages'],
+                            **message['messages'],
                             "jsonContent": existing_json
                         }
-                    }).eq('uuid', latest_message['uuid']).execute()
+                    }).eq('uuid', message_uuid).execute()
                     
                     print(f"✅ 사용자 메시지 업데이트 완료:")
-                    print(f"   - UUID: {latest_message['uuid']}")
+                    print(f"   - UUID: {message_uuid}")
                     print(f"   - should_intervene: True")
                     print(f"   - status: intervening")
                     print(f"   - selected_agent_id: {selected_agent_id}")
@@ -815,11 +936,11 @@ async def process_user_message_with_intervention(
                 user_message=text,
                 context_info=context_info,
                 should_intervene=True,
-                intervention_reason=intervention_decision.get("reason", ""),
+                intervention_reason=intervention_result.get("reason", ""),
                 selected_agent_id=selected_agent_id if selected_agent_id != "default" else None,
                 selected_agent_name=agent_name,
-                agent_selection_reason=agent_selection.get("reason", ""),
-                agent_selection_confidence=agent_selection.get("confidence"),
+                agent_selection_reason=agent_selection_reason,
+                agent_selection_confidence=confidence,
                 status="intervening"
             )
         
@@ -846,62 +967,65 @@ async def process_user_message_with_intervention(
                 selected_agent = next((a for a in agents if a.get("id") == selected_agent_id), None)
                 agent_name = selected_agent.get("username", "에이전트") if selected_agent else "에이전트"
                 
+                # 에이전트 응답에 사용자 메시지 UUID 포함 (프론트엔드에서 연결하기 위해)
+                if isinstance(agent_response_data, dict):
+                    agent_json_data = agent_response_data.copy()
+                else:
+                    agent_json_data = {}
+                
+                agent_json_data["user_message_uuid"] = message_uuid
+                
+                print(f"📝 에이전트 응답 저장:")
+                print(f"   - 사용자 메시지 UUID: {message_uuid}")
+                print(f"   - 에이전트 이름: {agent_name}")
+                print(f"   - jsonData에 포함된 user_message_uuid: {agent_json_data.get('user_message_uuid')}")
+                
                 agent_message_data = {
                     "name": agent_name,
-                    "content": agent_response_data.get("content", ""),
-                    "html": agent_response_data.get("html_content"),
-                    "jsonData": agent_response_data
+                    "content": agent_response_data.get("content", "") if isinstance(agent_response_data, dict) else "",
+                    "html": agent_response_data.get("html_content") if isinstance(agent_response_data, dict) else None,
+                    "jsonData": agent_json_data
                 }
                 upsert_chat_message(chat_room_id, agent_message_data, is_system=False, is_agent=True)
                 
-                # 사용자 메시지의 개입 상태를 "completed"로 업데이트
+                # 사용자 메시지의 개입 상태를 "completed"로 업데이트 (UUID로 직접 업데이트)
                 try:
                     from database import supabase_client_var, subdomain_var
                     supabase = supabase_client_var.get()
                     subdomain = subdomain_var.get()
                     
-                    # 정렬 없이 모든 메시지를 가져온 후 Python에서 정렬
-                    response = supabase.table("chats").select("*").eq('id', chat_room_id).eq('tenant_id', subdomain).execute()
-                    if response.data and len(response.data) >= 2:
-                        # messages.timeStamp를 기준으로 정렬
-                        sorted_messages = sorted(
-                            response.data,
-                            key=lambda x: x.get('messages', {}).get('timeStamp', 0) if isinstance(x.get('messages'), dict) else 0,
-                            reverse=True
-                        )
-                        # 두 번째 메시지가 사용자 메시지 (첫 번째는 에이전트 응답)
-                        user_message = sorted_messages[1] if len(sorted_messages) >= 2 else None
-                        if not user_message:
-                            return
-                        if user_message.get('messages') and user_message['messages'].get('email') == user_id:
-                            existing_json = user_message.get('messages', {}).get('jsonContent')
+                    # UUID로 메시지 조회
+                    response = supabase.table("chats").select("*").eq('uuid', message_uuid).eq('tenant_id', subdomain).execute()
+                    if response.data and len(response.data) > 0:
+                        message = response.data[0]
+                        if message.get('messages'):
+                            existing_json = message.get('messages', {}).get('jsonContent')
                             if existing_json and isinstance(existing_json, dict) and existing_json.get('intervention'):
                                 existing_json['intervention']['status'] = 'completed'
                                 supabase.table("chats").update({
                                     "messages": {
-                                        **user_message['messages'],
+                                        **message['messages'],
                                         "jsonContent": existing_json
                                     }
-                                }).eq('uuid', user_message['uuid']).execute()
+                                }).eq('uuid', message_uuid).execute()
                                 
                                 # 개입 로그 업데이트 (에이전트 응답 완료)
-                                if message_uuid:
-                                    save_intervention_log(
-                                        message_uuid=message_uuid,
-                                        chat_room_id=chat_room_id,
-                                        user_id=user_id,
-                                        user_message=text,
-                                        context_info=context_info,
-                                        should_intervene=True,
-                                        intervention_reason=intervention_decision.get("reason", ""),
-                                        selected_agent_id=selected_agent_id,
-                                        selected_agent_name=agent_name,
-                                        agent_selection_reason=agent_selection.get("reason", ""),
-                                        agent_selection_confidence=agent_selection.get("confidence"),
-                                        agent_response_content=agent_response_data.get("content", ""),
-                                        agent_response_type=agent_response_data.get("type", "response"),
-                                        status="completed"
-                                    )
+                                save_intervention_log(
+                                    message_uuid=message_uuid,
+                                    chat_room_id=chat_room_id,
+                                    user_id=user_id,
+                                    user_message=text,
+                                    context_info=context_info,
+                                    should_intervene=True,
+                                    intervention_reason=intervention_result.get("reason", ""),
+                                    selected_agent_id=selected_agent_id,
+                                    selected_agent_name=agent_name,
+                                    agent_selection_reason=agent_selection_reason,
+                                    agent_selection_confidence=confidence,
+                                    agent_response_content=agent_response_data.get("content", ""),
+                                    agent_response_type=agent_response_data.get("type", "response"),
+                                    status="completed"
+                                )
                 except Exception as e:
                     print(f" 개입 상태 업데이트 실패 (무시): {str(e)}")
                 
@@ -917,60 +1041,54 @@ async def process_user_message_with_intervention(
                 print(f" 기본 LLM으로 폴백")
                 # 에이전트 호출 실패 시 기본 LLM 사용
                 default_response = await get_default_llm_response(text, chat_room_id)
+                # 에이전트 응답에 사용자 메시지 UUID 포함 (프론트엔드에서 연결하기 위해)
                 agent_message_data = {
                     "name": "AI 어시스턴트",
-                    "content": default_response
+                    "content": default_response,
+                    "jsonData": {
+                        "user_message_uuid": message_uuid
+                    }
                 }
                 upsert_chat_message(chat_room_id, agent_message_data, is_system=False, is_agent=True)
                 
-                # 사용자 메시지의 개입 상태를 "completed"로 업데이트
+                # 사용자 메시지의 개입 상태를 "completed"로 업데이트 (UUID로 직접 업데이트)
                 try:
                     from database import supabase_client_var, subdomain_var
                     supabase = supabase_client_var.get()
                     subdomain = subdomain_var.get()
                     
-                    # 정렬 없이 모든 메시지를 가져온 후 Python에서 정렬
-                    response = supabase.table("chats").select("*").eq('id', chat_room_id).eq('tenant_id', subdomain).execute()
-                    if response.data and len(response.data) >= 2:
-                        # messages.timeStamp를 기준으로 정렬
-                        sorted_messages = sorted(
-                            response.data,
-                            key=lambda x: x.get('messages', {}).get('timeStamp', 0) if isinstance(x.get('messages'), dict) else 0,
-                            reverse=True
-                        )
-                        # 두 번째 메시지가 사용자 메시지 (첫 번째는 에이전트 응답)
-                        user_message = sorted_messages[1] if len(sorted_messages) >= 2 else None
-                        if not user_message:
-                            return
-                        if user_message.get('messages') and user_message['messages'].get('email') == user_id:
-                            existing_json = user_message.get('messages', {}).get('jsonContent')
+                    # UUID로 메시지 조회
+                    response = supabase.table("chats").select("*").eq('uuid', message_uuid).eq('tenant_id', subdomain).execute()
+                    if response.data and len(response.data) > 0:
+                        message = response.data[0]
+                        if message.get('messages'):
+                            existing_json = message.get('messages', {}).get('jsonContent')
                             if existing_json and isinstance(existing_json, dict) and existing_json.get('intervention'):
                                 existing_json['intervention']['status'] = 'completed'
                                 supabase.table("chats").update({
                                     "messages": {
-                                        **user_message['messages'],
+                                        **message['messages'],
                                         "jsonContent": existing_json
                                     }
-                                }).eq('uuid', user_message['uuid']).execute()
+                                }).eq('uuid', message_uuid).execute()
                                 
                                 # 개입 로그 업데이트 (에이전트 호출 실패, 기본 LLM 사용)
-                                if message_uuid:
-                                    save_intervention_log(
-                                        message_uuid=message_uuid,
-                                        chat_room_id=chat_room_id,
-                                        user_id=user_id,
-                                        user_message=text,
-                                        context_info=context_info,
-                                        should_intervene=True,
-                                        intervention_reason=intervention_decision.get("reason", ""),
-                                        selected_agent_id=selected_agent_id,
-                                        selected_agent_name="AI 어시스턴트",
-                                        agent_selection_reason=agent_selection.get("reason", ""),
-                                        agent_selection_confidence=agent_selection.get("confidence"),
-                                        agent_response_content=default_response,
-                                        agent_response_type="response",
-                                        status="completed"
-                                    )
+                                save_intervention_log(
+                                    message_uuid=message_uuid,
+                                    chat_room_id=chat_room_id,
+                                    user_id=user_id,
+                                    user_message=text,
+                                    context_info=context_info,
+                                    should_intervene=True,
+                                    intervention_reason=intervention_result.get("reason", ""),
+                                    selected_agent_id=selected_agent_id,
+                                    selected_agent_name="AI 어시스턴트",
+                                    agent_selection_reason=agent_selection_reason,
+                                    agent_selection_confidence=confidence,
+                                    agent_response_content=default_response,
+                                    agent_response_type="response",
+                                    status="completed"
+                                )
                 except Exception as e:
                     print(f" 개입 상태 업데이트 실패 (무시): {str(e)}")
                 
@@ -983,60 +1101,54 @@ async def process_user_message_with_intervention(
             # 기본 LLM 사용
             print(f" 기본 LLM 사용 (에이전트 선택 불가)")
             default_response = await get_default_llm_response(text, chat_room_id)
+            # 에이전트 응답에 사용자 메시지 UUID 포함 (프론트엔드에서 연결하기 위해)
             agent_message_data = {
                 "name": "AI 어시스턴트",
-                "content": default_response
+                "content": default_response,
+                "jsonData": {
+                    "user_message_uuid": message_uuid
+                }
             }
             upsert_chat_message(chat_room_id, agent_message_data, is_system=False, is_agent=True)
             
-            # 사용자 메시지의 개입 상태를 "completed"로 업데이트
+            # 사용자 메시지의 개입 상태를 "completed"로 업데이트 (UUID로 직접 업데이트)
             try:
                 from database import supabase_client_var, subdomain_var
                 supabase = supabase_client_var.get()
                 subdomain = subdomain_var.get()
                 
-                # 정렬 없이 모든 메시지를 가져온 후 Python에서 정렬
-                response = supabase.table("chats").select("*").eq('id', chat_room_id).eq('tenant_id', subdomain).execute()
-                if response.data and len(response.data) >= 2:
-                    # messages.timeStamp를 기준으로 정렬
-                    sorted_messages = sorted(
-                        response.data,
-                        key=lambda x: x.get('messages', {}).get('timeStamp', 0) if isinstance(x.get('messages'), dict) else 0,
-                        reverse=True
-                    )
-                    # 두 번째 메시지가 사용자 메시지 (첫 번째는 에이전트 응답)
-                    user_message = sorted_messages[1] if len(sorted_messages) >= 2 else None
-                    if not user_message:
-                        return
-                    if user_message.get('messages') and user_message['messages'].get('email') == user_id:
-                        existing_json = user_message.get('messages', {}).get('jsonContent')
+                # UUID로 메시지 조회
+                response = supabase.table("chats").select("*").eq('uuid', message_uuid).eq('tenant_id', subdomain).execute()
+                if response.data and len(response.data) > 0:
+                    message = response.data[0]
+                    if message.get('messages'):
+                        existing_json = message.get('messages', {}).get('jsonContent')
                         if existing_json and isinstance(existing_json, dict) and existing_json.get('intervention'):
                             existing_json['intervention']['status'] = 'completed'
                             supabase.table("chats").update({
                                 "messages": {
-                                    **user_message['messages'],
+                                    **message['messages'],
                                     "jsonContent": existing_json
                                 }
-                            }).eq('uuid', user_message['uuid']).execute()
+                            }).eq('uuid', message_uuid).execute()
                             
                             # 개입 로그 업데이트 (기본 LLM 사용)
-                            if message_uuid:
-                                save_intervention_log(
-                                    message_uuid=message_uuid,
-                                    chat_room_id=chat_room_id,
-                                    user_id=user_id,
-                                    user_message=text,
-                                    context_info=context_info,
-                                    should_intervene=True,
-                                    intervention_reason=intervention_decision.get("reason", ""),
-                                    selected_agent_id="default",
-                                    selected_agent_name="AI 어시스턴트",
-                                    agent_selection_reason=agent_selection.get("reason", ""),
-                                    agent_selection_confidence=agent_selection.get("confidence"),
-                                    agent_response_content=default_response,
-                                    agent_response_type="response",
-                                    status="completed"
-                                )
+                            save_intervention_log(
+                                message_uuid=message_uuid,
+                                chat_room_id=chat_room_id,
+                                user_id=user_id,
+                                user_message=text,
+                                context_info=context_info,
+                                should_intervene=True,
+                                intervention_reason=intervention_result.get("reason", ""),
+                                selected_agent_id="default",
+                                selected_agent_name="AI 어시스턴트",
+                                agent_selection_reason=agent_selection_reason,
+                                agent_selection_confidence=confidence,
+                                agent_response_content=default_response,
+                                agent_response_type="response",
+                                status="completed"
+                            )
             except Exception as e:
                 print(f" 개입 상태 업데이트 실패 (무시): {str(e)}")
             
@@ -1046,70 +1158,43 @@ async def process_user_message_with_intervention(
                 "content": default_response
             }
         
-        # 사용자 메시지에 개입 정보 업데이트 (이미 로그는 저장되었으므로 여기서는 chats 테이블만 업데이트)
+        print(f" 처리 완료 (메시지 UUID: {message_uuid})")
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"\n 에러 발생 (메시지 UUID: {message_uuid}): {str(e)}")
+        import traceback
+        traceback.print_exc()
+        print(f"{'='*60}\n")
+        # 에러 발생 시에도 메시지 상태 업데이트 시도
         try:
             from database import supabase_client_var, subdomain_var
             supabase = supabase_client_var.get()
             subdomain = subdomain_var.get()
             
-            # 최근 메시지 찾기 (정렬 없이 가져온 후 Python에서 정렬)
-            response = supabase.table("chats").select("*").eq('id', chat_room_id).eq('tenant_id', subdomain).execute()
-            
+            response = supabase.table("chats").select("*").eq('uuid', message_uuid).eq('tenant_id', subdomain).execute()
             if response.data and len(response.data) > 0:
-                # messages.timeStamp를 기준으로 정렬
-                sorted_messages = sorted(
-                    response.data,
-                    key=lambda x: x.get('messages', {}).get('timeStamp', 0) if isinstance(x.get('messages'), dict) else 0,
-                    reverse=True
-                )
-                latest_message = sorted_messages[0] if sorted_messages else response.data[0]
-                if latest_message.get('messages') and latest_message['messages'].get('email') == user_id:
-                    # 개입 정보를 jsonContent에 추가
+                message = response.data[0]
+                if message.get('messages'):
                     intervention_info = {
-                        "status": "intervening",  # 에이전트 응답 대기 중
-                        "should_intervene": True,
-                        "selected_agent_id": selected_agent_id,
-                        "reason": agent_selection.get("reason", ""),
-                        "agent_name": agent_response.get("agent_name") if agent_response else None
+                        "status": "failed",
+                        "should_intervene": False,
+                        "reason": f"에러 발생: {str(e)}"
                     }
-                    
-                    # 기존 jsonContent가 있으면 병합, 없으면 새로 생성
-                    existing_json = latest_message.get('messages', {}).get('jsonContent')
+                    existing_json = message.get('messages', {}).get('jsonContent')
                     if existing_json and isinstance(existing_json, dict):
                         existing_json['intervention'] = intervention_info
                     else:
                         existing_json = {"intervention": intervention_info}
                     
-                    # 메시지 업데이트
                     supabase.table("chats").update({
                         "messages": {
-                            **latest_message['messages'],
+                            **message['messages'],
                             "jsonContent": existing_json
                         }
-                    }).eq('uuid', latest_message['uuid']).execute()
-        except Exception as e:
-            print(f" 개입 정보 업데이트 실패 (무시): {str(e)}")
-        
-        print(f" 처리 완료")
-        print(f"{'='*60}\n")
-        
-        return {
-            "message_saved": True,
-            "intervention": {
-                "should_intervene": True,
-                "selected_agent_id": selected_agent_id,
-                "agent_response": agent_response,
-                "reason": agent_selection.get("reason", ""),
-                "debug_info": debug_info
-            }
-        }
-        
-    except Exception as e:
-        print(f"\n 에러 발생: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        print(f"{'='*60}\n")
-        raise HTTPException(status_code=500, detail=str(e))
+                    }).eq('uuid', message_uuid).execute()
+        except:
+            pass
 
 
 class UserMessageRequest(BaseModel):
@@ -1135,7 +1220,7 @@ async def handle_user_message(message: UserMessageRequest):
 def add_routes_to_app(app: FastAPI):
     """라우트 추가"""
     app.add_api_route(
-        "/completion/chat/message",
+        "/langchain-chat/intervention",
         handle_user_message,
         methods=["POST"]
     )
