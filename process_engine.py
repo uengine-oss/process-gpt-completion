@@ -41,6 +41,9 @@ async def handle_submit(request: Request):
 
         return await submit_workitem(input)
 
+    except HTTPException:
+        # FastAPI의 HTTPException은 그대로 전파해서 status_code가 500으로 덮이지 않게 함
+        raise
     except Exception as e:
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -699,14 +702,21 @@ async def get_reference_workitems(workitem):
     try:
         reference_workitems = [workitem]
         
-        # 프로세스 정의 가져오기 (인스턴스에 저장된 버전 우선)
+        # 프로세스 정의 가져오기
+        # - 1순위: workitem에 저장된 version_tag/version
+        # - 2순위: (workitem에 버전이 없을 때만) 인스턴스에 저장된 proc_def_version(arcv_id)
+        version_tag = getattr(workitem, "version_tag", None)
+        version = getattr(workitem, "version", None)
         process_instance = fetch_process_instance(workitem.proc_inst_id)
         arcv_id = None
-        if process_instance and getattr(process_instance, "proc_def_version", None):
-            arcv_id = process_instance.proc_def_version
+        if not version_tag and not version:
+            if process_instance and getattr(process_instance, "proc_def_version", None):
+                arcv_id = process_instance.proc_def_version
 
         process_definition_json = fetch_process_definition_by_version(
             workitem.proc_def_id,
+            version_tag,
+            version,
             tenant_id=workitem.tenant_id,
             arcv_id=arcv_id,
         )
@@ -756,13 +766,18 @@ async def get_reference_workitems(workitem):
 async def get_all_next_workitems(workitem):
     try:
         process_definition_id = workitem.proc_def_id
+        version_tag = getattr(workitem, "version_tag", None)
+        version = getattr(workitem, "version", None)
         process_instance = fetch_process_instance(workitem.proc_inst_id)
         arcv_id = None
-        if process_instance and getattr(process_instance, "proc_def_version", None):
-            arcv_id = process_instance.proc_def_version
+        if not version_tag and not version:
+            if process_instance and getattr(process_instance, "proc_def_version", None):
+                arcv_id = process_instance.proc_def_version
 
         process_definition_json = fetch_process_definition_by_version(
             process_definition_id,
+            version_tag,
+            version,
             tenant_id=workitem.tenant_id,
             arcv_id=arcv_id,
         )

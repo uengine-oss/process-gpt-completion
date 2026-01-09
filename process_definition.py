@@ -388,6 +388,14 @@ class ProcessDefinition(BaseModel):
         return unique_activities
 
 def load_process_definition(definition_json: dict) -> ProcessDefinition:
+    # 입력 방어: DB 조회 실패 등으로 None/문자열이 들어오는 케이스를 안전하게 처리
+    if definition_json is None:
+        raise ValueError("Process definition JSON is None")
+    if isinstance(definition_json, str):
+        definition_json = json.loads(definition_json)
+    if not isinstance(definition_json, dict):
+        raise TypeError(f"Process definition JSON must be dict, got {type(definition_json).__name__}")
+
     # Events를 게이트웨이 리스트에 추가
     if 'events' in definition_json:
         if 'gateways' not in definition_json:

@@ -124,7 +124,6 @@ def fetch_process_definition(def_id, tenant_id: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"No process definition found with ID {def_id}: {e}")
 
-
 def fetch_process_definition_version_by_arcv_id(def_id, arcv_id, tenant_id: Optional[str] = None):
     """
     proc_def_arcv / proc_def_version 에 저장된 특정 arcv_id 버전의 프로세스 정의를 조회합니다.
@@ -164,100 +163,46 @@ def fetch_process_definition_by_version(
     arcv_id: Optional[str] = None,
 ):
     """
-    version_tag / version / arcv_id 기준으로 프로세스 정의를 조회하는 헬퍼.
+    실행 정의(프로세스 definition)를 버전 규칙에 따라 조회합니다.
 
-    - arcv_id 가 주어지면: 해당 아카이브 버전(definition) 우선 조회
-    - version_tag == "major": proc_def_version(버전 뷰/테이블)에서 조회
-      * version 이 주어지면 해당 version 레코드 우선 조회
-      * 없으면 최신 version(내림차순) 사용
-    - 그 외(minor/None): 현재 proc_def 테이블에서 조회
+    호환/명시 우선순위:
+    - arcv_id 가 주어지면: 해당 proc_def_arcv 버전을 최우선으로 조회 (기존 동작 유지)
+    - version_tag + version 이 주어지면: proc_def_version에서 해당 tag/version을 우선 조회
+
+    기본(명시 버전이 없을 때) 동작은 TS 방식으로 통일:
+    1) proc_def.prod_version 이 있으면 해당 버전을 우선 조회
+       - prod_version은 기존 운영상 arcv_id로 저장되는 경우가 있어 proc_def_arcv로 먼저 시도하고,
+         실패 시 proc_def_version.version 매칭도 시도
+    2) 최신 major(version_tag='major')
+    3) 최신 minor(version_tag='minor')
+    4) proc_def.definition (현재 정의)
     """
-    tag = (version_tag or "").lower()
+    # 공통 모듈로 로직을 위임하여 중복 제거
+    from proc_def_versioning import fetch_process_definition_by_version_ts_style
 
-    # 0) arcv_id가 주어진 경우: 특정 아카이브 버전 우선 조회
-    if arcv_id:
-        try:
-            versions = fetch_process_definition_version_by_arcv_id(def_id, arcv_id, tenant_id)
-            if versions and len(versions) > 0:
-                row = versions[0]
-                definition = row.get("definition", None)
-                # definition에 버전 메타 정보 주입
-                if isinstance(definition, dict):
-                    if "version" not in definition:
-                        definition["version"] = row.get("version")
-                    if "version_tag" not in definition:
-                        definition["version_tag"] = "major"
-                return definition
-        except Exception:
-            # arcv_id 조회 실패 시 아래 공통 로직으로 폴백
-            pass
+    if not def_id:
+        return None
 
-    # minor 이거나 태그가 없으면 현재 정의에서 조회
-    if tag != "major":
-        definition = fetch_process_definition(def_id, tenant_id)
-        # definition에 요청 기반 버전 메타 정보 주입
-        if isinstance(definition, dict):
-            if "version" not in definition:
-                definition["version"] = version
-            if "version_tag" not in definition:
-                definition["version_tag"] = version_tag or "minor"
-        return definition
+    supabase = supabase_client_var.get()
+    if supabase is None:
+        raise Exception("Supabase client is not configured for this request")
 
-    # major 태그: proc_def_version/최신 버전 기준
-    try:
-        supabase = supabase_client_var.get()
-        if supabase is None:
-            raise Exception("Supabase client is not configured for this request")
+    subdomain = subdomain_var.get()
+    if not tenant_id:
+        tenant_id = subdomain
 
-        subdomain = subdomain_var.get()
-        if not tenant_id:
-            tenant_id = subdomain
+    def fetch_arcv_rows(arcv: str) -> List[dict]:
+        return fetch_process_definition_version_by_arcv_id(def_id, arcv, tenant_id) or []
 
-        # 1) version 이 명시된 경우: 해당 버전 우선 조회
-        if version is not None:
-            response = (
-                supabase.table("proc_def_version")
-                .select("*")
-                .eq("proc_def_id", def_id.lower())
-                .eq("tenant_id", tenant_id)
-                .eq("version", str(version))
-                .execute()
-            )
-            if response.data and len(response.data) > 0:
-                row = response.data[0]
-                definition = row.get("definition", None)
-                if isinstance(definition, dict):
-                    if "version" not in definition:
-                        definition["version"] = row.get("version")
-                    if "version_tag" not in definition:
-                        definition["version_tag"] = "major"
-                return definition
-
-        # 2) 명시된 버전이 없거나, 해당 버전이 없으면 최신 버전 사용
-        latest = fetch_process_definition_latest_version(def_id, tenant_id)
-        if latest:
-            definition = latest.get("definition", None)
-            if isinstance(definition, dict):
-                if "version" not in definition:
-                    definition["version"] = latest.get("version")
-                if "version_tag" not in definition:
-                    definition["version_tag"] = "major"
-            return definition
-
-        # 3) 아카이브/버전 뷰에도 없으면 기본 정의로 폴백
-        definition = fetch_process_definition(def_id, tenant_id)
-        if isinstance(definition, dict):
-            if "version" not in definition:
-                definition["version"] = version
-            if "version_tag" not in definition:
-                definition["version_tag"] = "major"
-        return definition
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No process definition found with ID {def_id} for version_tag={version_tag}, version={version}: {e}",
-        )
+    return fetch_process_definition_by_version_ts_style(
+        supabase=supabase,
+        def_id=def_id,
+        tenant_id=tenant_id,
+        version_tag=version_tag,
+        version=version,
+        arcv_id=arcv_id,
+        fetch_arcv_rows=fetch_arcv_rows,
+    )
 
 
 def fetch_process_definition_latest_version(def_id, tenant_id: Optional[str] = None):
@@ -403,12 +348,34 @@ class ProcessInstance(BaseModel):
         super().__init__(**data)
         def_id = self.get_def_id()
         tenant_id = self.tenant_id
-        # proc_def_version(arcv_id)가 있으면 해당 버전 정의를 우선 사용
-        definition_json = fetch_process_definition_by_version(
-            def_id,
-            tenant_id=tenant_id,
-            arcv_id=self.proc_def_version,
-        )
+        # proc_def_version(arcv_id)가 있으면 해당 버전 정의를 우선 사용하되,
+        # 레거시 데이터(예: "xxx_2.0")처럼 arcv_id가 아닌 값이 들어올 수 있어 폴백을 둡니다.
+        definition_json = None
+        if getattr(self, "proc_def_version", None):
+            definition_json = fetch_process_definition_by_version(
+                def_id,
+                tenant_id=tenant_id,
+                arcv_id=self.proc_def_version,
+            )
+
+        if not definition_json and getattr(self, "version_tag", None) and getattr(self, "version", None):
+            definition_json = fetch_process_definition_by_version(
+                def_id,
+                tenant_id=tenant_id,
+                version_tag=self.version_tag,
+                version=self.version,
+            )
+
+        if not definition_json:
+            definition_json = fetch_process_definition_by_version(def_id, tenant_id=tenant_id)
+
+        if not definition_json:
+            raise ValueError(
+                f"Process definition not found for def_id={def_id}, tenant_id={tenant_id}, "
+                f"proc_def_version={getattr(self, 'proc_def_version', None)}, "
+                f"version_tag={getattr(self, 'version_tag', None)}, version={getattr(self, 'version', None)}"
+            )
+
         self.process_definition = load_process_definition(definition_json)  # Load ProcessDefinition
 
 
@@ -500,8 +467,10 @@ def fetch_process_instance(full_id: str, tenant_id: Optional[str] = None) -> Opt
             return process_instance
         else:
             return None
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise HTTPException(status_code=500, detail=str(e)) from e
     
 def fetch_child_instances_by_parent(parent_proc_inst_id: str, tenant_id: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
