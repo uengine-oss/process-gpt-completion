@@ -1064,7 +1064,7 @@ class ChatMessage(BaseModel):
 
 class ChatItem(BaseModel):
     id: str
-    uuid: str
+    uuid: Optional[str] = None  # 그룹채팅은 uuid가 없을 수 있음
     messages: Optional[ChatMessage] = None
     tenant_id: str
 
@@ -1084,6 +1084,42 @@ def fetch_chat_history(chat_room_id: str) -> List[ChatItem]:
         for chat in response.data:
             chat.pop('jsonContent', None)
             chatHistory.append(ChatItem(**chat))
+        return chatHistory
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+def fetch_group_chat_history(chat_room_id: str) -> List[ChatItem]:
+    """
+    그룹채팅 전용: group_chat_messages 테이블에서 채팅 히스토리를 조회
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        subdomain = subdomain_var.get()
+        response = supabase.table("group_chat_messages").select("*").eq('chat_room_id', chat_room_id).eq('tenant_id', subdomain).order('time_stamp', desc=False).execute()
+
+        chatHistory = []
+        for msg in response.data:
+            # group_chat_messages 형식을 ChatItem 형식으로 변환
+            chat_item = {
+                "id": msg.get('chat_room_id'),
+                "uuid": None,  # 그룹채팅은 uuid가 없음
+                "messages": {
+                    "name": msg.get('name'),
+                    "role": msg.get('role'),
+                    "email": msg.get('email'),
+                    "content": msg.get('content'),
+                    "timeStamp": msg.get('time_stamp'),
+                    "jsonContent": msg.get('json_content'),
+                    "image": msg.get('image'),
+                    "images": msg.get('images')
+                },
+                "tenant_id": msg.get('tenant_id')
+            }
+            chatHistory.append(ChatItem(**chat_item))
         return chatHistory
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -1152,6 +1188,86 @@ def upsert_chat_message(chat_room_id: str, data: Any, is_system: bool, tenant_id
 
 
         supabase.table("chats").upsert(chat_item_dict).execute();
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+def upsert_group_chat_message(chat_room_id: str, data: Any, is_system: bool, tenant_id: Optional[str] = None, is_agent: Optional[bool] = False) -> Dict[str, Any]:
+    """
+    그룹채팅 전용: group_chat_messages 테이블에 메시지를 저장하고 ID를 반환
+    """
+    try:
+        if is_agent:
+            message = ChatMessage(
+                name=data["name"],
+                role="agent",
+                content=data["content"],
+                jsonContent=data["jsonData"] if "jsonData" in data else None,
+                htmlContent=data["html"] if "html" in data else None,
+                timeStamp=int(datetime.now(pytz.timezone('Asia/Seoul')).timestamp() * 1000),
+            )
+        else:
+            if is_system:
+                if isinstance(data, str):
+                    json_data = json.loads(data)
+                else:
+                    json_data = data
+                message = ChatMessage(
+                    name="system",
+                    role="system",
+                    email="system@uengine.org",
+                    image="",
+                    content=json_data["description"],
+                    contentType="html" if "html" in json_data else "text",
+                    jsonContent=json_data["jsonData"] if "jsonData" in json_data else None,
+                    htmlContent=json_data["html"] if "html" in json_data else None,
+                    timeStamp=int(datetime.now(pytz.timezone('Asia/Seoul')).timestamp() * 1000)
+                )
+            else:
+                if data["email"] == "external_customer":
+                    name = "외부 고객"
+                else:
+                    user_info = fetch_user_info(data["email"])
+                    name = user_info["username"]
+                message = ChatMessage(
+                    name=name,
+                    role="user",
+                    email=data["email"],
+                    image="",
+                    content=data["command"],
+                    jsonContent=data.get("jsonData") if "jsonData" in data else None,
+                    timeStamp=int(datetime.now(pytz.timezone('Asia/Seoul')).timestamp() * 1000)
+                )
+
+        if not tenant_id:
+            tenant_id = subdomain_var.get()
+
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        # 그룹 채팅: group_chat_messages 테이블에 저장
+        group_message_data = {
+            "chat_room_id": chat_room_id,
+            "content": message.content,
+            "email": message.email,
+            "name": message.name,
+            "role": message.role or "user",
+            "time_stamp": message.timeStamp or int(datetime.now(pytz.timezone('Asia/Seoul')).timestamp() * 1000),
+            "profile": getattr(message, 'profile', None),
+            "json_content": message.jsonContent,
+            "json_data": None,  # jsonData는 json_content에 포함
+            "image": getattr(message, 'image', None),
+            "images": getattr(message, 'images', None),
+            "thread_id": None,
+            "tenant_id": tenant_id
+        }
+        result = supabase.table("group_chat_messages").insert(group_message_data).execute()
+        # 저장된 메시지의 id 반환 (auto increment)
+        if result.data and len(result.data) > 0:
+            message_id = result.data[0].get('id')
+            return {"id": message_id}
+        return {"id": None}
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
