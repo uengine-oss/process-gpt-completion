@@ -1272,14 +1272,6 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
         if workitem:
             workitem.status = activity_data['result']
             workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul')) if activity_data['result'] == 'DONE' else None
-            if workitem.user_id == '' or workitem.user_id == None:
-                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
-                    workitem.user_id = safeget(activity, 'agent', None)
-                else:
-                    user_info = fetch_assignee_info(activity_data['nextUserEmail'])
-                    if user_info:
-                        workitem.user_id = user_info.get('id')
-                        workitem.username = user_info.get('name')
             if workitem.agent_mode == None:
                 workitem.agent_mode = determine_agent_mode(workitem.user_id, workitem.agent_mode)
                 if workitem.agent_mode == 'COMPLETE' and (workitem.agent_orch == 'none' or workitem.agent_orch == None):
