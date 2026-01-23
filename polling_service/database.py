@@ -1321,9 +1321,14 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
             if activity:
                 prev_activities = process_definition.find_prev_activities(safeget(activity, 'id', ''), [])
                 start_date = datetime.now(pytz.timezone('Asia/Seoul'))
+                
+                # reference_ids 설정 (이전 액티비티 ID 목록)
+                reference_ids = []
                 if prev_activities:
+                    reference_ids = fetch_prev_task_ids(process_definition, safeget(activity, 'id', ''), process_instance_data['proc_inst_id'])
                     for prev_activity in prev_activities:
                         start_date = start_date + timedelta(days=safeget(prev_activity, 'duration', 0))
+                
                 due_date = start_date + timedelta(days=safeget(activity, 'duration', 0)) if safeget(activity, 'duration', 0) else None
                 agent_mode = determine_agent_mode(activity_data['nextUserEmail'], safeget(activity, 'agentMode', None))
                 agent_orch = safeget(activity, 'orchestration', None)
@@ -1355,6 +1360,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 
                 workitem = WorkItem(
                     id=str(uuid.uuid4()),
+                    reference_ids=reference_ids if prev_activities else [],
                     proc_inst_id=process_instance_data['proc_inst_id'],
                     proc_def_id=process_result_data['processDefinitionId'].lower(),
                     activity_id=safeget(activity, 'id', ''),
