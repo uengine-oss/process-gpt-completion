@@ -1277,10 +1277,13 @@ def get_workitem_position(workitem: dict) -> Tuple[bool, bool]:
         version = workitem.get('version')
 
         # 2순위: 인스턴스에 저장된 proc_def_version(arcv_id)
+        # - workitem에 버전(version_tag/version)이 명시된 경우에는 arcv_id를 넘기지 않아
+        #   "workitem 버전 우선" 규칙이 깨지지 않도록 합니다.
         process_instance = fetch_process_instance(proc_inst_id, tenant_id)
         arcv_id = None
-        if process_instance and getattr(process_instance, "proc_def_version", None):
-            arcv_id = process_instance.proc_def_version
+        if not version_tag and not version:
+            if process_instance and getattr(process_instance, "proc_def_version", None):
+                arcv_id = process_instance.proc_def_version
 
         process_definition_json = fetch_process_definition_by_version(
             proc_def_id,
@@ -3474,10 +3477,13 @@ async def handle_workitem(workitem):
     version = workitem.get('version')
 
     # 2순위: 인스턴스에 저장된 proc_def_version(arcv_id)
+    # - workitem에 버전(version_tag/version)이 명시된 경우에는 arcv_id를 넘기지 않아
+    #   "workitem 버전 우선" 규칙이 깨지지 않도록 합니다.
     process_instance = fetch_process_instance(process_instance_id, tenant_id)
     arcv_id = None
-    if process_instance and getattr(process_instance, "proc_def_version", None):
-        arcv_id = process_instance.proc_def_version
+    if not version_tag and not version:
+        if process_instance and getattr(process_instance, "proc_def_version", None):
+            arcv_id = process_instance.proc_def_version
 
     process_definition_json = fetch_process_definition_by_version(
         process_definition_id,
@@ -3952,10 +3958,13 @@ async def handle_pending_workitem(workitem):
         version = workitem.get('version')
 
         # 2순위: 인스턴스에 저장된 proc_def_version(arcv_id)
+        # - workitem에 버전(version_tag/version)이 명시된 경우에는 arcv_id를 넘기지 않아
+        #   "workitem 버전 우선" 규칙이 깨지지 않도록 합니다.
         process_instance = fetch_process_instance(workitem.get('proc_inst_id'), tenant_id)
         arcv_id = None
-        if process_instance and getattr(process_instance, "proc_def_version", None):
-            arcv_id = process_instance.proc_def_version
+        if not version_tag and not version:
+            if process_instance and getattr(process_instance, "proc_def_version", None):
+                arcv_id = process_instance.proc_def_version
 
         process_definition_json = fetch_process_definition_by_version(
             proc_def_id,
