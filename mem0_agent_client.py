@@ -182,7 +182,7 @@ def store_in_memory(agent_id: str, content: str):
             "type": "information",
             "timestamp": datetime.now().isoformat()
         },
-        infer=True
+        infer=False
     )
 
 async def process_mem0_message(text: str, agent_id: str, chat_room_id: str = None, is_learning_mode: bool = False):
