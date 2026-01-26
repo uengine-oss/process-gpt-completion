@@ -8,7 +8,7 @@ from database import (
     setting_database, fetch_workitem_with_submitted_status, 
     upsert_workitem, cleanup_stale_consumers,
     fetch_process_definition_by_version, fetch_workitem_with_pending_status,
-    fetch_process_instance, upsert_process_instance, fetch_and_delete_stale_new_workitems
+    fetch_process_instance, upsert_process_instance
 )
 from workitem_processor import handle_workitem, handle_service_workitem, handle_pending_workitem
 from file_cleanup_service import file_cleanup_polling_task
@@ -189,24 +189,6 @@ async def cleanup_task():
         # 정상적인 경우 5분 대기
         await asyncio.sleep(300)
 
-async def cleanup_new_workitems_task():
-    """5분 간격으로 NEW 상태의 워크아이템을 조회하고 삭제하는 태스크"""
-    while not shutdown_event.is_set():
-        try:
-            deleted_count = fetch_and_delete_stale_new_workitems()
-            if deleted_count > 0:
-                print(f"[INFO] Cleanup new workitems task completed: deleted {deleted_count} workitems")
-            else:
-                print("[DEBUG] Cleanup new workitems task completed: no workitems to delete")
-        except Exception as e:
-            print(f"[ERROR] Cleanup new workitems task error: {e}")
-            # 오류 발생 시 짧은 대기 후 재시도
-            await asyncio.sleep(60)
-            continue
-        
-        # 정상적인 경우 5분 대기
-        await asyncio.sleep(300)
-
 async def start_polling():
     try:
         setting_database()
@@ -222,10 +204,6 @@ async def start_polling():
     # 파일 정리 폴링 태스크 시작
     file_cleanup_task_obj = asyncio.create_task(file_cleanup_polling_task(shutdown_event, polling_interval=300))
     print("[INFO] File cleanup polling task started")
-    
-    # NEW 상태 워크아이템 정리 태스크 시작
-    cleanup_new_workitems_task_obj = asyncio.create_task(cleanup_new_workitems_task())
-    print("[INFO] Cleanup new workitems task started")
 
     while not shutdown_event.is_set():
         try:
@@ -260,16 +238,6 @@ async def start_polling():
         print("[INFO] File cleanup task cancelled successfully")
     except Exception as e:
         print(f"[ERROR] Error cancelling file cleanup task: {e}")
-    
-    # NEW 상태 워크아이템 정리 태스크 취소
-    print("[INFO] Cancelling cleanup new workitems task...")
-    cleanup_new_workitems_task_obj.cancel()
-    try:
-        await cleanup_new_workitems_task_obj
-    except asyncio.CancelledError:
-        print("[INFO] Cleanup new workitems task cancelled successfully")
-    except Exception as e:
-        print(f"[ERROR] Error cancelling cleanup new workitems task: {e}")
 
 async def graceful_shutdown():
     """Graceful shutdown을 위한 함수"""
