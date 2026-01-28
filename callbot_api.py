@@ -304,13 +304,48 @@ async def get_task_detail(
             except Exception as e:
                 logger.warning(f"[Callbot Task Detail] Form schema not found: {e}")
         
+        # proc_def에서 activity의 instruction, checkpoints, inputData 등 추가 정보 조회
+        activity_instruction = None
+        activity_checkpoints = None
+        activity_input_data = []  # inputData 필드 추가
+        if task_data.get('proc_def_id') and task_data.get('activity_id'):
+            try:
+                proc_def_response = supabase.table('proc_def').select('definition').eq(
+                    'id', task_data['proc_def_id']
+                ).eq('tenant_id', subdomain).execute()
+                
+                if proc_def_response.data and len(proc_def_response.data) > 0:
+                    definition = proc_def_response.data[0].get('definition', {})
+                    activities = definition.get('activities', [])
+                    
+                    # 해당 activity_id 찾기
+                    for activity in activities:
+                        if activity.get('id') == task_data['activity_id']:
+                            activity_instruction = activity.get('instruction', '')
+                            activity_checkpoints = activity.get('checkpoints', [])
+                            activity_input_data = activity.get('inputData', [])  # inputData 가져오기
+                            logger.info(f"[Callbot Task Detail] Found instruction: {activity_instruction[:50] if activity_instruction else 'None'}...")
+                            logger.info(f"[Callbot Task Detail] Found inputData: {activity_input_data}")
+                            break
+            except Exception as e:
+                logger.warning(f"[Callbot Task Detail] Failed to fetch activity instruction: {e}")
+        
         # 현재 폼 데이터
         current_data = task_data.get('output', {}) or {}
         
-        # 참조 폼 데이터 조회 (같은 프로세스 인스턴스의 이전 activity들)
+        # inputData에서 참조할 폼 ID들 추출 (예: "form_id.field_name" -> "form_id")
+        referenced_form_ids = set()
+        if activity_input_data:
+            for input_field in activity_input_data:
+                if '.' in input_field:
+                    form_id = input_field.split('.')[0]
+                    referenced_form_ids.add(form_id)
+            logger.info(f"[Callbot Task Detail] Referenced form IDs from inputData: {referenced_form_ids}")
+        
+        # 참조 폼 데이터 조회 (같은 프로세스 인스턴스의 이전 activity들 중 inputData에 정의된 것만)
         reference_forms = []
         proc_inst_id = task_data.get('proc_inst_id')
-        if proc_inst_id:
+        if proc_inst_id and referenced_form_ids:
             try:
                 # 같은 proc_inst_id의 완료된(DONE) 업무들 조회
                 ref_response = supabase.table('todolist').select('*').eq(
@@ -319,14 +354,22 @@ async def get_task_detail(
                 
                 if ref_response.data:
                     for ref_task in ref_response.data:
-                        if ref_task.get('output'):
-                            reference_forms.append({
-                                "activity_name": ref_task.get('activity_name'),
-                                "activity_id": ref_task.get('activity_id'),
-                                "data": ref_task.get('output', {})
-                            })
+                        output_data = ref_task.get('output', {})
+                        if output_data:
+                            # output의 키(폼 ID)가 inputData에 참조된 폼 ID와 일치하는지 확인
+                            output_form_ids = set(output_data.keys())
+                            matching_form_ids = output_form_ids & referenced_form_ids
+                            
+                            if matching_form_ids:
+                                # 참조된 폼 ID에 해당하는 데이터만 필터링
+                                filtered_data = {k: v for k, v in output_data.items() if k in referenced_form_ids}
+                                reference_forms.append({
+                                    "activity_name": ref_task.get('activity_name'),
+                                    "activity_id": ref_task.get('activity_id'),
+                                    "data": filtered_data
+                                })
                     
-                    logger.info(f"[Callbot Task Detail] Found {len(reference_forms)} reference forms")
+                    logger.info(f"[Callbot Task Detail] Found {len(reference_forms)} reference forms (filtered by inputData)")
             except Exception as e:
                 logger.warning(f"[Callbot Task Detail] Failed to fetch reference forms: {e}")
         
@@ -334,6 +377,8 @@ async def get_task_detail(
         logger.info(f"[Callbot Task Detail] Form schema fields: {len(form_schema) if form_schema else 0}")
         logger.info(f"[Callbot Task Detail] Current data keys: {list(current_data.keys())}")
         logger.info(f"[Callbot Task Detail] Reference forms: {len(reference_forms)}")
+        logger.info(f"[Callbot Task Detail] Instruction: {activity_instruction}")
+        logger.info(f"[Callbot Task Detail] Checkpoints: {activity_checkpoints}")
         
         return {
             "success": True,
@@ -345,6 +390,8 @@ async def get_task_detail(
                 "proc_inst_id": task_data.get('proc_inst_id'),
                 "proc_def_id": task_data.get('proc_def_id'),
                 "activity_id": task_data.get('activity_id'),
+                "instruction": activity_instruction,  # 업무 처리 지시사항
+                "checkpoints": activity_checkpoints,  # 체크포인트
             },
             "form_schema": form_schema,
             "current_data": current_data,
@@ -399,25 +446,38 @@ async def update_task_form(
         # ✅ 웹 형식으로 wrap (폼 이름을 최상위 키로 포함)
         # 예: {"field1": "value1"} -> {"form_id": {"field1": "value1"}}
         tool = task_data.get('tool', '')
+        logger.info(f"[Callbot Task Update] tool: {tool}")
+        logger.info(f"[Callbot Task Update] current_output: {current_output}")
+        logger.info(f"[Callbot Task Update] fields before wrap: {fields}")
+        
         if tool and 'formHandler:' in tool:
             form_id = tool.split('formHandler:')[1]
+            logger.info(f"[Callbot Task Update] form_id: {form_id}")
             # fields가 이미 폼 이름으로 wrap되어 있지 않으면 wrap
             if form_id not in fields:
                 logger.info(f"[Callbot Task Update] Wrapping fields with form_id: {form_id}")
                 fields = {form_id: fields}
         
+        logger.info(f"[Callbot Task Update] fields after wrap: {fields}")
+        
         # output 필드 업데이트 (merge)
         # 웹 형식: {"form_id": {"field1": "value1", "field2": "value2"}}
         if tool and 'formHandler:' in tool:
             form_id = tool.split('formHandler:')[1]
+            logger.info(f"[Callbot Task Update] form_id in current_output: {form_id in current_output}")
+            logger.info(f"[Callbot Task Update] form_id in fields: {form_id in fields}")
             if form_id in current_output and form_id in fields:
                 # 기존 폼 데이터와 merge
+                logger.info(f"[Callbot Task Update] Merging with existing data")
                 updated_output = {**current_output}
                 updated_output[form_id] = {**current_output[form_id], **fields[form_id]}
             else:
+                logger.info(f"[Callbot Task Update] No existing data, using fields directly")
                 updated_output = {**current_output, **fields}
         else:
             updated_output = {**current_output, **fields}
+        
+        logger.info(f"[Callbot Task Update] updated_output: {updated_output}")
         
         # 데이터베이스 업데이트
         update_response = supabase.table('todolist').update({
