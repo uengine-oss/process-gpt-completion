@@ -1354,41 +1354,34 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     else:
                         user_id = agent_id
                     
-                    # assignees에 activity.agent 추가 (중복 체크)
-                    agent_already_in_assignees = False
+                    # assignees에서 activity.role과 이름이 같은 role_binding의 endpoint를 확장
+                    role_name = safeget(activity, 'role', '')
+                    updated_role_binding = False
                     for assignee in assignees:
-                        assignee_endpoint = assignee.get('endpoint', '')
+                        if assignee.get('name') != role_name:
+                            continue
+                        assignee_endpoint = assignee.get('endpoint')
+                        # endpoint가 리스트인 경우: agent_id가 없으면 append
                         if isinstance(assignee_endpoint, list):
-                            if agent_id in assignee_endpoint:
-                                agent_already_in_assignees = True
-                                break
-                        elif assignee_endpoint == agent_id:
-                            agent_already_in_assignees = True
-                            break
+                            if agent_id not in assignee_endpoint:
+                                assignee_endpoint.append(agent_id)
+                                assignee['endpoint'] = assignee_endpoint
+                        # endpoint가 문자열/단일 값인 경우
+                        elif isinstance(assignee_endpoint, str) and assignee_endpoint.strip() != "":
+                            if assignee_endpoint != agent_id:
+                                assignee['endpoint'] = [assignee_endpoint, agent_id]
+                        # endpoint가 없거나 빈 경우
+                        else:
+                            assignee['endpoint'] = agent_id
+                        updated_role_binding = True
+                        break
                     
-                    if not agent_already_in_assignees:
-                        # activity.agent에 해당하는 role_binding 찾기 또는 생성
-                        agent_role_binding = None
-                        if process_result_data.get('roleBindings'):
-                            for rb in process_result_data['roleBindings']:
-                                rb_endpoint = rb.get('endpoint', '')
-                                if isinstance(rb_endpoint, list):
-                                    if agent_id in rb_endpoint:
-                                        agent_role_binding = rb
-                                        break
-                                elif rb_endpoint == agent_id:
-                                    agent_role_binding = rb
-                                    break
-                        
-                        # role_binding을 찾지 못했으면 activity.role을 사용하여 생성
-                        if not agent_role_binding:
-                            agent_role_binding = {
-                                "name": safeget(activity, 'role', ''),
-                                "endpoint": agent_id,
-                                "default": agent_id
-                            }
-                        
-                        assignees.append(agent_role_binding)
+                    # 동일 role의 role_binding이 없으면 새로 하나 추가
+                    if not updated_role_binding:
+                        assignees.append({
+                            "name": role_name,
+                            "endpoint": agent_id
+                        })
                 
                 # 최종 user_id 기준으로 username 재계산
                 username = ''
@@ -1669,41 +1662,34 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                     else:
                         user_id = agent_id
                     
-                    # assignees에 activity.agent 추가 (중복 체크)
-                    agent_already_in_assignees = False
+                    # assignees에서 activity.role과 이름이 같은 role_binding의 endpoint를 확장
+                    role_name = safeget(activity, 'role', '')
+                    updated_role_binding = False
                     for assignee in assignees:
-                        assignee_endpoint = assignee.get('endpoint', '')
+                        if assignee.get('name') != role_name:
+                            continue
+                        assignee_endpoint = assignee.get('endpoint')
+                        # endpoint가 리스트인 경우: agent_id가 없으면 append
                         if isinstance(assignee_endpoint, list):
-                            if agent_id in assignee_endpoint:
-                                agent_already_in_assignees = True
-                                break
-                        elif assignee_endpoint == agent_id:
-                            agent_already_in_assignees = True
-                            break
+                            if agent_id not in assignee_endpoint:
+                                assignee_endpoint.append(agent_id)
+                                assignee['endpoint'] = assignee_endpoint
+                        # endpoint가 문자열/단일 값인 경우
+                        elif isinstance(assignee_endpoint, str) and assignee_endpoint.strip() != "":
+                            if assignee_endpoint != agent_id:
+                                assignee['endpoint'] = [assignee_endpoint, agent_id]
+                        # endpoint가 없거나 빈 경우
+                        else:
+                            assignee['endpoint'] = agent_id
+                        updated_role_binding = True
+                        break
                     
-                    if not agent_already_in_assignees:
-                        # activity.agent에 해당하는 role_binding 찾기 또는 생성
-                        agent_role_binding = None
-                        if process_result_data.get('roleBindings'):
-                            for rb in process_result_data['roleBindings']:
-                                rb_endpoint = rb.get('endpoint', '')
-                                if isinstance(rb_endpoint, list):
-                                    if agent_id in rb_endpoint:
-                                        agent_role_binding = rb
-                                        break
-                                elif rb_endpoint == agent_id:
-                                    agent_role_binding = rb
-                                    break
-                        
-                        # role_binding을 찾지 못했으면 activity.role을 사용하여 생성
-                        if not agent_role_binding:
-                            agent_role_binding = {
-                                "name": safeget(activity, 'role', ''),
-                                "endpoint": agent_id,
-                                "default": agent_id
-                            }
-                        
-                        assignees.append(agent_role_binding)
+                    # 동일 role의 role_binding이 없으면 새로 하나 추가
+                    if not updated_role_binding:
+                        assignees.append({
+                            "name": role_name,
+                            "endpoint": agent_id
+                        })
                 
                 # 최종 user_id 기준으로 username 재계산
                 username = ''
