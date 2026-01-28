@@ -17,6 +17,7 @@ import os
 import uuid
 import json
 import asyncio
+import requests
 
 
 supabase_client_var = ContextVar('supabase', default=None)
@@ -1313,9 +1314,14 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
             if activity:
                 prev_activities = process_definition.find_prev_activities(safeget(activity, 'id', ''), [])
                 start_date = datetime.now(pytz.timezone('Asia/Seoul'))
+                
+                # reference_ids 설정 (이전 액티비티 ID 목록)
+                reference_ids = []
                 if prev_activities:
+                    reference_ids = fetch_prev_task_ids(process_definition, safeget(activity, 'id', ''), process_instance_data['proc_inst_id'])
                     for prev_activity in prev_activities:
                         start_date = start_date + timedelta(days=safeget(prev_activity, 'duration', 0))
+                
                 due_date = start_date + timedelta(days=safeget(activity, 'duration', 0)) if safeget(activity, 'duration', 0) else None
                 agent_mode = determine_agent_mode(activity_data['nextUserEmail'], safeget(activity, 'agentMode', None))
                 agent_orch = safeget(activity, 'orchestration', None)
@@ -1418,6 +1424,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 
                 workitem = WorkItem(
                     id=str(uuid.uuid4()),
+                    reference_ids=reference_ids if prev_activities else [],
                     proc_inst_id=process_instance_data['proc_inst_id'],
                     proc_def_id=process_result_data['processDefinitionId'].lower(),
                     activity_id=safeget(activity, 'id', ''),
@@ -1478,6 +1485,42 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 workitem_dict["start_date"] = workitem.start_date.isoformat() if workitem.start_date else None
                 workitem_dict["end_date"] = workitem.end_date.isoformat() if workitem.end_date else None
                 workitem_dict["due_date"] = workitem.due_date.isoformat() if workitem.due_date else None
+
+                # TEMP: 콜봇 테스트코드드 다음 업무 생성 시 특정 담당자(frcp9408@gmail.com)에게 브라우저 콜 트리거
+                try:
+                    target_email = "frcp9408@gmail.com"
+                    trigger_url = "https://monitor-faithful-slightly.ngrok-free.app/call/client"
+                    trigger_identity = "browser-user"
+                    status_val = (workitem_dict.get("status") or "").upper()
+                    assignee_id = workitem_dict.get("user_id")
+
+                    print(f"[TwilioTrigger][next] status={status_val} assignee_id={assignee_id} activity={workitem.activity_id}")
+
+                    if status_val in ("IN_PROGRESS", "TODO", "NEW") and isinstance(assignee_id, str):
+                        assignee_email = ""
+                        try:
+                            user_row = fetch_user_info(assignee_id)
+                            assignee_email = (user_row.get("email") or "").lower()
+                            print(f"[TwilioTrigger][next] resolved via user lookup -> email={assignee_email}")
+                        except Exception as e:
+                            print(f"[TwilioTrigger][next] user lookup failed ({assignee_id}): {e}")
+                            assignee_info = fetch_assignee_info(assignee_id) or {}
+                            assignee_email = (assignee_info.get("email") or assignee_id or "").lower()
+                            print(f"[TwilioTrigger][next] resolved via email fallback -> email={assignee_email}")
+
+                        if assignee_email == target_email and trigger_url:
+                            try:
+                                resp = requests.post(trigger_url, json={"identity": trigger_identity}, timeout=5)
+                                resp.raise_for_status()
+                                print(f"[TwilioTrigger][next] fired for {assignee_email} -> {trigger_url}")
+                            except Exception as exc:
+                                print(f"[TwilioTrigger][next] Failed trigger for {assignee_email}: {exc}")
+                        else:
+                            print(f"[TwilioTrigger][next] skipped: email mismatch or no trigger_url (email={assignee_email})")
+                    else:
+                        print(f"[TwilioTrigger][next] skipped: status={status_val}, assignee={assignee_id}")
+                except Exception as exc:
+                    print(f"[TwilioTrigger][next] Skipped trigger logic: {exc}")
 
                 # browser-automation-agent인 경우 상세한 description 생성
                 # if workitem.agent_orch == 'browser-automation-agent':
