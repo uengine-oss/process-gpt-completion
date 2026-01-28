@@ -16,7 +16,7 @@ from database import (
 
 logger = logging.getLogger("uvicorn.error")
 
-router = APIRouter(prefix="/api/callbot", tags=["callbot"])
+router = APIRouter(prefix="/complete-callbot", tags=["callbot"])
 
 
 @router.get("/caller-info")
