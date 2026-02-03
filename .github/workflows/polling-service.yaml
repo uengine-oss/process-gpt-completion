@@ -45,12 +45,16 @@ jobs:
         run: |
           IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-7)
           IMAGE_NAME=ghcr.io/uengine-oss/process-gpt-polling-service:$IMAGE_TAG
+          IMAGE_NAME_LATEST=ghcr.io/uengine-oss/process-gpt-polling-service:latest
+
           cd polling_service
-          docker build -t $IMAGE_NAME .
+          docker build -t $IMAGE_NAME -t $IMAGE_NAME_LATEST .
           docker push $IMAGE_NAME
+          docker push $IMAGE_NAME_LATEST
 
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+          echo "IMAGE_NAME_LATEST=$IMAGE_NAME_LATEST" >> $GITHUB_ENV
 
       - name: Checkout GitOps repository
         uses: actions/checkout@v3
@@ -89,8 +93,9 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Image** | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Tag** | \`${{ env.IMAGE_TAG }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image (commit)** | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image (latest)** | \`${{ env.IMAGE_NAME_LATEST }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tag** | \`${{ env.IMAGE_TAG }}\` / \`latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | [\`${{ github.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |" >> $GITHUB_STEP_SUMMARY
           echo "| **GitOps Repo** | [process-gpt-k8s](https://github.com/uengine-oss/process-gpt-k8s) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -111,8 +116,9 @@ jobs:
                 const commentBody = [
                   '🚀 **Polling Service Deployment Started**',
                   '',
-                  '**Image:** `${{ env.IMAGE_NAME }}`',
-                  '**Tag:** `${{ env.IMAGE_TAG }}`',
+                  '**Image (commit):** `${{ env.IMAGE_NAME }}`',
+                  '**Image (latest):** `${{ env.IMAGE_NAME_LATEST }}`',
+                  '**Tags:** `${{ env.IMAGE_TAG }}` / `latest`',
                   '',
                   'ArgoCD will automatically sync the changes from [process-gpt-k8s](https://github.com/uengine-oss/process-gpt-k8s)',
                   '',

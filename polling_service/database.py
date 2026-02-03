@@ -17,6 +17,7 @@ import os
 import uuid
 import json
 import asyncio
+import requests
 
 
 supabase_client_var = ContextVar('supabase', default=None)
@@ -1272,14 +1273,6 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
         if workitem:
             workitem.status = activity_data['result']
             workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul')) if activity_data['result'] == 'DONE' else None
-            if workitem.user_id == '' or workitem.user_id == None:
-                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
-                    workitem.user_id = safeget(activity, 'agent', None)
-                else:
-                    user_info = fetch_assignee_info(activity_data['nextUserEmail'])
-                    if user_info:
-                        workitem.user_id = user_info.get('id')
-                        workitem.username = user_info.get('name')
             if workitem.agent_mode == None:
                 workitem.agent_mode = determine_agent_mode(workitem.user_id, workitem.agent_mode)
                 if workitem.agent_mode == 'COMPLETE' and (workitem.agent_orch == 'none' or workitem.agent_orch == None):
@@ -1321,9 +1314,14 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
             if activity:
                 prev_activities = process_definition.find_prev_activities(safeget(activity, 'id', ''), [])
                 start_date = datetime.now(pytz.timezone('Asia/Seoul'))
+                
+                # reference_ids 설정 (이전 액티비티 ID 목록)
+                reference_ids = []
                 if prev_activities:
+                    reference_ids = fetch_prev_task_ids(process_definition, safeget(activity, 'id', ''), process_instance_data['proc_inst_id'])
                     for prev_activity in prev_activities:
                         start_date = start_date + timedelta(days=safeget(prev_activity, 'duration', 0))
+                
                 due_date = start_date + timedelta(days=safeget(activity, 'duration', 0)) if safeget(activity, 'duration', 0) else None
                 agent_mode = determine_agent_mode(activity_data['nextUserEmail'], safeget(activity, 'agentMode', None))
                 agent_orch = safeget(activity, 'orchestration', None)
@@ -1334,8 +1332,72 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 
                 user_info = fetch_assignee_info(activity_data['nextUserEmail'])
                 user_id = user_info.get('id')
+                
+                # assignees 초기화
+                assignees = []
+                if process_result_data.get('roleBindings'):
+                    role_bindings = process_result_data['roleBindings']
+                    for role_binding in role_bindings:
+                        if role_binding['name'] == safeget(activity, 'role', ''):
+                            assignees.append(role_binding)
+                
+                # activity.agent가 있으면 user_id에 추가 (중복 체크, 우선순위 높음)
                 if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
-                    user_id = safeget(activity, 'agent', None)
+                    agent_id = safeget(activity, 'agent', None)
+                    
+                    # 기존 user_id와 조인 (중복 체크)
+                    if user_id:
+                        user_ids = [uid.strip() for uid in user_id.split(',') if uid.strip()]
+                        if agent_id not in user_ids:
+                            user_ids.insert(0, agent_id)  # activity.agent를 맨 앞에 추가 (우선순위)
+                        user_id = ','.join(user_ids)
+                    else:
+                        user_id = agent_id
+                    
+                    # assignees에서 activity.role과 이름이 같은 role_binding의 endpoint를 확장
+                    role_name = safeget(activity, 'role', '')
+                    updated_role_binding = False
+                    for assignee in assignees:
+                        if assignee.get('name') != role_name:
+                            continue
+                        assignee_endpoint = assignee.get('endpoint')
+                        # endpoint가 리스트인 경우: agent_id가 없으면 append
+                        if isinstance(assignee_endpoint, list):
+                            if agent_id not in assignee_endpoint:
+                                assignee_endpoint.append(agent_id)
+                                assignee['endpoint'] = assignee_endpoint
+                        # endpoint가 문자열/단일 값인 경우
+                        elif isinstance(assignee_endpoint, str) and assignee_endpoint.strip() != "":
+                            if assignee_endpoint != agent_id:
+                                assignee['endpoint'] = [assignee_endpoint, agent_id]
+                        # endpoint가 없거나 빈 경우
+                        else:
+                            assignee['endpoint'] = agent_id
+                        updated_role_binding = True
+                        break
+                    
+                    # 동일 role의 role_binding이 없으면 새로 하나 추가
+                    if not updated_role_binding:
+                        assignees.append({
+                            "name": role_name,
+                            "endpoint": agent_id
+                        })
+                
+                # 최종 user_id 기준으로 username 재계산
+                username = ''
+                if user_id:
+                    if ',' in user_id:
+                        usernames = []
+                        user_ids = user_id.split(',')
+                        for id in user_ids:
+                            user_info_item = fetch_assignee_info(id.strip())
+                            if user_info_item:
+                                usernames.append(user_info_item.get('name', ''))
+                        username = ','.join([name for name in usernames if name])
+                    else:
+                        user_info = fetch_assignee_info(user_id.strip())
+                        if user_info:
+                            username = user_info.get('name', '')
                 
                 if workitem and workitem.query:
                     query = workitem.query
@@ -1355,17 +1417,19 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 
                 workitem = WorkItem(
                     id=str(uuid.uuid4()),
+                    reference_ids=reference_ids if prev_activities else [],
                     proc_inst_id=process_instance_data['proc_inst_id'],
                     proc_def_id=process_result_data['processDefinitionId'].lower(),
                     activity_id=safeget(activity, 'id', ''),
                     activity_name= f"{safeget(activity, 'name', '')}{scope_name}",
                     user_id=user_id,
-                    username=user_info.get('name'),
+                    username=username,
                     status=activity_data['result'],
                     start_date=start_date,
                     due_date=due_date,
                     tool=safeget(activity, 'tool', ''),
                     tenant_id=tenant_id,
+                    assignees=assignees if assignees else [],
                     agent_mode=agent_mode,
                     description=description,
                     query=query,
@@ -1414,6 +1478,42 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 workitem_dict["start_date"] = workitem.start_date.isoformat() if workitem.start_date else None
                 workitem_dict["end_date"] = workitem.end_date.isoformat() if workitem.end_date else None
                 workitem_dict["due_date"] = workitem.due_date.isoformat() if workitem.due_date else None
+
+                # TEMP: 콜봇 테스트코드드 다음 업무 생성 시 특정 담당자(frcp9408@gmail.com)에게 브라우저 콜 트리거
+                try:
+                    target_email = "frcp9408@gmail.com"
+                    trigger_url = "https://monitor-faithful-slightly.ngrok-free.app/call/client"
+                    trigger_identity = "browser-user"
+                    status_val = (workitem_dict.get("status") or "").upper()
+                    assignee_id = workitem_dict.get("user_id")
+
+                    print(f"[TwilioTrigger][next] status={status_val} assignee_id={assignee_id} activity={workitem.activity_id}")
+
+                    if status_val in ("IN_PROGRESS", "TODO", "NEW") and isinstance(assignee_id, str):
+                        assignee_email = ""
+                        try:
+                            user_row = fetch_user_info(assignee_id)
+                            assignee_email = (user_row.get("email") or "").lower()
+                            print(f"[TwilioTrigger][next] resolved via user lookup -> email={assignee_email}")
+                        except Exception as e:
+                            print(f"[TwilioTrigger][next] user lookup failed ({assignee_id}): {e}")
+                            assignee_info = fetch_assignee_info(assignee_id) or {}
+                            assignee_email = (assignee_info.get("email") or assignee_id or "").lower()
+                            print(f"[TwilioTrigger][next] resolved via email fallback -> email={assignee_email}")
+
+                        if assignee_email == target_email and trigger_url:
+                            try:
+                                resp = requests.post(trigger_url, json={"identity": trigger_identity}, timeout=5)
+                                resp.raise_for_status()
+                                print(f"[TwilioTrigger][next] fired for {assignee_email} -> {trigger_url}")
+                            except Exception as exc:
+                                print(f"[TwilioTrigger][next] Failed trigger for {assignee_email}: {exc}")
+                        else:
+                            print(f"[TwilioTrigger][next] skipped: email mismatch or no trigger_url (email={assignee_email})")
+                    else:
+                        print(f"[TwilioTrigger][next] skipped: status={status_val}, assignee={assignee_id}")
+                except Exception as exc:
+                    print(f"[TwilioTrigger][next] Skipped trigger logic: {exc}")
 
                 # browser-automation-agent인 경우 상세한 description 생성
                 # if workitem.agent_orch == 'browser-automation-agent':
@@ -1518,20 +1618,6 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                             user_id = ','.join(role_binding['endpoint']) if isinstance(role_binding['endpoint'], list) else role_binding['endpoint']
                             assignees.append(role_binding)
                 
-                username = ''
-                if ',' in user_id:
-                    usernames = []
-                    user_ids = user_id.split(',')
-                    for id in user_ids:
-                        user_info = fetch_assignee_info(id)
-                        if user_info:
-                            usernames.append(user_info.get('name'))
-                    username = ','.join(usernames)
-                else:
-                    user_info = fetch_assignee_info(user_id)
-                    if user_info:
-                        username = user_info.get('name')
-                
                 agent_mode = determine_agent_mode(user_id, safeget(activity, 'agentMode', None))
                 agent_orch = safeget(activity, 'orchestration', None)
                 if agent_orch is None or agent_orch == 'none' or agent_orch == 'None' or agent_orch == '':
@@ -1563,8 +1649,63 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 if not activity_tool and 'task' in activity_type:
                     activity_tool = 'formHandler:defaultForm'
                     
+                # activity.agent가 있으면 user_id에 추가 (중복 체크, 우선순위 높음)
                 if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
-                    user_id = safeget(activity, 'agent', None)
+                    agent_id = safeget(activity, 'agent', None)
+                    
+                    # 기존 user_id와 조인 (중복 체크)
+                    if user_id:
+                        user_ids = [uid.strip() for uid in user_id.split(',') if uid.strip()]
+                        if agent_id not in user_ids:
+                            user_ids.insert(0, agent_id)  # activity.agent를 맨 앞에 추가 (우선순위)
+                        user_id = ','.join(user_ids)
+                    else:
+                        user_id = agent_id
+                    
+                    # assignees에서 activity.role과 이름이 같은 role_binding의 endpoint를 확장
+                    role_name = safeget(activity, 'role', '')
+                    updated_role_binding = False
+                    for assignee in assignees:
+                        if assignee.get('name') != role_name:
+                            continue
+                        assignee_endpoint = assignee.get('endpoint')
+                        # endpoint가 리스트인 경우: agent_id가 없으면 append
+                        if isinstance(assignee_endpoint, list):
+                            if agent_id not in assignee_endpoint:
+                                assignee_endpoint.append(agent_id)
+                                assignee['endpoint'] = assignee_endpoint
+                        # endpoint가 문자열/단일 값인 경우
+                        elif isinstance(assignee_endpoint, str) and assignee_endpoint.strip() != "":
+                            if assignee_endpoint != agent_id:
+                                assignee['endpoint'] = [assignee_endpoint, agent_id]
+                        # endpoint가 없거나 빈 경우
+                        else:
+                            assignee['endpoint'] = agent_id
+                        updated_role_binding = True
+                        break
+                    
+                    # 동일 role의 role_binding이 없으면 새로 하나 추가
+                    if not updated_role_binding:
+                        assignees.append({
+                            "name": role_name,
+                            "endpoint": agent_id
+                        })
+                
+                # 최종 user_id 기준으로 username 재계산
+                username = ''
+                if user_id:
+                    if ',' in user_id:
+                        usernames = []
+                        user_ids = user_id.split(',')
+                        for id in user_ids:
+                            user_info = fetch_assignee_info(id.strip())
+                            if user_info:
+                                usernames.append(user_info.get('name', ''))
+                        username = ','.join([name for name in usernames if name])
+                    else:
+                        user_info = fetch_assignee_info(user_id.strip())
+                        if user_info:
+                            username = user_info.get('name', '')
 
                 workitem = WorkItem(
                     id=f"{str(uuid.uuid4())}",
@@ -1784,8 +1925,6 @@ def delete_workitem(workitem_id: str, tenant_id: Optional[str] = None):
         supabase.table('todolist').delete().eq('id', workitem_id).eq('tenant_id', tenant_id).execute()
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-
-
 def upsert_chat_message(chat_room_id: str, data: Any, tenant_id: Optional[str] = None) -> None:
     """
     채팅 메시지를 upsert하는 함수
