@@ -13,6 +13,7 @@ from database import (
     supabase_client_var,
     subdomain_var
 )
+from polling_service.outbound_notify import insert_outbound_call_queue, send_sms
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -563,6 +564,157 @@ async def submit_task(
         raise
     except Exception as e:
         logger.error(f"[Callbot Task Submit] Exception: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.post("/outbound/status")
+async def update_outbound_status(
+    queue_id: str = Body(..., embed=True, description="outbound_call_queue ID"),
+    call_status: str = Body(..., embed=True, description="Twilio CallStatus"),
+):
+    """
+    Twilio Status Callback 처리용: outbound_call_queue 상태 업데이트
+    
+    Parameters:
+    - queue_id: outbound_call_queue UUID
+    - call_status: Twilio CallStatus (initiated, ringing, in-progress, completed, no-answer, busy, failed, canceled)
+    
+    Returns:
+    - success: 성공 여부
+    - queue_id: 업데이트된 큐 ID
+    - status: 업데이트된 상태
+    """
+    try:
+        from datetime import datetime, timezone
+        
+        logger.info(f"[Outbound Status] Request - queue_id: {queue_id}, call_status: {call_status}")
+        
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Supabase client not configured")
+        
+        # Twilio 상태 → 우리 상태 매핑
+        status_map = {
+            "initiated": "PENDING",
+            "ringing": "RINGING",
+            "in-progress": "CONNECTED",
+            "completed": "COMPLETED",
+            "no-answer": "NO_ANSWER",
+            "busy": "REJECTED",
+            "failed": "FAILED",
+            "canceled": "CANCELLED",
+        }
+        
+        normalized_status = call_status.lower()
+        new_status = status_map.get(normalized_status)
+        if not new_status:
+            logger.warning(f"[Outbound Status] Unknown status: {call_status}")
+            return {"success": False, "error": f"Unknown status: {call_status}"}
+
+        # completed라도 업무가 아직 IN_PROGRESS면 완료 처리하지 않음
+        if new_status == "COMPLETED":
+            try:
+                queue_resp = supabase.table("outbound_call_queue").select("workitem_id, tenant_id").eq("id", queue_id).execute()
+                queue_row = queue_resp.data[0] if queue_resp.data else None
+                if queue_row:
+                    todo_resp = supabase.table("todolist").select("status").eq(
+                        "id", queue_row["workitem_id"]
+                    ).eq("tenant_id", queue_row["tenant_id"]).execute()
+                    todo_status = (todo_resp.data[0].get("status") if todo_resp.data else None)
+                    if todo_status == "IN_PROGRESS":
+                        new_status = "DISCONNECTED"
+                        logger.info(f"[Outbound Status] Call completed but task still IN_PROGRESS. Marked DISCONNECTED.")
+            except Exception as exc:
+                logger.warning(f"[Outbound Status] Failed to check todolist status: {exc}")
+        
+        # 시간 필드 결정
+        update_data = {
+            "status": new_status,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        if new_status == "RINGING":
+            update_data["started_at"] = datetime.now(timezone.utc).isoformat()
+        elif new_status == "CONNECTED":
+            update_data["connected_at"] = datetime.now(timezone.utc).isoformat()
+        elif new_status in ("COMPLETED", "NO_ANSWER", "REJECTED", "FAILED", "CANCELLED"):
+            update_data["ended_at"] = datetime.now(timezone.utc).isoformat()
+        
+        # DB 업데이트
+        response = supabase.table("outbound_call_queue").update(update_data).eq("id", queue_id).execute()
+        
+        logger.info(f"[Outbound Status] ✅ Updated queue {queue_id} to status {new_status}")
+
+        # ✅ 콜이 완료되지 않았으면 SMS로 안내 (전화 실패 시 fallback)
+        if new_status in ("NO_ANSWER", "REJECTED", "FAILED", "CANCELLED", "DISCONNECTED"):
+            queue_resp = supabase.table("outbound_call_queue").select("*").eq("id", queue_id).execute()
+            queue_row = queue_resp.data[0] if queue_resp.data else None
+            
+            if not queue_row:
+                logger.warning(f"[Outbound Status] Queue not found for SMS fallback: {queue_id}")
+            elif queue_row.get("channel") != "phone":
+                logger.info(f"[Outbound Status] Skip SMS fallback (channel={queue_row.get('channel')})")
+            else:
+                workitem_id = queue_row.get("workitem_id")
+                tenant_id = queue_row.get("tenant_id")
+                user_id = queue_row.get("user_id")
+                
+                # 이미 fallback SMS가 발송되었는지 확인
+                sms_exists = supabase.table("outbound_call_queue").select("id").eq(
+                    "workitem_id", workitem_id
+                ).eq("channel", "sms").eq("trigger_reason", "call_fallback").execute()
+                
+                if sms_exists.data:
+                    logger.info(f"[Outbound Status] SMS fallback already sent for workitem={workitem_id}")
+                else:
+                    # 사용자 전화번호 조회
+                    phone_number = None
+                    try:
+                        user_info = fetch_user_info_by_uid(user_id)
+                        phone_number = user_info.get("phone_number")
+                    except Exception as exc:
+                        logger.warning(f"[Outbound Status] Failed to fetch user info: {exc}")
+                    
+                    if not phone_number:
+                        logger.warning(f"[Outbound Status] No phone_number for SMS fallback (user_id={user_id})")
+                    else:
+                        # 업무명 조회
+                        activity_name = "새 업무"
+                        try:
+                            todo_resp = supabase.table("todolist").select("activity_name").eq(
+                                "id", workitem_id
+                            ).eq("tenant_id", tenant_id).execute()
+                            if todo_resp.data:
+                                activity_name = todo_resp.data[0].get("activity_name") or activity_name
+                        except Exception as exc:
+                            logger.warning(f"[Outbound Status] Failed to fetch activity name: {exc}")
+                        
+                        try:
+                            sms_queue_id = insert_outbound_call_queue(
+                                workitem_id=workitem_id,
+                                user_id=user_id,
+                                tenant_id=tenant_id,
+                                channel="sms",
+                                trigger_reason="call_fallback"
+                            )
+                            sms_body = f"[ProcessGPT] 전화 연결이 되지 않아 문자로 안내드립니다: {activity_name}"
+                            send_sms(sms_queue_id, phone_number, sms_body)
+                        except Exception as exc:
+                            logger.error(f"[Outbound Status] SMS fallback failed: {exc}")
+        
+        return {
+            "success": True,
+            "queue_id": queue_id,
+            "status": new_status
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Outbound Status] Exception: {str(e)}", exc_info=True)
         return {
             "success": False,
             "error": str(e)

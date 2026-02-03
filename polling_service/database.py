@@ -6,7 +6,7 @@ from langchain_community.vectorstores import SupabaseVectorStore
 from process_definition import ProcessDefinition, load_process_definition, UIDefinition
 from fastapi import HTTPException
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextvars import ContextVar
 from dotenv import load_dotenv
 from llm_factory import create_llm
@@ -1479,41 +1479,18 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 workitem_dict["end_date"] = workitem.end_date.isoformat() if workitem.end_date else None
                 workitem_dict["due_date"] = workitem.due_date.isoformat() if workitem.due_date else None
 
-                # TEMP: 콜봇 테스트코드드 다음 업무 생성 시 특정 담당자(frcp9408@gmail.com)에게 브라우저 콜 트리거
+                # Outbound 알림: prefer_contact에 따라 전화 또는 SMS 발송
                 try:
-                    target_email = "frcp9408@gmail.com"
-                    trigger_url = "https://monitor-faithful-slightly.ngrok-free.app/call/client"
-                    trigger_identity = "browser-user"
-                    status_val = (workitem_dict.get("status") or "").upper()
-                    assignee_id = workitem_dict.get("user_id")
-
-                    print(f"[TwilioTrigger][next] status={status_val} assignee_id={assignee_id} activity={workitem.activity_id}")
-
-                    if status_val in ("IN_PROGRESS", "TODO", "NEW") and isinstance(assignee_id, str):
-                        assignee_email = ""
-                        try:
-                            user_row = fetch_user_info(assignee_id)
-                            assignee_email = (user_row.get("email") or "").lower()
-                            print(f"[TwilioTrigger][next] resolved via user lookup -> email={assignee_email}")
-                        except Exception as e:
-                            print(f"[TwilioTrigger][next] user lookup failed ({assignee_id}): {e}")
-                            assignee_info = fetch_assignee_info(assignee_id) or {}
-                            assignee_email = (assignee_info.get("email") or assignee_id or "").lower()
-                            print(f"[TwilioTrigger][next] resolved via email fallback -> email={assignee_email}")
-
-                        if assignee_email == target_email and trigger_url:
-                            try:
-                                resp = requests.post(trigger_url, json={"identity": trigger_identity}, timeout=5)
-                                resp.raise_for_status()
-                                print(f"[TwilioTrigger][next] fired for {assignee_email} -> {trigger_url}")
-                            except Exception as exc:
-                                print(f"[TwilioTrigger][next] Failed trigger for {assignee_email}: {exc}")
-                        else:
-                            print(f"[TwilioTrigger][next] skipped: email mismatch or no trigger_url (email={assignee_email})")
-                    else:
-                        print(f"[TwilioTrigger][next] skipped: status={status_val}, assignee={assignee_id}")
+                    from outbound_notify import process_outbound_notify
+                    process_outbound_notify(
+                        workitem_id=str(workitem.id),
+                        workitem_status=workitem_dict.get("status", ""),
+                        user_id=workitem_dict.get("user_id", ""),
+                        tenant_id=tenant_id,
+                        activity_name=workitem_dict.get("activity_name", "새 업무")
+                    )
                 except Exception as exc:
-                    print(f"[TwilioTrigger][next] Skipped trigger logic: {exc}")
+                    print(f"[OutboundNotify] Skipped: {exc}")
 
                 # browser-automation-agent인 경우 상세한 description 생성
                 # if workitem.agent_orch == 'browser-automation-agent':
