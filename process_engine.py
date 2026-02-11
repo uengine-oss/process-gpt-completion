@@ -142,7 +142,6 @@ async def submit_workitem(input: dict):
         if process_instance is not None:
             workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_id, activity_id)
         else:
-            process_instance_id = f"{process_definition_id.lower()}.{str(uuid.uuid4())}"
             await create_process_instance(process_definition, process_instance_id, False, role_bindings, project_id)
     else:
         raise HTTPException(status_code=400, detail="Process instance id is required")
