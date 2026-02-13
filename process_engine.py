@@ -81,6 +81,15 @@ async def create_process_instance(process_definition, process_instance_id, is_in
     
 
 async def submit_workitem(input: dict):
+    # Request-scoped trace id for debugging duplicated workitems
+    trace_id = str(uuid.uuid4())
+    try:
+        # tenant_id is managed via ContextVar in database.py (DBConfigMiddleware)
+        from database import subdomain_var
+        tenant_ctx = subdomain_var.get()
+    except Exception:
+        tenant_ctx = None
+
     process_instance_id = input.get('process_instance_id')
     process_definition_id = input.get('process_definition_id')
     activity_id = input.get('activity_id')
@@ -88,25 +97,59 @@ async def submit_workitem(input: dict):
     task_id = input.get('task_id')
     version_tag = input.get('version_tag')
     version = input.get('version')
+
+    print(
+        "[SUBMIT][{trace}] start tenant_ctx={tenant} task_id={task_id} "
+        "proc_inst_id={pi} proc_def_id={pd} activity_id={aid} version_tag={vt} version={v}".format(
+            trace=trace_id,
+            tenant=tenant_ctx,
+            task_id=task_id,
+            pi=process_instance_id,
+            pd=process_definition_id,
+            aid=activity_id,
+            vt=version_tag,
+            v=version,
+        )
+    )
     
     process_definition_json = fetch_process_definition_by_version(process_definition_id, version_tag, version)
-    process_definition = load_process_definition(process_definition_json)
+    process_definition = load_process_definition(process_definition_json) if process_definition_json else None
     
+    # NOTE:
+    # - task_id가 넘어오면 기존 todolist row를 "업데이트"해야 한다.
+    # - 아래에서 workitem을 다시 None으로 초기화하면 새 UUID로 row가 생성되어
+    #   동일 activity_id가 2개 생기는(기존 IN_PROGRESS + 신규 DONE/SUBMITTED) 문제가 발생한다.
+    workitem = None
     if task_id is not None:
         workitem = fetch_workitem_by_id(task_id)
+        print(
+            "[SUBMIT][{trace}] fetch_by_id task_id={task_id} -> {found}{wid}{st}".format(
+                trace=trace_id,
+                task_id=task_id,
+                found="FOUND " if workitem is not None else "NOT_FOUND",
+                wid=(f" id={getattr(workitem,'id',None)}" if workitem is not None else ""),
+                st=(f" status={getattr(workitem,'status',None)}" if workitem is not None else ""),
+            )
+        )
         if workitem is not None:
             activity_id = workitem.activity_id
             process_definition_id = workitem.proc_def_id
             process_instance_id = workitem.proc_inst_id
             project_id = workitem.project_id
+            # task_id 기반으로 proc_def_id가 바뀔 수 있으므로 정의를 다시 로드
+            try:
+                process_definition_json = fetch_process_definition_by_version(process_definition_id, version_tag, version)
+                process_definition = load_process_definition(process_definition_json) if process_definition_json else process_definition
+            except Exception as e:
+                print(f"[SUBMIT][{trace_id}] warn: failed to reload definition after task_id override: {e}")
 
+    # Resolve activity_id as early as possible (needed for matching existing todolist row)
     if activity_id is None:
+        if not process_definition:
+            raise HTTPException(status_code=400, detail="Process definition is required to resolve initial activity")
         activity_id = process_definition.find_initial_activity().id
-    activity = process_definition.find_activity_by_id(activity_id)
-    if activity is not None:
-        prev_activities = process_definition.find_prev_activities(activity.id, [])
-    else:
-        prev_activities = []
+    activity = process_definition.find_activity_by_id(activity_id) if process_definition else None
+    prev_activities = process_definition.find_prev_activities(activity.id, []) if (process_definition and activity is not None) else []
 
     role_bindings = input.get('role_mappings')
     output = input.get('form_values')
@@ -135,13 +178,35 @@ async def submit_workitem(input: dict):
 
     if not user_email:
         user_email = input.get('email')
-        
-    workitem = None
+
+    # Try to match an existing todolist row even if bpm_proc_inst row is missing.
+    # This prevents creating a second workitem row for the same proc_inst_id+activity_id.
+    if workitem is None and process_instance_id is not None and activity_id is not None:
+        try:
+            workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_id, activity_id, tenant_ctx)
+        except Exception as e:
+            print(f"[SUBMIT][{trace_id}] warn: fetch_by_proc_act failed: {e}")
+            workitem = None
+        print(
+            "[SUBMIT][{trace}] fetch_by_proc_act proc_inst_id={pi} activity_id={aid} tenant_id={t} -> {found}{wid}{st}".format(
+                trace=trace_id,
+                pi=process_instance_id,
+                aid=activity_id,
+                t=tenant_ctx,
+                found="FOUND " if workitem is not None else "NOT_FOUND",
+                wid=(f" id={getattr(workitem,'id',None)}" if workitem is not None else ""),
+                st=(f" status={getattr(workitem,'status',None)}" if workitem is not None else ""),
+            )
+        )
+
     if process_instance_id is not None:
-        process_instance = fetch_process_instance(process_instance_id)
-        if process_instance is not None:
-            workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_id, activity_id)
-        else:
+        process_instance = fetch_process_instance(process_instance_id, tenant_ctx)
+        print(
+            f"[SUBMIT][{trace_id}] fetch_process_instance proc_inst_id={process_instance_id} tenant_id={tenant_ctx} "
+            f"-> {'FOUND' if process_instance is not None else 'NOT_FOUND'}"
+        )
+        if process_instance is None:
+            print(f"[SUBMIT][{trace_id}] create_process_instance proc_inst_id={process_instance_id} tenant_id={tenant_ctx}")
             await create_process_instance(process_definition, process_instance_id, False, role_bindings, project_id)
     else:
         raise HTTPException(status_code=400, detail="Process instance id is required")
@@ -226,7 +291,17 @@ async def submit_workitem(input: dict):
             "version_tag": version_tag,
             "version": version
         }
-    
+
+    print(
+        "[SUBMIT][{trace}] upsert id={wid} proc_inst_id={pi} activity_id={aid} status={st} (workitem_matched={matched})".format(
+            trace=trace_id,
+            wid=workitem_data.get("id"),
+            pi=workitem_data.get("proc_inst_id"),
+            aid=workitem_data.get("activity_id"),
+            st=workitem_data.get("status"),
+            matched=("yes" if workitem is not None else "no"),
+        )
+    )
     upsert_workitem(workitem_data)
     return workitem_data
 

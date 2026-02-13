@@ -1,0 +1,26 @@
+.git
+.gitignore
+.github
+.vscode
+
+# Local env / secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Local runtime/artifacts
+*.sqlite
+*.db
+assets/
+terminals/

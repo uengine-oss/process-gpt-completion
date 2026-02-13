@@ -27,7 +27,9 @@ CONSUMER_FILTER = os.getenv("WORKITEM_CONSUMER")
 
 def setting_database():
     try:
-        load_dotenv(override=True)
+        # Do not override env vars provided by container/K8s.
+        # This prevents baked-in .env from breaking deployments.
+        load_dotenv(override=False)
 
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_KEY")
@@ -1010,11 +1012,10 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
             execution_scope =''
         
         for completed_activity in process_result_data['completedActivities']:
-            workitem = fetch_workitem_by_proc_inst_and_activity(
-                process_instance_data['proc_inst_id'],
-                completed_activity['completedActivityId'],
-                tenant_id
-            )
+            proc_inst_id = process_instance_data['proc_inst_id']
+            completed_id = completed_activity['completedActivityId']
+
+            workitem = fetch_workitem_by_proc_inst_and_activity(proc_inst_id, completed_id, tenant_id)
             
             if workitem:
                 workitem.status = completed_activity['result']
@@ -1036,10 +1037,37 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                 if  cannotProceedErrors and len(cannotProceedErrors) > 0:
                     workitem.log = "\n".join(f"[{error.get('type', '')}] {error.get('reason', '')}" for error in cannotProceedErrors);
             else:
+                # If we get here, we're about to CREATE a new completed workitem row.
+                # This is acceptable for tasks that never had a todolist row (e.g., some internal/script tasks),
+                # but for user tasks it often indicates a matching bug. Log enough context to debug from container logs.
+                try:
+                    existing = fetch_todolist_by_proc_inst_id(proc_inst_id, tenant_id) or []
+                    summary = [
+                        {
+                            "id": getattr(wi, "id", None),
+                            "activity_id": getattr(wi, "activity_id", None),
+                            "status": getattr(wi, "status", None),
+                        }
+                        for wi in existing
+                    ]
+                    print(
+                        "[WARN] upsert_completed_workitem: no existing workitem found; creating new row "
+                        f"tenant_id={tenant_id} proc_inst_id={proc_inst_id} completedActivityId={completed_id} "
+                        f"existing_count={len(existing)} existing={summary}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(
+                        f"[WARN] upsert_completed_workitem: failed to log existing workitems "
+                        f"tenant_id={tenant_id} proc_inst_id={proc_inst_id} completedActivityId={completed_id} err={e}",
+                        flush=True,
+                    )
+
                 activity = process_definition.find_activity_by_id(completed_activity['completedActivityId'])
                 start_date = datetime.now(pytz.timezone('Asia/Seoul'))
                 due_date = start_date + timedelta(days=safeget(activity, 'duration', 0)) if safeget(activity, 'duration', 0) else None
                 assignees = []
+                user_id = None
                 if process_instance_data['role_bindings']:
                     role_bindings = process_instance_data['role_bindings']
                     for role_binding in role_bindings:
@@ -1048,7 +1076,7 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                             assignees.append(role_binding)
                 
                 user_info = None
-                if completed_activity['completedUserEmail'] != user_id:
+                if completed_activity.get('completedUserEmail') and completed_activity['completedUserEmail'] != user_id:
                     user_info = fetch_assignee_info(completed_activity['completedUserEmail'])
 
                 agent_orch = safeget(activity, 'orchestration', None)

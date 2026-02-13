@@ -26,7 +26,9 @@ subdomain_var = ContextVar('subdomain', default='localhost')
 def setting_database():
     try:
         if os.getenv("ENV") != "production":
-            load_dotenv(override=True)
+            # Don't override env vars provided by runtime (Docker/K8s).
+            # Local dev still works because .env fills missing values.
+            load_dotenv(override=False)
 
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_KEY")

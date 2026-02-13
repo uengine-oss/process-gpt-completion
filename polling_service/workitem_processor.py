@@ -751,40 +751,79 @@ def _process_next_activities(process_instance: ProcessInstance, process_result: 
     # Ensure current_activity_ids is initialized
     if process_instance.current_activity_ids is None:
         process_instance.current_activity_ids = []
-    
-    for activity in process_result.nextActivities:
-        if activity.nextActivityId in ["endEvent", "END_PROCESS", "end_event"]:
+
+    # 1) 먼저 "이번 호출에서 완료된 활동"은 current에서 제거한다.
+    #    (nextActivities 계산/역할 해석이 실패해 비어도, 완료된 활동이 계속 current로 남아
+    #     UI에서 '완료됨' + '진행중'으로 중복 표시되는 문제를 방지)
+    completed_ids: set[str] = set()
+    try:
+        for ca in (process_result.completedActivities or []):
+            try:
+                cid = getattr(ca, "completedActivityId", None)
+                cres = (getattr(ca, "result", None) or "").upper()
+                if cid and cres in ("DONE", "SUBMITTED", "COMPLETED"):
+                    completed_ids.add(str(cid))
+            except Exception:
+                continue
+    except Exception:
+        completed_ids = set()
+
+    if completed_ids:
+        process_instance.current_activity_ids = [
+            aid for aid in (process_instance.current_activity_ids or [])
+            if str(aid) not in completed_ids
+        ]
+
+    # 2) nextActivities로부터 새 current 후보를 누적한다(기존 current는 유지 + 유니크).
+    next_acts = process_result.nextActivities or []
+    for activity in next_acts:
+        next_id = getattr(activity, "nextActivityId", None)
+        if next_id in ["endEvent", "END_PROCESS", "end_event"]:
+            # 종료로 향하면 current는 비워 종료 처리로 위임
             process_instance.current_activity_ids = []
             break
-            
-        if process_definition.find_gateway_by_id(activity.nextActivityId):
-            if activity.type == "event":
-                process_instance.current_activity_ids = [activity.nextActivityId]
-            else:
-                next_activities = process_definition.find_next_activities(activity.nextActivityId, True)
-                if next_activities:
-                    process_instance.current_activity_ids = [act.id for act in next_activities]
-                    process_result_json["nextActivities"] = []
-                    next_activity_dicts = [
-                        Activity(
-                            nextActivityId=act.id,
-                            nextUserEmail=activity.nextUserEmail,
-                            result="IN_PROGRESS"
-                        ).model_dump() for act in next_activities
-                    ]
-                    process_result_json["nextActivities"].extend(next_activity_dicts)
-                else:
-                    process_instance.current_activity_ids = []
-                    process_result_json["nextActivities"] = []
-                    break
-                
-        elif activity.result == "IN_PROGRESS" and activity.nextActivityId not in process_instance.current_activity_ids:
-            process_instance.current_activity_ids = [activity.nextActivityId]
-        else:
-            process_instance.current_activity_ids.append(activity.nextActivityId)
-        
+
+        # 게이트웨이인 경우: 이벤트 게이트웨이는 그대로, 그 외는 다음 액티비티로 확장
+        if next_id and process_definition.find_gateway_by_id(next_id):
+            if getattr(activity, "type", None) == "event":
+                if str(next_id) not in [str(x) for x in process_instance.current_activity_ids]:
+                    process_instance.current_activity_ids.append(next_id)
+                activity_obj = process_definition.find_activity_by_id(next_id)
+                check_external_customer_and_send_email(activity_obj, process_instance, process_definition)
+                continue
+
+            expanded = process_definition.find_next_activities(next_id, True) or []
+            if expanded:
+                # process_result_json에 gateway 대신 확장된 nextActivities를 반영
+                process_result_json["nextActivities"] = []
+                next_activity_dicts = [
+                    Activity(
+                        nextActivityId=act.id,
+                        nextUserEmail=getattr(activity, "nextUserEmail", None),
+                        result="IN_PROGRESS",
+                    ).model_dump()
+                    for act in expanded
+                ]
+                process_result_json["nextActivities"].extend(next_activity_dicts)
+
+                for act in expanded:
+                    if act.id and str(act.id) not in [str(x) for x in process_instance.current_activity_ids]:
+                        process_instance.current_activity_ids.append(act.id)
+                    # Check external customer and send email for expanded activities
+                    activity_obj = process_definition.find_activity_by_id(act.id)
+                    check_external_customer_and_send_email(activity_obj, process_instance, process_definition)
+                continue
+
+            # 확장 결과가 없으면 nextActivities를 비워둔다(다만 완료된 current가 살아남지 않도록 위에서 제거됨)
+            process_result_json["nextActivities"] = []
+            continue
+
+        # 일반 액티비티
+        if next_id and str(next_id) not in [str(x) for x in process_instance.current_activity_ids]:
+            process_instance.current_activity_ids.append(next_id)
+
         # Check external customer and send email
-        activity_obj = process_definition.find_activity_by_id(activity.nextActivityId)
+        activity_obj = process_definition.find_activity_by_id(next_id)
         check_external_customer_and_send_email(activity_obj, process_instance, process_definition)
 
 def _process_sub_processes(process_instance: ProcessInstance, process_result: ProcessResult, process_result_json: dict, process_definition):
