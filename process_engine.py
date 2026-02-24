@@ -244,6 +244,9 @@ async def submit_workitem(input: dict):
         workitem_data['version_tag'] = version_tag
         workitem_data['version'] = version
         
+        if not workitem.assignees or len(workitem.assignees) == 0:
+            workitem_data['assignees'] = role_bindings
+        
         revert_from = input.get('revert_from')
         if revert_from:
             workitem_data['revert_from'] = revert_from

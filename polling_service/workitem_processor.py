@@ -3014,6 +3014,27 @@ def resolve_next_activity_payloads(
 
     role_bindings_for_next = workitem.get("assignees", []) or []
 
+    # 현재 워크아이템의 assignees 정보가 없는 경우,
+    # bpm_proc_inst.role_bindings 컬럼 값을 폴백으로 사용
+    if not role_bindings_for_next:
+        try:
+            proc_inst_id = workitem.get("proc_inst_id")
+            tenant_id = workitem.get("tenant_id")
+            if proc_inst_id and tenant_id:
+                proc_inst = fetch_process_instance(proc_inst_id, tenant_id)
+                if proc_inst is not None:
+                    rb = getattr(proc_inst, "role_bindings", None)
+                    # role_bindings가 문자열로 저장되어 있을 가능성도 고려
+                    if isinstance(rb, str):
+                        try:
+                            rb = json.loads(rb)
+                        except Exception:
+                            rb = None
+                    if isinstance(rb, list):
+                        role_bindings_for_next = rb
+        except Exception as e:
+            print(f"[WARN] Failed to fallback role_bindings from process instance: {e}")
+
     def _extract_endpoint(binding: dict | None) -> str | None:
         if not isinstance(binding, dict):
             return None

@@ -800,21 +800,13 @@ def fetch_workitem_with_submitted_status(limit=10) -> Optional[List[dict]]:
         
         # Supabase Client API를 사용하여 워크아이템 조회 및 업데이트
         # 먼저 SUBMITTED 상태이고 consumer가 NULL인 워크아이템들을 조회
-        env = os.getenv("ENV")
-        if env == 'dev':
-            q = supabase.table('todolist').select('*').eq('status', 'SUBMITTED').eq('tenant_id', 'uengine')
-            if CONSUMER_FILTER:
-                q = q.eq('consumer', CONSUMER_FILTER)
-            else:
-                q = q.is_('consumer', 'null')
-            response = q.limit(limit).execute()
+        # 테넌트/환경별 분기 없이 전 테넌트 공통 조건으로 조회
+        q = supabase.table('todolist').select('*').eq('status', 'SUBMITTED')
+        if CONSUMER_FILTER:
+            q = q.eq('consumer', CONSUMER_FILTER)
         else:
-            q = supabase.table('todolist').select('*').eq('status', 'SUBMITTED').neq('tenant_id', 'uengine')
-            if CONSUMER_FILTER:
-                q = q.eq('consumer', CONSUMER_FILTER)
-            else:
-                q = q.is_('consumer', 'null')
-            response = q.limit(limit).execute()
+            q = q.is_('consumer', 'null')
+        response = q.limit(limit).execute()
         
         if not response.data:
             return None
@@ -886,21 +878,14 @@ def fetch_workitem_with_pending_status(limit=5) -> Optional[List[dict]]:
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
         
-        env = os.getenv("ENV")
-        if env == 'dev':
-            q = supabase.table('todolist').select('*').eq('status', 'PENDING').eq('tenant_id', 'uengine')
-            if CONSUMER_FILTER:
-                q = q.eq('consumer', CONSUMER_FILTER)
-            else:
-                q = q.is_('consumer', 'null')
-            response = q.limit(limit).execute()
+        # PENDING 상태이고 consumer가 NULL인 워크아이템들을 조회
+        # 테넌트/환경별 분기 없이 전 테넌트 공통 조건으로 조회
+        q = supabase.table('todolist').select('*').eq('status', 'PENDING')
+        if CONSUMER_FILTER:
+            q = q.eq('consumer', CONSUMER_FILTER)
         else:
-            q = supabase.table('todolist').select('*').eq('status', 'PENDING').neq('tenant_id', 'uengine')
-            if CONSUMER_FILTER:
-                q = q.eq('consumer', CONSUMER_FILTER)
-            else:
-                q = q.is_('consumer', 'null')
-            response = q.limit(limit).execute()
+            q = q.is_('consumer', 'null')
+        response = q.limit(limit).execute()
         
         
         if not response.data:
@@ -1295,12 +1280,43 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
     for activity_data in process_result_data['nextActivities']:
         if activity_data['nextActivityId'] in ["END_PROCESS", "endEvent", "end_event"]:
             continue
+
+        # nextUserEmail는 LLM/roleBindings에서 결정된 최종 담당자 식별자 (이메일 또는 id/UUID)
+        next_user_email = activity_data.get('nextUserEmail')
         
         workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_data['proc_inst_id'], activity_data['nextActivityId'], tenant_id)
         
         if workitem:
             workitem.status = activity_data['result']
             workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul')) if activity_data['result'] == 'DONE' else None
+
+            # 기존 workitem에 user_id가 비어 있고(nextUserEmail만 있는) 경우, 여기서 user_id/username을 보강
+            if (not getattr(workitem, 'user_id', None)) and next_user_email:
+                try:
+                    user_info = fetch_assignee_info(next_user_email)
+                    new_user_id = (user_info.get('id') if isinstance(user_info, dict) else None) or next_user_email
+                except Exception:
+                    new_user_id = next_user_email
+
+                workitem.user_id = new_user_id
+
+                # 최종 user_id 기준으로 username 재계산
+                username = ''
+                if new_user_id:
+                    if ',' in new_user_id:
+                        usernames = []
+                        user_ids = new_user_id.split(',')
+                        for id in user_ids:
+                            user_info_item = fetch_assignee_info(id.strip())
+                            if user_info_item:
+                                usernames.append(user_info_item.get('name', ''))
+                        username = ','.join([name for name in usernames if name])
+                    else:
+                        user_info_item = fetch_assignee_info(new_user_id.strip())
+                        if user_info_item:
+                            username = user_info_item.get('name', '')
+                workitem.username = username
+
             if workitem.agent_mode == None:
                 workitem.agent_mode = determine_agent_mode(workitem.user_id, workitem.agent_mode)
                 if workitem.agent_mode == 'COMPLETE' and (workitem.agent_orch == 'none' or workitem.agent_orch == None):
@@ -1351,15 +1367,24 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                         start_date = start_date + timedelta(days=safeget(prev_activity, 'duration', 0))
                 
                 due_date = start_date + timedelta(days=safeget(activity, 'duration', 0)) if safeget(activity, 'duration', 0) else None
-                agent_mode = determine_agent_mode(activity_data['nextUserEmail'], safeget(activity, 'agentMode', None))
+                agent_mode = determine_agent_mode(next_user_email, safeget(activity, 'agentMode', None))
                 agent_orch = safeget(activity, 'orchestration', None)
                 if agent_orch is None or agent_orch == 'none' or agent_orch == 'None' or agent_orch == '':
                     agent_orch = None
                 if agent_mode == 'COMPLETE' and (safeget(activity, 'orchestration', None) == 'none' or safeget(activity, 'orchestration', None) == None):
                     agent_orch = 'crewai-deep-research'
                 
-                user_info = fetch_assignee_info(activity_data['nextUserEmail'])
-                user_id = user_info.get('id')
+                user_id = None
+                if next_user_email:
+                    try:
+                        user_info = fetch_assignee_info(next_user_email)
+                        # fetch_assignee_info는 정상일 때 항상 id를 채우지만,
+                        # 어떤 경우에도 next_user_email 자체를 최종 폴백으로 사용
+                        user_id = (user_info.get('id') if isinstance(user_info, dict) else None) or next_user_email
+                    except Exception:
+                        # fetch_assignee_info 실패 시에도 next_user_email을 그대로 user_id로 사용
+                        user_id = next_user_email
+
                 
                 # assignees 초기화
                 assignees = []

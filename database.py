@@ -947,7 +947,33 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                     assignee_info = fetch_assignee_info(user_id)
                 
                 if activity.agent is not None and activity.agent != "":
-                    user_id = activity.agent
+                    agent_id = activity.agent
+                    if user_id:
+                        user_ids = [uid.strip() for uid in user_id.split(',') if uid.strip()]
+                        if agent_id not in user_ids:
+                            user_ids.insert(0, agent_id)
+                        user_id = ','.join(user_ids)
+                    else:
+                        user_id = agent_id
+                    role_name = activity.role or ''
+                    updated_role_binding = False
+                    for assignee in assignees:
+                        if assignee.get('name') != role_name:
+                            continue
+                        assignee_endpoint = assignee.get('endpoint')
+                        if isinstance(assignee_endpoint, list):
+                            if agent_id not in assignee_endpoint:
+                                assignee_endpoint.append(agent_id)
+                                assignee['endpoint'] = assignee_endpoint
+                        elif isinstance(assignee_endpoint, str) and assignee_endpoint.strip() != "":
+                            if assignee_endpoint != agent_id:
+                                assignee['endpoint'] = [assignee_endpoint, agent_id]
+                        else:
+                            assignee['endpoint'] = agent_id
+                        updated_role_binding = True
+                        break
+                    if not updated_role_binding:
+                        assignees.append({"name": role_name, "endpoint": agent_id})
                 
                 workitem = WorkItem(
                     id=f"{str(uuid.uuid4())}",
