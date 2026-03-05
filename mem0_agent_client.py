@@ -1,15 +1,17 @@
 from mem0 import Memory
 from dotenv import load_dotenv
 import os
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Any
 import json
 from datetime import datetime
 from langchain.prompts import PromptTemplate
 from langchain.schema.output_parser import StrOutputParser
 from langchain.schema.runnable import RunnablePassthrough
 from fastapi import HTTPException
-from database import fetch_chat_history
 from llm_factory import create_llm
+
+# 학습 모드 유사도 임계값 (고정 응답은 사용하지 않고 LLM이 학습 유무를 포함해 자연스럽게 답변)
+LEARNING_DUPLICATE_THRESHOLD = 0.92
 
 if os.getenv("ENV") != "production":
     load_dotenv(override=True)
@@ -25,32 +27,17 @@ connection_string = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{
 # LLM 객체 생성 (공통 팩토리 사용)
 llm = create_llm(model="gpt-4o", streaming=True)
 
-intent_analysis_prompt = PromptTemplate.from_template(
-    """이전 대화 내역과 사용자의 메시지를 바탕으로 다음 사용자의 의도를 분석해주세요.
+learning_response_prompt = PromptTemplate.from_template(
+    """당신은 사용자가 입력한 지침이나 기억을 받아들이는 에이전트입니다.
+사용자 메시지에 대해 자연스럽게 한두 문장으로 답하되, 반드시 아래 학습 결과를 포함해주세요.
 
-응답 형식:
-{{
-    "intent": "query" 또는 "information". 의도를 알 수 없는 경우 기본적으로 "information",
-    "content": "질문의 경우 검색할 내용을 제공, 정보의 경우 저장할 내용을 제공."
-}}
+- 저장한 경우: 이 내용을 잘 반영했음/기억했음/학습했음을 자연스럽게 표현해주세요.
+- 저장하지 않은 경우: 비슷한 내용이 이미 있어 새로 저장하지 않았음을 자연스럽게 표현해주세요.
 
-예시:
-- 입력: "지방에 있는 매출에 설립일 1년 이내 여자 대표이사가 운영하는 회사이다. 이 회사의 법인세 감면율은?"
-{{
-    "intent": "query",
-    "content": "지방에 있는 매출에 설립일 1년 이내 여자 대표이사가 운영하는 회사이다. 이 회사의 법인세 감면율은?"
-}}
+답변은 JSON이 아니라 평문 한두 문장으로만 작성해주세요.
 
-- 입력: "기본 법인세율: 20%"
-{{
-    "intent": "information",
-    "content": "기본 법인세율은 20% 입니다."
-}}
-
-사용자 입력: {message}
-
-이전 대화 내역:
-{chat_history}"""
+학습 결과: {learning_result}
+사용자 메시지: {user_message}"""
 )
 
 response_generation_prompt = PromptTemplate.from_template(
@@ -116,9 +103,9 @@ config = {
 
 memory = Memory.from_config(config_dict=config)
 
-intent_chain = (
+learning_response_chain = (
     RunnablePassthrough() |
-    intent_analysis_prompt |
+    learning_response_prompt |
     llm |
     StrOutputParser()
 )
@@ -130,29 +117,13 @@ response_chain = (
     StrOutputParser()
 )
 
-async def analyze_intent(message: str, chat_room_id: str = None) -> Tuple[str, Optional[Dict]]:
-    """OpenAI를 사용하여 메시지의 의도를 분석합니다."""
-    try:
-        chat_history = fetch_chat_history(chat_room_id)
-        if chat_history:
-            chat_history = "\n".join([f"{item.messages.content}" for item in chat_history if item.messages])
-        else:
-            chat_history = ""
-        result = await intent_chain.ainvoke({"message": message, "chat_history": chat_history})
-        parsed_result = json.loads(result)
-        
-        intent = parsed_result["intent"]
-        info = {
-            "content": parsed_result["content"],
-            "category": intent,
-            "confidence": 0.9,
-            "timestamp": datetime.now().isoformat()
-        }
-        return intent, info
-        
-    except Exception as e:
-        print(f"OpenAI 분석 중 오류 발생: {str(e)}")
-        return "other", {"content": "죄송합니다. 이해하지 못했습니다. 다시 요청 해주세요."}
+async def generate_learning_response(user_message: str, was_stored: bool) -> str:
+    """학습 유무를 포함한 자연스러운 답변을 생성합니다."""
+    learning_result = "저장함" if was_stored else "비슷한 내용이 있어 저장하지 않음"
+    return await learning_response_chain.ainvoke({
+        "user_message": user_message,
+        "learning_result": learning_result
+    })
 
 async def generate_response(message: str, search_results: List[Dict]) -> str:
     """검색 결과를 활용하여 응답을 생성합니다."""
@@ -185,17 +156,30 @@ def store_in_memory(agent_id: str, content: str):
         infer=False
     )
 
+def _is_duplicate_memory(search_results: List[Dict], threshold: float = LEARNING_DUPLICATE_THRESHOLD) -> bool:
+    """검색 결과 상위 1건의 유사도가 임계값 이상이면 유사 메모리 존재로 간주합니다."""
+    if not search_results:
+        return False
+    first = search_results[0]
+    score = first.get("score")
+    if score is None:
+        return False
+    return float(score) >= threshold
+
 async def process_mem0_message(text: str, agent_id: str, chat_room_id: str = None, is_learning_mode: bool = False):
     """Mem0 에이전트를 통해 메시지를 처리합니다."""
     try:
         if is_learning_mode:
-            intent = "information"
-            store_in_memory(agent_id, text)
+            search_results = search_memories(agent_id, text)
+            is_duplicate = _is_duplicate_memory(search_results)
+            if not is_duplicate:
+                store_in_memory(agent_id, text)
+            content = await generate_learning_response(text, was_stored=not is_duplicate)
             return {
                 "task_id": str(datetime.now().timestamp()),
                 "response": {
-                    "type": intent,
-                    "content": text
+                    "type": "information",
+                    "content": content
                 }
             }
         else:

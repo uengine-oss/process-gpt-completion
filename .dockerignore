@@ -1,0 +1,34 @@
+.git
+.gitignore
+.github
+.vscode
+
+# Local env / secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Node
+node_modules/
+
+# Local runtime/artifacts
+.langchain.db
+*.sqlite
+*.db
+terminals/
+assets/
+
+# Polling service local env
+polling_service/.env
+polling_service/.venv/
