@@ -28,7 +28,9 @@ rules:
     metadata:
       guide: "Python_시큐어코딩_가이드(2023)"
       section: "입력데이터 검증 및 표현 > 코드 삽입"
-    pattern: eval(...)
+    patterns:
+      - pattern: eval(...)
+      - pattern-not: eval(compile(...), ...)
 
   - id: kisa.py.injection.no-exec
     message: "[KISA PY Guide] 코드 삽입: exec() 사용 금지"

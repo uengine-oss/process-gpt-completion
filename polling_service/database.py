@@ -714,7 +714,7 @@ def fetch_workitem_by_proc_inst_and_activity(
                                 updated_at = datetime.fromisoformat(updated_at.replace('Z', '+00:00')).replace(tzinfo=None)
                             elif hasattr(updated_at, 'replace'):
                                 updated_at = updated_at.replace(tzinfo=None)
-                        except:
+                        except (ValueError, TypeError, AttributeError):
                             updated_at = None
                     
                     return (updated_at or datetime.min, rework_count)

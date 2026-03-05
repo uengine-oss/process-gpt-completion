@@ -225,7 +225,7 @@ def generate_create_statement_for_table(table_name):
         cursor = connection.cursor()
         
         # Fetch the table schema
-        cursor.execute(f"SELECT column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_name = '{table_name}'")
+        cursor.execute("SELECT column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_name = %s", (table_name,))
         columns = cursor.fetchall()
         
         if not columns:
@@ -698,7 +698,7 @@ def fetch_table_columns(table_name: str) -> List[str]:
         db_config = db_config_var.get()
         connection = psycopg2.connect(**db_config)
         cursor = connection.cursor()
-        cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table_name,))
         columns = cursor.fetchall()
         return [column[0] for column in columns]
     except Exception as e:
@@ -832,9 +832,9 @@ def fetch_workitem_by_proc_inst_and_activity(
                                 updated_at = datetime.fromisoformat(updated_at.replace('Z', '+00:00')).replace(tzinfo=None)
                             elif hasattr(updated_at, 'replace'):
                                 updated_at = updated_at.replace(tzinfo=None)
-                        except:
+                        except (ValueError, TypeError, AttributeError):
                             updated_at = None
-                    
+
                     return (updated_at or datetime.min, rework_count)
                 
                 most_recent_item = max(response.data, key=get_recent_key)
