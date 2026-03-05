@@ -100,6 +100,10 @@ jobs:
   build-and-deploy:
     needs: [tests, security-checks]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
 
     steps:
       - name: Checkout code
@@ -122,6 +126,43 @@ jobs:
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
           echo "IMAGE_NAME_LATEST=$IMAGE_NAME_LATEST" >> $GITHUB_ENV
+
+      # ── Docker 이미지 서명 (cosign keyless - Sigstore OIDC) ──
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Docker image with cosign
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_NAME 2>/dev/null || \
+                   docker inspect --format='{{.Id}}' $IMAGE_NAME)
+          cosign sign --yes "$DIGEST"
+          echo "SIGNED_DIGEST=$DIGEST" >> $GITHUB_ENV
+
+      # ── 배포 파일 해시값 (SHA256) ──
+      - name: Generate deployment artifact hashes
+        run: |
+          mkdir -p reports
+          echo "# Deployment Artifact Hashes" > reports/SHA256SUMS
+          echo "# Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> reports/SHA256SUMS
+          echo "# Commit: ${{ github.sha }}" >> reports/SHA256SUMS
+          echo "" >> reports/SHA256SUMS
+          # Docker image digest
+          echo "## Docker Image" >> reports/SHA256SUMS
+          docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_NAME >> reports/SHA256SUMS 2>/dev/null || true
+          echo "" >> reports/SHA256SUMS
+          # Dockerfile hash
+          echo "## Source Files" >> reports/SHA256SUMS
+          sha256sum Dockerfile >> reports/SHA256SUMS
+          sha256sum requirements.txt >> reports/SHA256SUMS
+          cat reports/SHA256SUMS
+
+      - name: Upload hash report
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-hashes-${{ github.sha }}
+          path: reports/SHA256SUMS
 
       - name: Checkout GitOps repository
         uses: actions/checkout@v3
@@ -165,6 +206,7 @@ jobs:
           echo "| **Tag** | \`${{ env.IMAGE_TAG }}\` / \`latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | [\`${{ github.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |" >> $GITHUB_STEP_SUMMARY
           echo "| **GitOps Repo** | [process-gpt-k8s](https://github.com/uengine-oss/process-gpt-k8s) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Cosign Signed** | \`${{ env.SIGNED_DIGEST }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "✅ ArgoCD will automatically sync the changes from the GitOps repository." >> $GITHUB_STEP_SUMMARY
 
