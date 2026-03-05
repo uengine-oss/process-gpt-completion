@@ -62,10 +62,53 @@ jobs:
       contents: read
       packages: write
       id-token: write
+      attestations: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+
+      # ── 배포 아티팩트 패키징 및 코드서명 ──
+      - name: Package deployment artifact
+        run: |
+          tar -czf process-gpt-completion-${{ github.sha }}.tar.gz \
+            --exclude='__pycache__' --exclude='.venv' --exclude='tests' --exclude='.git' \
+            *.py polling_service/ features/ fcm_service/ requirements.txt Dockerfile
+
+      - name: Generate SHA256SUMS
+        run: |
+          sha256sum process-gpt-completion-${{ github.sha }}.tar.gz > SHA256SUMS
+          sha256sum requirements.txt >> SHA256SUMS
+          sha256sum Dockerfile >> SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign build artifact with cosign (code signing)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign-blob --yes \
+            --output-signature process-gpt-completion-${{ github.sha }}.tar.gz.sig \
+            --output-certificate process-gpt-completion-${{ github.sha }}.tar.gz.cert \
+            process-gpt-completion-${{ github.sha }}.tar.gz
+
+      # SLSA Build Provenance 증명 (GitHub Attestation)
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: process-gpt-completion-${{ github.sha }}.tar.gz
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-gpt-completion-dist-prod-${{ github.sha }}
+          path: |
+            process-gpt-completion-${{ github.sha }}.tar.gz
+            process-gpt-completion-${{ github.sha }}.tar.gz.sig
+            process-gpt-completion-${{ github.sha }}.tar.gz.cert
+            SHA256SUMS
 
       - name: Log in to GHCR
         run: |
