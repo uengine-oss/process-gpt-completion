@@ -33,7 +33,7 @@ import os
 import argparse
 from supabase import create_client, Client
 import json
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET
 from datetime import datetime
 import sys
 import logging

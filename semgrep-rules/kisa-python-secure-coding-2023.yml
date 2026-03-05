@@ -166,3 +166,145 @@ rules:
       guide: "Python_시큐어코딩_가이드(2023)"
       section: "보안기능 > 안전하지 않은 임시파일"
     pattern: tempfile.mktemp(...)
+
+  # ── 역직렬화 (추가) ──
+
+  - id: kisa.py.security.no-yaml-unsafe-load
+    message: "[KISA PY Guide] 안전하지 않은 역직렬화: yaml.load()에 SafeLoader 미사용 금지"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 신뢰되지 않는 데이터의 역직렬화"
+    patterns:
+      - pattern: yaml.load($DATA)
+      - pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader)
+      - pattern-not: yaml.load($DATA, Loader=yaml.CSafeLoader)
+
+  - id: kisa.py.security.no-marshal-loads
+    message: "[KISA PY Guide] 안전하지 않은 역직렬화: marshal.loads() 사용 금지"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 신뢰되지 않는 데이터의 역직렬화"
+    pattern: marshal.loads(...)
+
+  # ── OS 명령어 삽입 (추가) ──
+
+  - id: kisa.py.injection.no-os-popen
+    message: "[KISA PY Guide] OS 명령어 삽입: os.popen() 사용 금지, subprocess.run() 사용 권장"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > OS 명령어 삽입"
+    pattern: os.popen(...)
+
+  - id: kisa.py.injection.no-dynamic-import
+    message: "[KISA PY Guide] 코드 삽입: __import__() 동적 임포트 사용 금지"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 코드 삽입"
+    pattern: __import__(...)
+
+  # ── XML 처리 ──
+
+  - id: kisa.py.xxe.no-xml-parse-untrusted
+    message: "[KISA PY Guide] XXE: xml.etree.ElementTree.parse() 대신 defusedxml 사용 권장"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > XML 외부개체 삽입"
+    pattern: xml.etree.ElementTree.parse(...)
+
+  - id: kisa.py.xxe.no-xml-fromstring
+    message: "[KISA PY Guide] XXE: xml.etree.ElementTree.fromstring() 대신 defusedxml 사용 권장"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > XML 외부개체 삽입"
+    pattern: xml.etree.ElementTree.fromstring(...)
+
+  - id: kisa.py.xxe.no-lxml-parse
+    message: "[KISA PY Guide] XXE: lxml.etree.parse()는 XXE 취약, resolve_entities=False 설정 필요"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > XML 외부개체 삽입"
+    pattern: lxml.etree.parse(...)
+
+  # ── 보안기능 (추가) ──
+
+  - id: kisa.py.security.no-random-for-security
+    message: "[KISA PY Guide] 부적절한 난수: 보안 목적에 random 모듈 사용 금지, secrets 모듈 사용 권장"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 적절하지 않은 난수값 사용"
+    pattern-regex: (?:token|secret|password|key|nonce|salt|otp|session_id|csrf)\s*=\s*(?:str\()?random\.
+
+  - id: kisa.py.security.no-cors-wildcard
+    message: "[KISA PY Guide] CORS 와일드카드: allow_origins=['*'] 사용 금지, 허용 도메인 명시"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 부적절한 접근 제어"
+    patterns:
+      - pattern: CORSMiddleware(..., allow_origins=["*"], ...)
+
+  - id: kisa.py.security.no-assert-validation
+    message: "[KISA PY Guide] 입력값 검증에 assert 사용 금지: 최적화 모드(-O)에서 제거됨"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 부적절한 입력값 검증"
+    pattern-regex: assert\s+(?:request\.|form\.|data\[|params\[|input\[|args\.)
+
+  # ── 암호화 (추가) ──
+
+  - id: kisa.py.crypto.no-des
+    message: "[KISA PY Guide] 취약한 암호 알고리즘: DES 사용 금지, AES-256 사용 권장"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 취약한 암호화 알고리즘 사용"
+    pattern: DES.new(...)
+
+  - id: kisa.py.crypto.no-rc4
+    message: "[KISA PY Guide] 취약한 암호 알고리즘: RC4(ARC4) 사용 금지, AES-256 사용 권장"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 취약한 암호화 알고리즘 사용"
+    pattern: ARC4.new(...)
+
+  - id: kisa.py.crypto.no-ecb-mode
+    message: "[KISA PY Guide] 취약한 암호 운용모드: ECB 모드 사용 금지, CBC/GCM 사용 권장"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 취약한 암호화 알고리즘 사용"
+    pattern: AES.new(..., AES.MODE_ECB, ...)
+
+  # ── 로깅 ──
+
+  - id: kisa.py.logging.no-sensitive-data-in-log
+    message: "[KISA PY Guide] 민감정보 로깅 금지: password/token/secret을 로그에 직접 출력하지 말 것"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 중요정보 평문 노출"
+    pattern-regex: (?:logger?|logging)\.(?:info|debug|warning|error|critical)\(.*(?:password|passwd|secret|token|api_key|apikey|credential)
