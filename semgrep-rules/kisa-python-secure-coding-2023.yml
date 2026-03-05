@@ -1,0 +1,166 @@
+rules:
+  # ── 입력데이터 검증 및 표현 ──
+
+  - id: kisa.py.injection.no-shell-true
+    message: "[KISA PY Guide] OS 명령어 삽입: subprocess에서 shell=True 사용 금지"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > OS 명령어 삽입"
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern-not: subprocess.$FUNC(..., shell=True, ...) # noqa: security
+
+  - id: kisa.py.injection.no-os-system
+    message: "[KISA PY Guide] OS 명령어 삽입: os.system() 사용 금지, subprocess.run() 사용 권장"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > OS 명령어 삽입"
+    pattern: os.system(...)
+
+  - id: kisa.py.injection.no-eval
+    message: "[KISA PY Guide] 코드 삽입: eval() 사용 금지"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 코드 삽입"
+    pattern: eval(...)
+
+  - id: kisa.py.injection.no-exec
+    message: "[KISA PY Guide] 코드 삽입: exec() 사용 금지"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 코드 삽입"
+    pattern: exec(...)
+
+  - id: kisa.py.injection.sql-format-string
+    message: "[KISA PY Guide] SQL 삽입: f-string/format으로 SQL 쿼리 조립 금지, 파라미터 바인딩 사용"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > SQL 삽입"
+    pattern-regex: (?:execute|executemany)\s*\(\s*f['"](SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)
+
+  - id: kisa.py.xss.no-markup-safe-bypass
+    message: "[KISA PY Guide] XSS: Markup() 직접 사용 시 입력값 이스케이프 필요"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > XSS"
+    pattern: Markup($VALUE)
+
+  # ── 보안기능 ──
+
+  - id: kisa.py.security.no-hardcoded-secret
+    message: "[KISA PY Guide] 하드코딩된 비밀번호/토큰 사용 금지, 환경변수 사용 권장"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 하드코딩된 중요정보"
+    pattern-regex: (?:password|secret|token|api_key)\s*=\s*['\"][^'"]{8,}['\"]
+    paths:
+      exclude:
+        - tests/
+        - "*_test.py"
+        - "test_*.py"
+
+  - id: kisa.py.security.no-verify-false
+    message: "[KISA PY Guide] SSL 인증서 검증 비활성화 금지: verify=False 사용 금지"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 부적절한 인증서 유효성 검증"
+    pattern: requests.$FUNC(..., verify=False, ...)
+
+  - id: kisa.py.security.no-debug-true-in-prod
+    message: "[KISA PY Guide] 프로덕션에서 debug=True 사용 금지"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 디버그 모드 노출"
+    patterns:
+      - pattern: app.run(..., debug=True, ...)
+
+  - id: kisa.py.security.no-pickle-load
+    message: "[KISA PY Guide] 신뢰할 수 없는 데이터 역직렬화: pickle.load() 사용 주의"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 신뢰되지 않는 데이터의 역직렬화"
+    pattern: pickle.load(...)
+
+  - id: kisa.py.security.no-pickle-loads
+    message: "[KISA PY Guide] 신뢰할 수 없는 데이터 역직렬화: pickle.loads() 사용 주의"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 신뢰되지 않는 데이터의 역직렬화"
+    pattern: pickle.loads(...)
+
+  # ── 에러처리 ──
+
+  - id: kisa.py.error.no-bare-except
+    message: "[KISA PY Guide] 광범위한 예외 처리: bare except 사용 금지, 구체적 예외 지정"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "에러처리 > 광범위한 예외 처리"
+    pattern: |
+      try:
+          ...
+      except:
+          ...
+
+  # ── 암호화 ──
+
+  - id: kisa.py.crypto.no-md5
+    message: "[KISA PY Guide] 취약한 해시 알고리즘: MD5 사용 금지, SHA-256 이상 사용 권장"
+    severity: ERROR
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 취약한 암호화 알고리즘 사용"
+    pattern: hashlib.md5(...)
+
+  - id: kisa.py.crypto.no-sha1
+    message: "[KISA PY Guide] 취약한 해시 알고리즘: SHA-1 사용 금지, SHA-256 이상 사용 권장"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 취약한 암호화 알고리즘 사용"
+    pattern: hashlib.sha1(...)
+
+  # ── 파일 처리 ──
+
+  - id: kisa.py.path.no-path-traversal
+    message: "[KISA PY Guide] 경로 조작: 사용자 입력을 직접 open()에 전달 금지"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "입력데이터 검증 및 표현 > 경로 조작 및 자원 삽입"
+    pattern: open(request.$ATTR, ...)
+
+  - id: kisa.py.tempfile.no-mktemp
+    message: "[KISA PY Guide] 안전하지 않은 임시파일: tempfile.mktemp() 대신 tempfile.mkstemp() 사용"
+    severity: WARNING
+    languages: [python]
+    metadata:
+      guide: "Python_시큐어코딩_가이드(2023)"
+      section: "보안기능 > 안전하지 않은 임시파일"
+    pattern: tempfile.mktemp(...)
