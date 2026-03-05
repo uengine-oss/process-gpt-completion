@@ -1,6 +1,6 @@
 # process-gpt-completion
 
-## Environment Setup 
+## Environment Setup
 
 Before running the project, you need to set up environment variables.
 
