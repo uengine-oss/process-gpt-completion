@@ -748,6 +748,26 @@ def _update_process_variables(process_instance: ProcessInstance, field_mappings:
 def _process_next_activities(process_instance: ProcessInstance, process_result: ProcessResult, 
                            process_result_json: dict, process_definition):
     """Process next activities"""
+    def _is_event_activity_type(activity_type: Any) -> bool:
+        if not activity_type:
+            return False
+        normalized = str(activity_type).strip().lower()
+        if normalized == "event":
+            return True
+        return normalized in {
+            "intermediatethrowevent",
+            "intermediatecatchevent",
+            "timerintermediateevent",
+            "messageintermediateevent",
+            "signalintermediateevent",
+            "conditionalintermediateevent",
+            "linkintermediateevent",
+            "escalationintermediateevent",
+            "errorintermediateevent",
+            "cancelintermediateevent",
+            "compensationintermediateevent",
+        }
+
     # Ensure current_activity_ids is initialized
     if process_instance.current_activity_ids is None:
         process_instance.current_activity_ids = []
@@ -784,8 +804,9 @@ def _process_next_activities(process_instance: ProcessInstance, process_result: 
             break
 
         # 게이트웨이인 경우: 이벤트 게이트웨이는 그대로, 그 외는 다음 액티비티로 확장
-        if next_id and process_definition.find_gateway_by_id(next_id):
-            if getattr(activity, "type", None) == "event":
+        gateway_obj = process_definition.find_gateway_by_id(next_id) if next_id else None
+        if next_id and gateway_obj:
+            if _is_event_activity_type(getattr(activity, "type", None)) or _is_event_activity_type(getattr(gateway_obj, "type", None)):
                 if str(next_id) not in [str(x) for x in process_instance.current_activity_ids]:
                     process_instance.current_activity_ids.append(next_id)
                 activity_obj = process_definition.find_activity_by_id(next_id)
@@ -1141,18 +1162,31 @@ def _register_single_event(process_instance: ProcessInstance, event: dict, proce
 def _register_timer_event(process_instance: ProcessInstance, event: dict):
     """Register a timer intermediate event"""
     print(f"[INFO] Registering timer intermediate event: {event['event_id']}")
-    if event['expression']:
-        job_name = f"{event['process_id']}_{event['event_id']}"
-        cron_expr = event['expression']
-        params = {
-            "p_job_name": job_name,
-            "p_cron_expr": cron_expr,
-            "p_input": {
-                "proc_inst_id": event['process_id'],
-                "activity_id": event['event_id']
-            }
+    if not event.get('expression'):
+        print(f"[WARN] Timer event has no expression: event_id={event.get('event_id')}")
+        return None
+
+    job_name = f"{event['process_id']}_{event['event_id']}"
+    cron_expr = event['expression']
+    next_workitem = fetch_workitem_by_proc_inst_and_activity(
+        event['process_id'],
+        event['event_id'],
+        process_instance.tenant_id,
+    )
+    params = {
+        "p_job_name": job_name,
+        "p_cron_expr": cron_expr,
+        "p_input": {
+            "proc_inst_id": event['process_id'],
+            "activity_id": event['event_id'],
+            "process_instance_id": event['process_id'],
+            "process_definition_id": process_instance.proc_def_id,
+            "tenant_id": process_instance.tenant_id,
+            "task_id": getattr(next_workitem, "id", None),
         }
-        result = execute_rpc("register_cron_intermidiated", params)
+    }
+    result = execute_rpc("register_cron_intermidiated", params)
+    print(f"[INFO] Timer registration RPC result for {event['event_id']}: {result}")
     return result
 def _persist_process_data(process_instance: ProcessInstance, process_result: ProcessResult, 
                          process_result_json: dict, process_definition, tenant_id: Optional[str] = None):
@@ -3231,6 +3265,12 @@ def resolve_next_activity_payloads(
                 return
             gateway_obj = process_definition.find_gateway_by_id(target_id)
             if gateway_obj:
+                # Intermediate events are modeled as gateway objects in this codebase.
+                # Keep them as event candidates instead of expanding to downstream tasks.
+                gw_type = str(getattr(gateway_obj, "type", None) or "").strip().lower()
+                if "event" in gw_type:
+                    _record("event", gateway_obj)
+                    return
                 if target_id in visited_gateways:
                     return
                 visited_gateways.add(target_id)
@@ -3251,7 +3291,7 @@ def resolve_next_activity_payloads(
             continue
         node_name = getattr(node_obj, "name", "") or node_id
         description = getattr(node_obj, "description", "") or ""
-        next_type_value = getattr(node_obj, "type", None) or node_type
+        next_type_value = "event" if node_type == "event" else (getattr(node_obj, "type", None) or node_type)
         expression_value = None
         if node_type == "event":
             condition_value = getattr(node_obj, "condition", None)

@@ -1106,7 +1106,7 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                     agent_orch=agent_orch,
                     agent_mode=safeget(activity, 'agentMode', None),
                     log=log,
-                    root_proc_inst_id=process_instance_data['root_proc_inst_id'],
+                    root_proc_inst_id=process_instance_data.get('root_proc_inst_id') or process_instance_data.get('proc_inst_id'),
                     execution_scope=execution_scope,
                     version_tag=getattr(process_definition, "version_tag", None),
                     version=getattr(process_definition, "version", None),
@@ -1240,7 +1240,7 @@ def upsert_cancelled_workitem(process_instance_data, process_result_data, proces
                     query=query,
                     agent_orch=agent_orch,
                     agent_mode=safeget(activity, 'agentMode', None),
-                    root_proc_inst_id=process_instance_data['root_proc_inst_id'],
+                    root_proc_inst_id=process_instance_data.get('root_proc_inst_id') or process_instance_data.get('proc_inst_id'),
                     execution_scope=execution_scope,
                     version_tag=getattr(process_definition, "version_tag", None),
                     version=getattr(process_definition, "version", None),
@@ -1355,8 +1355,14 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
             # print(f"[DEBUG] workitem.agent_mode: {workitem.agent_mode}")
         else:
             activity = process_definition.find_activity_by_id(activity_data['nextActivityId'])
+            is_event_node = False
+            if not activity:
+                activity = process_definition.find_event_by_id(activity_data['nextActivityId'])
+                is_event_node = activity is not None
             if activity:
-                prev_activities = process_definition.find_prev_activities(safeget(activity, 'id', ''), [])
+                prev_activities = []
+                if not is_event_node:
+                    prev_activities = process_definition.find_prev_activities(safeget(activity, 'id', ''), [])
                 start_date = datetime.now(pytz.timezone('Asia/Seoul'))
                 
                 # reference_ids 설정 (이전 액티비티 ID 목록)
@@ -1487,7 +1493,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     description=description,
                     query=query,
                     agent_orch=agent_orch,
-                    root_proc_inst_id=process_instance_data['root_proc_inst_id'],
+                    root_proc_inst_id=process_instance_data.get('root_proc_inst_id') or process_instance_data.get('proc_inst_id'),
                     execution_scope=execution_scope,
                     version_tag=getattr(process_definition, "version_tag", None),
                     version=getattr(process_definition, "version", None),
@@ -1780,7 +1786,7 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                     description=description,
                     query=query,
                     agent_orch=agent_orch,
-                    root_proc_inst_id=process_instance_data['root_proc_inst_id'],
+                    root_proc_inst_id=process_instance_data.get('root_proc_inst_id') or process_instance_data.get('proc_inst_id'),
                     execution_scope=execution_scope,
                     version_tag=getattr(process_definition, "version_tag", None),
                     version=getattr(process_definition, "version", None),

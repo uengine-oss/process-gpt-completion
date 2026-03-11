@@ -112,8 +112,11 @@ async def submit_workitem(input: dict):
         )
     )
     
-    process_definition_json = fetch_process_definition_by_version(process_definition_id, version_tag, version)
-    process_definition = load_process_definition(process_definition_json) if process_definition_json else None
+    process_definition_json = None
+    process_definition = None
+    if process_definition_id:
+        process_definition_json = fetch_process_definition_by_version(process_definition_id, version_tag, version)
+        process_definition = load_process_definition(process_definition_json) if process_definition_json else None
     
     # NOTE:
     # - task_id가 넘어오면 기존 todolist row를 "업데이트"해야 한다.
@@ -205,6 +208,12 @@ async def submit_workitem(input: dict):
             f"[SUBMIT][{trace_id}] fetch_process_instance proc_inst_id={process_instance_id} tenant_id={tenant_ctx} "
             f"-> {'FOUND' if process_instance is not None else 'NOT_FOUND'}"
         )
+        # Timer callback 등에서 process_definition_id가 누락되어도 인스턴스에서 복구한다.
+        if process_instance and not process_definition_id:
+            process_definition_id = process_instance.proc_def_id
+            print(f"[SUBMIT][{trace_id}] recovered process_definition_id from instance: {process_definition_id}")
+            process_definition_json = fetch_process_definition_by_version(process_definition_id, version_tag, version)
+            process_definition = load_process_definition(process_definition_json) if process_definition_json else None
         if process_instance is None:
             print(f"[SUBMIT][{trace_id}] create_process_instance proc_inst_id={process_instance_id} tenant_id={tenant_ctx}")
             await create_process_instance(process_definition, process_instance_id, False, role_bindings, project_id)

@@ -450,7 +450,8 @@ class ProcessDefinition(BaseModel):
     
     def find_event_by_id(self, event_id: str) -> Optional[ProcessGateway]:
         for gateway in self.gateways:
-            if gateway.id == event_id and "event" in gateway.type:
+            gateway_type = str(getattr(gateway, "type", "") or "").lower()
+            if gateway.id == event_id and "event" in gateway_type:
                 return gateway
         return None
 
