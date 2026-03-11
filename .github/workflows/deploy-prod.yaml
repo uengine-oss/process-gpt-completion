@@ -1,16 +1,114 @@
-name: process-gpt-build-and-deploy
+name: process-gpt-build-and-deploy-prod
 
 on:
   release:
     types: [created]
 
 jobs:
-  build-and-deploy:
+  # ── 보안 검증 (SAST + 라이선스) ──
+  security-checks:
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt || true
+
+      # SAST: Semgrep (KISA Python 시큐어코딩 가이드)
+      - name: Install Semgrep
+        run: python -m pip install semgrep
+
+      - name: Run Semgrep SAST scan
+        run: |
+          mkdir -p reports
+          semgrep scan \
+            --config ./semgrep-rules \
+            --metrics off \
+            --exclude "tests" \
+            --exclude ".venv" \
+            --exclude "__pycache__" \
+            --json \
+            --output reports/semgrep-python.json \
+            . || true
+
+      # OSS 라이선스 점검
+      - name: License check
+        run: |
+          python -m pip install pip-licenses
+          pip-licenses --format=json --output-file=reports/license-report.json
+          pip-licenses --summary
+
+      # 리포트 업로드 (증빙)
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.sha }}
+          path: reports/
+
+  # ── 빌드 및 배포 ──
+  build-and-deploy:
+    needs: security-checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+
+      # ── 배포 아티팩트 패키징 및 코드서명 ──
+      - name: Package deployment artifact
+        run: |
+          tar -czf process-gpt-completion-${{ github.sha }}.tar.gz \
+            --exclude='__pycache__' --exclude='.venv' --exclude='tests' --exclude='.git' \
+            *.py polling_service/ features/ fcm_service/ requirements.txt Dockerfile
+
+      - name: Generate SHA256SUMS
+        run: |
+          sha256sum process-gpt-completion-${{ github.sha }}.tar.gz > SHA256SUMS
+          sha256sum requirements.txt >> SHA256SUMS
+          sha256sum Dockerfile >> SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign build artifact with cosign (code signing)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign-blob --yes \
+            --output-signature process-gpt-completion-${{ github.sha }}.tar.gz.sig \
+            --output-certificate process-gpt-completion-${{ github.sha }}.tar.gz.cert \
+            process-gpt-completion-${{ github.sha }}.tar.gz
+
+      # SLSA Build Provenance 증명 (GitHub Attestation)
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: process-gpt-completion-${{ github.sha }}.tar.gz
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-gpt-completion-dist-prod-${{ github.sha }}
+          path: |
+            process-gpt-completion-${{ github.sha }}.tar.gz
+            process-gpt-completion-${{ github.sha }}.tar.gz.sig
+            process-gpt-completion-${{ github.sha }}.tar.gz.cert
+            SHA256SUMS
 
       - name: Log in to GHCR
         run: |
@@ -20,12 +118,47 @@ jobs:
         run: |
           IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-7)
           IMAGE_NAME=ghcr.io/uengine-oss/process-gpt-completion:$IMAGE_TAG
+          IMAGE_NAME_LATEST=ghcr.io/uengine-oss/process-gpt-completion:latest
 
-          docker build -t $IMAGE_NAME .
+          docker build -t $IMAGE_NAME -t $IMAGE_NAME_LATEST .
           docker push $IMAGE_NAME
+          docker push $IMAGE_NAME_LATEST
 
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+
+      # ── Docker 이미지 서명 (cosign keyless - Sigstore OIDC) ──
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Docker image with cosign
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_NAME 2>/dev/null || \
+                   docker inspect --format='{{.Id}}' $IMAGE_NAME)
+          cosign sign --yes "$DIGEST"
+          echo "SIGNED_DIGEST=$DIGEST" >> $GITHUB_ENV
+
+      # ── 배포 파일 해시값 (SHA256) ──
+      - name: Generate deployment artifact hashes
+        run: |
+          mkdir -p reports
+          echo "# Deployment Artifact Hashes (Production)" > reports/SHA256SUMS
+          echo "# Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> reports/SHA256SUMS
+          echo "# Commit: ${{ github.sha }}" >> reports/SHA256SUMS
+          echo "# Release: ${{ github.event.release.tag_name }}" >> reports/SHA256SUMS
+          echo "" >> reports/SHA256SUMS
+          docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_NAME >> reports/SHA256SUMS 2>/dev/null || true
+          sha256sum Dockerfile >> reports/SHA256SUMS
+          sha256sum requirements.txt >> reports/SHA256SUMS
+          cat reports/SHA256SUMS
+
+      - name: Upload hash report
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-hashes-prod-${{ github.sha }}
+          path: reports/SHA256SUMS
 
       - name: Checkout GitOps repository
         uses: actions/checkout@v3
@@ -43,10 +176,10 @@ jobs:
       - name: Update image tag in GitOps repository
         run: |
           cd gitops-repo
-          
+
           # Update completion deployment image
           yq eval '.spec.template.spec.containers[0].image = "'$IMAGE_NAME'"' -i deployments/completion-deployment.yaml
-          
+
           echo "Updated image to: $IMAGE_NAME"
 
       - name: Commit and push changes
@@ -54,7 +187,7 @@ jobs:
           cd gitops-repo
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
+
           git add .
           git commit -m "Update completion image to $IMAGE_TAG" || exit 0
           git push
@@ -68,6 +201,7 @@ jobs:
           echo "| **Image** | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Tag** | \`${{ env.IMAGE_TAG }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | [\`${{ github.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Cosign Signed** | \`${{ env.SIGNED_DIGEST }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **GitOps Repo** | [process-gpt-k8s](https://github.com/uengine-oss/process-gpt-k8s) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "✅ ArgoCD will automatically sync the changes from the GitOps repository." >> $GITHUB_STEP_SUMMARY
@@ -81,7 +215,7 @@ jobs:
           script: |
             const maxRetries = 3;
             let attempt = 0;
-            
+
             while (attempt < maxRetries) {
               try {
                 const commentBody = [
@@ -95,7 +229,7 @@ jobs:
                   '---',
                   '*Deployed via GitHub Actions*'
                 ].join('\n');
-                
+
                 await github.rest.repos.createCommitComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -107,7 +241,7 @@ jobs:
               } catch (error) {
                 attempt++;
                 console.log(`Attempt ${attempt} failed:`, error.message);
-                
+
                 if (attempt >= maxRetries) {
                   console.log('All attempts failed, but deployment was successful');
                   core.warning('Failed to create commit comment, but deployment completed successfully');

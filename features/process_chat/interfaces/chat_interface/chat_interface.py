@@ -88,7 +88,7 @@ class ChatInterface:
                         content = obj["choices"][0]["delta"].get("content")
                         if content:
                             result_text += content
-                    except:
+                    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                         pass
                     yield chunk
 

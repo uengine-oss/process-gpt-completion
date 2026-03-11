@@ -190,7 +190,7 @@ async def process_mem0_message(text: str, agent_id: str, chat_room_id: str = Non
             response = await generate_response(text, search_results)
             try:
                 response = json.loads(response)
-            except:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 response = {"content": response}
             response["type"] = intent
             

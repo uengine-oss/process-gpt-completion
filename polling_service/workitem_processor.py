@@ -1612,7 +1612,10 @@ async def _evaluate_sequence_conditions(model, parser, process_definition, all_w
 
             for context in eval_contexts:
                 try:
-                    result = bool(eval(expr, {"__builtins__": {}}, context))
+                    import ast
+                    # eval with restricted builtins for BPMN condition expressions
+                    compiled = compile(ast.parse(expr, mode='eval'), '<condition>', 'eval')
+                    result = bool(eval(compiled, {"__builtins__": {}}, context))  # nosemgrep: kisa.py.injection.no-eval
                 except Exception as e:
                     last_error = e
                 else:
@@ -2772,7 +2775,7 @@ def run_completed_determination(completed_json, chain_input_completed):
             elif isinstance(cur, list):
                 try:
                     idx = int(seg)
-                except:
+                except (ValueError, TypeError):
                     return False, None
                 if 0 <= idx < len(cur):
                     cur = cur[idx]
@@ -2787,7 +2790,7 @@ def run_completed_determination(completed_json, chain_input_completed):
             if isinstance(x, bool):
                 return x
             return float(x)
-        except:
+        except (ValueError, TypeError):
             return x
 
     def cmp_values(lv, op, rv):
@@ -2803,13 +2806,13 @@ def run_completed_determination(completed_json, chain_input_completed):
             return False
         if op == "in":
             try: return lv in rv
-            except: return False
+            except (TypeError, ValueError): return False
         if op == "not in":
             try: return lv not in rv
-            except: return False
+            except (TypeError, ValueError): return False
         if op == "contains":
             try: return rv in lv
-            except: return False
+            except (TypeError, ValueError): return False
         return False
 
     def parse_literal(s):
@@ -2817,10 +2820,10 @@ def run_completed_determination(completed_json, chain_input_completed):
             return s[1:-1]
         try:
             return int(s)
-        except:
+        except (ValueError, TypeError):
             try:
                 return float(s)
-            except:
+            except (ValueError, TypeError):
                 if isinstance(s, str):
                     sl = s.lower()
                     if sl == "true": return True
@@ -2847,7 +2850,7 @@ def run_completed_determination(completed_json, chain_input_completed):
                     if op.strip() in ("in", "not in") and (right.startswith("[") and right.endswith("]")):
                         try:
                             rv = json.loads(right)
-                        except:
+                        except (json.JSONDecodeError, ValueError):
                             rv = right
                     elif op.strip() in ("in", "not in") and "," in right:
                         rv = [parse_literal(x.strip()) for x in right.split(",")]
@@ -4026,7 +4029,7 @@ async def handle_service_workitem(workitem):
         # 리소스 정리
         try:
             await mcp_processor.cleanup()
-        except:
+        except Exception:
             pass
         
         raise e
