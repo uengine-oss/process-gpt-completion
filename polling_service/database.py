@@ -1277,8 +1277,21 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
     else:
         execution_scope =''
         
+    def _is_end_event_node(node_id: str, act_data: dict = None) -> bool:
+        if node_id in ("END_PROCESS", "endEvent", "end_event"):
+            return True
+        if act_data:
+            act_type = str(act_data.get("type") or "").lower()
+            if act_type == "endevent":
+                return True
+        if process_definition:
+            gw = process_definition.find_gateway_by_id(node_id) if node_id else None
+            if gw and "endevent" in str(getattr(gw, "type", "") or "").lower():
+                return True
+        return False
+
     for activity_data in process_result_data['nextActivities']:
-        if activity_data['nextActivityId'] in ["END_PROCESS", "endEvent", "end_event"]:
+        if _is_end_event_node(activity_data['nextActivityId'], activity_data):
             continue
 
         # nextUserEmail는 LLM/roleBindings에서 결정된 최종 담당자 식별자 (이메일 또는 id/UUID)

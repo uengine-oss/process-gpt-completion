@@ -794,11 +794,23 @@ def _process_next_activities(process_instance: ProcessInstance, process_result: 
             if str(aid) not in completed_ids
         ]
 
+    def _is_end_event(node_id: str, activity_obj=None) -> bool:
+        if node_id in ("endEvent", "END_PROCESS", "end_event"):
+            return True
+        if activity_obj:
+            act_type = str(getattr(activity_obj, "type", "") or "").lower()
+            if act_type == "endevent":
+                return True
+        gw = process_definition.find_gateway_by_id(node_id) if node_id else None
+        if gw and "endevent" in str(getattr(gw, "type", "") or "").lower():
+            return True
+        return False
+
     # 2) nextActivities로부터 새 current 후보를 누적한다(기존 current는 유지 + 유니크).
     next_acts = process_result.nextActivities or []
     for activity in next_acts:
         next_id = getattr(activity, "nextActivityId", None)
-        if next_id in ["endEvent", "END_PROCESS", "end_event"]:
+        if _is_end_event(next_id, activity):
             # 종료로 향하면 current는 비워 종료 처리로 위임
             process_instance.current_activity_ids = []
             break
@@ -3292,6 +3304,14 @@ def resolve_next_activity_payloads(
         node_id = getattr(node_obj, "id", None)
         if not node_id:
             continue
+
+        obj_type = str(getattr(node_obj, "type", "") or "").lower()
+        if "endevent" in obj_type:
+            next_activity_payloads.append(
+                Activity(nextActivityId=node_id, result="IN_PROGRESS", type="endEvent").model_dump()
+            )
+            continue
+
         node_name = getattr(node_obj, "name", "") or node_id
         description = getattr(node_obj, "description", "") or ""
         next_type_value = "event" if node_type == "event" else (getattr(node_obj, "type", None) or node_type)
@@ -3844,9 +3864,10 @@ async def handle_workitem(workitem):
                 tenant_id
             )
 
-            execute_next_activity(completed_json, tenant_id)
-            
-            process_output(workitem, tenant_id)
+            try:
+                execute_next_activity(completed_json, tenant_id)
+            finally:
+                process_output(workitem, tenant_id)
 
     except Exception as e:
         print(f"[ERROR] Error in handle_workitem for workitem {workitem['id']}: {str(e)}")
