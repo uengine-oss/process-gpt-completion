@@ -8,6 +8,7 @@ from process_definition import load_process_definition
 from langchain.tools import StructuredTool
 from pydantic import BaseModel
 from langchain.tools import StructuredTool
+from llm_factory import create_llm
 
 if os.getenv("ENV") != "production":
     load_dotenv(override=True)
@@ -187,7 +188,8 @@ class MCPProcessor:
 
             tools = sanitize_mcp_tools(self.mcp_tools)
             # tools = [self.wrap_tool_for_empty_args(tool) for tool in tools]
-            agent = create_react_agent("openai:gpt-4.1", tools)
+            llm = create_llm(streaming=False)
+            agent = create_react_agent(llm, tools)
             response = await agent.ainvoke({"messages": prompt})
             
             return response

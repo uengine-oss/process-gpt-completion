@@ -10,8 +10,7 @@ def usage(raw_data):
         # "userId":          "gpt@gpt.org", // user
         # "startAt":         "2025-08-06T09:00:00+09:00", // service start at.
         # "usage": {
-        #     "gpt-4.1-2025-04-14": { "request":100, "response":200, "cachedRequest":100 },
-        #     "gpt-4o":         { "request":100, "response":200, "cachedRequest":200 }
+        #     "<model_alias>": { "request": 100, "response": 200, "cachedRequest": 100 }
         # },
         # "process_def_id":  null,
         # "process_inst_id": null,

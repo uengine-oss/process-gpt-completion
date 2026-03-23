@@ -382,7 +382,7 @@ def apply_field_name_annotation_recursively(
     return obj
 
 # LLM 객체 생성 (공통 팩토리 사용)
-model = create_llm(model="gpt-4o", streaming=True, temperature=0)
+model = create_llm(streaming=True, temperature=0)
 
 # parser 생성
 class CustomJsonOutputParser(SimpleJsonOutputParser):

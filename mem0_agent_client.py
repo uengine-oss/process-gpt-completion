@@ -25,7 +25,7 @@ DB_NAME = os.getenv("DB_NAME")
 connection_string = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # LLM 객체 생성 (공통 팩토리 사용)
-llm = create_llm(model="gpt-4o", streaming=True)
+llm = create_llm(streaming=True)
 
 learning_response_prompt = PromptTemplate.from_template(
     """당신은 사용자가 입력한 지침이나 기억을 받아들이는 에이전트입니다.

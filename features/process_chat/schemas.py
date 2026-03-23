@@ -1,18 +1,15 @@
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 class ChatRequest(BaseModel):
-    vendor: str
-    model: str
+    model: Optional[str] = None
     messages: List[Dict[str, Any]] 
     stream: bool = False
-    modelConfig: Dict[str, Any]
+    modelConfig: Dict[str, Any] = {}
 
 class TokenCountRequest(BaseModel):
-    vendor: str
-    model: str
+    model: Optional[str] = None
     messages: List[Dict[str, Any]]
 
 class EmbeddingRequest(BaseModel):
-    vendor: str
-    model: str
+    model: Optional[str] = None
     text: str

@@ -204,7 +204,7 @@ def generate_deterministic_compensation_code(tenant_id: str, query: str, event_l
     )
 
     try:
-        generator = create_llm(model="gpt-4o", streaming=False, temperature=0)
+        generator = create_llm(streaming=False, temperature=0)
         resp = generator.invoke(prompt)
         code_str = getattr(resp, 'content', None) or str(resp)
         if "async def run(" in code_str and "call_tool(" in code_str:

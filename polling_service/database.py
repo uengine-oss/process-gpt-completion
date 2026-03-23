@@ -1,7 +1,6 @@
 from supabase import create_client, Client
 from pydantic import BaseModel, validator
 from typing import Any, Dict, List, Optional, Set, Union
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from process_definition import ProcessDefinition, load_process_definition, UIDefinition
 from fastapi import HTTPException
@@ -9,7 +8,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 from contextvars import ContextVar
 from dotenv import load_dotenv
-from llm_factory import create_llm
+from llm_factory import create_llm, create_embedding
 
 import pytz
 import socket
@@ -1942,7 +1941,7 @@ def _generate_browser_automation_description(
         )
         
         # LLM 호출
-        model = create_llm(model="gpt-4o", streaming=True, temperature=0)
+        model = create_llm(streaming=True, temperature=0)
         response = model.invoke(prompt)
         
         # 응답에서 단계별 설명 추출
@@ -2169,7 +2168,7 @@ def get_vector_store():
     if supabase is None:
         raise Exception("Supabase client is not configured")
     
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", deployment="text-embedding-3-small")
+    embeddings = create_embedding()
     
     return SupabaseVectorStore(
         client=supabase,

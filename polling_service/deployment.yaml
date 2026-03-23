@@ -44,6 +44,13 @@ spec:
           timeoutSeconds: 5
           failureThreshold: 3
         env:
+        - name: LLM_PROXY_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: OPENAI_API_KEY
+              name: openai-secret
+        - name: LLM_PROXY_URL
+          value: http://litellm-proxy:4000
         - name: OPENAI_API_KEY
           valueFrom:
             secretKeyRef:
@@ -84,6 +91,8 @@ spec:
           value: http://memento-service:8005
         - name: ENV
           value: production
+        - name: LLM_MODEL
+          value: gpt-4o
         - name: LANGSMITH_API_KEY
           valueFrom:
             secretKeyRef:

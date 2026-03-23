@@ -13,7 +13,7 @@ from process_var_sql_gen import get_process_definitions
 
 
 model = create_llm()
-vision_model = create_openai_llm(model="gpt-4-vision-preview", max_tokens=4096)
+vision_model = create_openai_llm(max_tokens=4096)
 
 parser = SimpleJsonOutputParser()
 

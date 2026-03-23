@@ -13,19 +13,18 @@ from langchain.output_parsers.json import SimpleJsonOutputParser  # JsonOutputPa
 import requests
 
 from datetime import date
-from pathlib import Path
 
 # vector
 # from langchain_openai import OpenAIEmbeddings
 # from langchain.vectorstores import Chroma
 # from langchain.schema import Document
-# embedding_function = OpenAIEmbeddings(model="text-embedding-3-large")
+# embedding_function = OpenAIEmbeddings(model="<embedding_model_alias>")
 # persist_directory = "db/speech_embedding_db"
 
 parser = SimpleJsonOutputParser()
 
 # 1. LLM 생성 (공통 팩토리 사용)
-model = create_llm(model="gpt-4o", streaming=True)
+model = create_llm(streaming=True)
 
 prompt = PromptTemplate.from_template(
     """
@@ -676,142 +675,6 @@ workitem_complete_chain = (
 )
 
 
-intent_classification = PromptTemplate.from_template(
-    """
-        Please classify the user's intent among the following:
-
-        QUERY_PROCESS_INSTANCE: query for status of a specific process instance. (e.g., 현재 영업활동 프로세스 인스턴스들의 상태를 알려줘)
-        QUERY_PROCESS_DEFINITION: query for process definition, its activities, and checkpoints for the activity. (e.g., 휴가 신청 프로세스에 대해 알려줘)
-        QUERY_TODO_LIST: query for the to-do list or specific work items. (e.g., 내 할일 목록을 알려줘)
-        COMMAND_WORK_ITEM: command for completing a process instance work item. (e.g., 휴가 신청을 승인 할게)
-        COMMAND_PROCESS_START: a concise commands indicating the start of a process instance. (e.g., 휴가 신청하고 싶어, 프로세스를 시작해, 응 신청해, 좋아 그렇게 접수해줘)
-        COMMAND_PROCESS_INPUT_DATA: Process execution command with detailed input data. This must include specific information required for the process. (e.g., 오늘 프로세스 실행 에러가 발생했어 장애 내역으로 접수할게)
-        QUERY_INFO: query for information from internal documents.
-        
-        user query:
-        {query}
-        
-        chat history:
-        {chat_history}
-
-        * Try to understand the user's intention only with possible user queries.
-        * When distinguishing COMMAND_PROCESS_START from COMMAND_PROCESS_INPUT_DATA, check the length of the user query. (The shorter the COMMAND_PROCESS_START).
-        * Please respond with the intent code ONLY.
-    """
-    )
-
-intent_classification_chain = (
-    RunnablePassthrough() | 
-    intent_classification | 
-    model | 
-    StrOutputParser()
-)
-
-
-from langchain.schema.runnable import RunnablePassthrough
-
-def generate_speech(part):
-    speech_file_path = Path(__file__).parent / "speech.mp3"
-    response = openai.audio.speech.create(
-        model="tts-1",
-        voice="nova",  # alloy
-        speed=1.2,
-        input=part
-    )
-    response.stream_to_file(speech_file_path)
-    with open(speech_file_path, 'rb') as file:
-        return file.read()
-
-
-import uuid
-
-def create_audio_stream(data):
-    input_text = data.get("query")
-    chat_room_id = data.get("chat_room_id")
-    email = data.get("email")
-    if  chat_room_id:
-        chat_history = get_chat_history(data)
-
-    intent = intent_classification_chain.invoke({"query": input_text, "chat_history": chat_history})
-    print(intent)
-    
-    chain = process_instance_data_query_chain
-    
-    message_data = {
-        "command": input_text,
-        "email": email
-    }
-    if chat_room_id:
-        upsert_chat_message(chat_room_id, message_data, False)
-    else:
-        chat_room_id = str(uuid.uuid4())
-        upsert_chat_message(chat_room_id, message_data, False)
-    
-    proc_def_list = get_process_definitions(data)
-
-    if intent == "QUERY_PROCESS_INSTANCE":
-        chain = process_instance_data_query_chain
-        input = {"query": input_text, "email": email, "proc_def_list": proc_def_list}
-    
-    elif intent == "COMMAND_PROCESS_START":
-        chain = process_instance_start_chain
-        input = {"query": input_text, "chat_room_id": chat_room_id, "email": email, "proc_def_list": proc_def_list}
-
-    elif intent == "QUERY_PROCESS_DEFINITION":
-        chain = process_definition_query_chain
-        input = {"query": input_text, "proc_def_list": proc_def_list}
-    
-    elif intent == "QUERY_TODO_LIST":
-        chain = todolist_query_chain
-        input = {"query": input_text, "email": email, "proc_def_list": proc_def_list}
-    
-    elif intent == "COMMAND_WORK_ITEM":
-        chain = workitem_complete_chain
-        input = {"query": input_text, "chat_room_id": chat_room_id, "email": email, "proc_def_list": proc_def_list}
-        
-    elif intent == "COMMAND_PROCESS_INPUT_DATA":
-        chain = process_input_data_chain
-        input = {"query": input_text, "chat_room_id": chat_room_id, "email": email, "proc_def_list": proc_def_list}
-        
-    # TODO: QUERY_INFO 인 경우 작업 필요   
-    elif intent == "QUERY_INFO":
-        chain = process_definition_query_chain
-        input = {"query": input_text}
-        # chain = info_query_chain
-        # input = {"var_name": input_text, "resolution_rule": "요청된 프로세스 정의와 해당 건에 대한 프로세스 인스턴스 정보를 읽어야. 가능한 하나의 테이블에서 데이터를 조회. UNION 사용하지 말것."}
-
-    word = ""
-    result = ""
-    buffer = []
-    for chunk in chain.stream(input):
-        word += chunk
-        
-        # 문장 단위로 분할
-        if '.' in word:
-            split_index = word.find('.')
-            part = word[:split_index + 1].strip()  # 마침표 포함
-            word = word[split_index + 1:].strip()
-            result += part
-            buffer.append(part)
-            
-    for part in buffer:
-        speech = generate_speech(part)
-        yield speech
-    
-    result_json = json.dumps({"description": result})
-    if chat_room_id:
-        upsert_chat_message(chat_room_id, result_json, True)
-    #result = chain.invoke({"var_name": input_text, "resolution_rule": "    요청된 프로세스 정의와 해당 건에 대한 프로세스 인스턴스 정보를 읽어야. 가능한 하나의 테이블에서 데이터를 조회. UNION 사용하지 말것."})
-
-
-from fastapi.responses import StreamingResponse
-
-#input_text = "현재 영업활동 프로세스 인스턴스들의 상태를 알려줘"
-async def stream_audio(request: Request):
-    input = await request.json()
-    return StreamingResponse(create_audio_stream(input), media_type='audio/webm')
-
-
 async def combine_input(request: Request):
     json_data = await request.json()
     input = json_data.get('input')
@@ -833,7 +696,6 @@ def add_routes_to_app(app) :
 
     app.add_api_route("/process-var-sql", combine_input, methods=["POST"])
     app.add_api_route("/process-data-query", combine_input, methods=["POST"])
-    app.add_api_route("/audio-stream", stream_audio, methods=["POST"])
 
 
 

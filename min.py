@@ -36,7 +36,7 @@ prompt_template = ChatPromptTemplate.from_template(
     )
 
 # LLM 인스턴스 생성 (공통 팩토리 사용)
-model = create_llm(model="gpt-3.5-turbo")
+model = create_llm()
 
 # 출력 파서 생성
 output_parser = SimpleJsonOutputParser()

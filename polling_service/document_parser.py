@@ -173,7 +173,7 @@ async def summarize_text(text: str, max_length: int = 2000) -> str:
         logger.info(f"[INFO] 텍스트 요약 시작: {len(text)} 문자")
         
         # LLM 생성
-        llm = create_llm(model="gpt-4o-mini", streaming=False, temperature=0.3)
+        llm = create_llm(streaming=False, temperature=0.3)
         
         # 텍스트 분할
         text_splitter = RecursiveCharacterTextSplitter(

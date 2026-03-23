@@ -1220,8 +1220,8 @@ def fetch_assignee_info(assignee_id: str) -> Dict[str, str]:
         }
 
 
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
+from llm_factory import create_embedding
 
 
 def get_vector_store():
@@ -1229,7 +1229,7 @@ def get_vector_store():
     if supabase is None:
         raise Exception("Supabase client is not configured")
     
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", deployment="text-embedding-3-small")
+    embeddings = create_embedding()
     
     return SupabaseVectorStore(
         client=supabase,

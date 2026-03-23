@@ -14,7 +14,7 @@ import json
 import pytz
 
 # LLM 객체 생성 (공통 팩토리 사용)
-model = create_llm(model="gpt-4o", streaming=True)
+model = create_llm(streaming=True)
 
 # parser 생성
 import re
