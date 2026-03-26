@@ -60,6 +60,15 @@ def _install_stub_modules():
     # llm_factory
     llm_factory = types.ModuleType("llm_factory")
     llm_factory.create_llm = lambda **_kwargs: _DummyModel()
+
+    class _DummyEmbeddings:
+        def embed_documents(self, texts):  # noqa: ANN001
+            return [[0.0] * 4 for _ in texts]
+
+        def embed_query(self, text):  # noqa: ANN001
+            return [0.0] * 4
+
+    llm_factory.create_embedding = lambda **_kwargs: _DummyEmbeddings()
     sys.modules["llm_factory"] = llm_factory
 
     # fastapi
