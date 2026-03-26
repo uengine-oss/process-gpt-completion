@@ -1444,6 +1444,27 @@ def fetch_user_info_by_uid(uid: str) -> Dict[str, str]:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
 
+def fetch_user_info_by_uid_and_tenant(uid: str, tenant_id: str) -> Dict[str, Any]:
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = (
+            supabase.table("users")
+            .select("*")
+            .eq('id', uid)
+            .eq('tenant_id', tenant_id)
+            .limit(1)
+            .execute()
+        )
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        raise HTTPException(status_code=404, detail="User not found")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
 def check_tenant_owner(tenant_id: str, uid: str) -> bool:
     try:
         supabase = supabase_client_var.get()

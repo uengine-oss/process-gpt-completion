@@ -191,7 +191,7 @@
                 "ODOO_URL": "https://uengine.odoo.com",
                 "ODOO_DB": "uengine",
                 "ODOO_USERNAME": "jyjang@uengine.org",
-                "ODOO_PASSWORD": "bca96d3d9716c1dddef9c159097aca3cb2b16352"
+                "ODOO_PASSWORD": "env(ODOO_PASSWORD)"
             },
             "transport": "stdio"
         },
