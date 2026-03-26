@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from typing import Any, Optional, Tuple, Union
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-
 TimeoutType = Union[float, Tuple[float, float]]
 
 
@@ -36,6 +34,14 @@ def _proxy_api_key() -> str:
     return api_key
 
 
+def openai_compatible_client_config() -> dict[str, str]:
+    """OpenAI SDK-compatible `api_key` + `openai_base_url` (e.g. LiteLLM proxy)."""
+    return {
+        "api_key": _proxy_api_key(),
+        "openai_base_url": _proxy_base_url(),
+    }
+
+
 def create_llm(
     model: Optional[str] = None,
     streaming: bool = False,
@@ -45,6 +51,10 @@ def create_llm(
     **kwargs: Any,
 ):
     """Standard ChatOpenAI constructor wrapper used across the project."""
+    # Import lazily to keep module importable in test/CI environments
+    # where optional LLM dependencies may not be installed.
+    from langchain_openai import ChatOpenAI
+
     resolved_model = (model or "").strip() or get_llm_model()
 
     base_url = kwargs.pop("base_url", None) or _proxy_base_url()
@@ -77,6 +87,10 @@ def create_embedding(
     max_retries: int = 6,
     **kwargs: Any,
 ):
+    # Import lazily to keep module importable in test/CI environments
+    # where optional LLM dependencies may not be installed.
+    from langchain_openai import OpenAIEmbeddings
+
     if model is None:
         model = os.getenv("LLM_EMBEDDING_MODEL") or os.getenv("OPENAI_EMBEDDING_MODEL")
     if not model:

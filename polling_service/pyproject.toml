@@ -15,7 +15,6 @@ dependencies = [
     "langchain-openai==0.3.23",
     "langgraph==0.5.3",
     "langserve==0.3.1",
-    "process-gpt-llm-factory==1.0.0",
     "psutil==6.1.0",
     "psycopg2-binary==2.9.10",
     "pydantic==2.11.7",

@@ -132,7 +132,6 @@ dependencies = [
     "portalocker==2.10.1",
     "postgrest==1.0.2",
     "posthog==4.10.0",
-    "process-gpt-llm-factory==1.0.0",
     "propcache==0.3.2",
     "proto-plus==1.26.1",
     "protobuf==5.29.4",

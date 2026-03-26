@@ -8,10 +8,24 @@ from langchain.prompts import PromptTemplate
 from langchain.schema.output_parser import StrOutputParser
 from langchain.schema.runnable import RunnablePassthrough
 from fastapi import HTTPException
-from llm_factory import create_llm
+from llm_factory import create_llm, get_llm_model, openai_compatible_client_config
 
 # 학습 모드 유사도 임계값 (고정 응답은 사용하지 않고 LLM이 학습 유무를 포함해 자연스럽게 답변)
 LEARNING_DUPLICATE_THRESHOLD = 0.92
+
+
+class _OpenAIEmbeddingNoDimensions:
+    """mem0 OpenAIEmbedding은 항상 `dimensions`를 넘기는데, LiteLLM은 text-embedding-3 계열에서 이를 거부한다."""
+
+    def __init__(self, inner):
+        self.config = inner.config
+        self._client = inner.client
+        self._model = inner.config.model
+
+    def embed(self, text, memory_action=None):
+        text = (text or "").replace("\n", " ")
+        return self._client.embeddings.create(input=[text], model=self._model).data[0].embedding
+
 
 if os.getenv("ENV") != "production":
     load_dotenv(override=True)
@@ -89,6 +103,12 @@ response_generation_prompt = PromptTemplate.from_template(
 {search_context}"""
 )
 
+_mem_openai = openai_compatible_client_config()
+_embedding_model = (
+    os.getenv("LLM_EMBEDDING_MODEL")
+    or "text-embedding-3-small"
+).strip()
+
 config = {
     "vector_store": {
         "provider": "supabase",
@@ -96,12 +116,22 @@ config = {
             "connection_string": connection_string,
             "collection_name": "memories",
             "index_method": "hnsw",
-            "index_measure": "cosine_distance"
-        }
-    }
+            "index_measure": "cosine_distance",
+        },
+    },
+    # mem0 기본 임베딩/LLM은 OPENAI_API_KEY만 본다. 채팅과 같이 프록시 키·URL을 쓴다.
+    "embedder": {
+        "provider": "openai",
+        "config": {**_mem_openai, "model": _embedding_model},
+    },
+    "llm": {
+        "provider": "openai",
+        "config": {**_mem_openai, "model": get_llm_model()},
+    },
 }
 
 memory = Memory.from_config(config_dict=config)
+memory.embedding_model = _OpenAIEmbeddingNoDimensions(memory.embedding_model)
 
 learning_response_chain = (
     RunnablePassthrough() |

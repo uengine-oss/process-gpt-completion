@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from typing import Any, Optional, Tuple, Union
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-
 TimeoutType = Union[float, Tuple[float, float]]
 
 
@@ -43,6 +41,10 @@ def create_llm(
     max_retries: int = 6,
     **kwargs: Any,
 ):
+    # Import lazily to keep module importable in test/CI environments
+    # where optional LLM dependencies may not be installed.
+    from langchain_openai import ChatOpenAI
+
     resolved_model = (model or "").strip() or get_llm_model()
 
     base_url = kwargs.pop("base_url", None) or _proxy_base_url()
@@ -75,6 +77,10 @@ def create_embedding(
     max_retries: int = 6,
     **kwargs: Any,
 ):
+    # Import lazily to keep module importable in test/CI environments
+    # where optional LLM dependencies may not be installed.
+    from langchain_openai import OpenAIEmbeddings
+
     if model is None:
         model = os.getenv("LLM_EMBEDDING_MODEL") or os.getenv("OPENAI_EMBEDDING_MODEL")
     if not model:
