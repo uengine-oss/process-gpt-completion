@@ -1,3 +1,5 @@
+> **전체 설치 및 실행 방법은 메인 프로젝트를 참고하세요:** [ProcessGPT](https://github.com/uengine-oss/process-gpt)
+
 # process-gpt-completion
 
 ## Environment Setup
