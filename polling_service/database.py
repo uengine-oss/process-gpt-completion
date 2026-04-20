@@ -6,7 +6,7 @@ from process_definition import ProcessDefinition, load_process_definition, UIDef
 from fastapi import HTTPException
 from decimal import Decimal
 from datetime import datetime, timedelta
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dotenv import load_dotenv
 from llm_factory import create_llm, create_embedding
 
@@ -16,12 +16,47 @@ import os
 import uuid
 import json
 import asyncio
+import threading
 import requests
 
 
 supabase_client_var = ContextVar('supabase', default=None)
 subdomain_var = ContextVar('subdomain', default='localhost')
 CONSUMER_FILTER = os.getenv("WORKITEM_CONSUMER")
+
+
+def run_async_in_sync_context(coro):
+    """
+    Run coroutine safely from sync code, even when an event loop is already running.
+    """
+    try:
+        asyncio.get_running_loop()
+        has_running_loop = True
+    except RuntimeError:
+        has_running_loop = False
+
+    if not has_running_loop:
+        return asyncio.run(coro)
+
+    result_holder = {"result": None, "error": None}
+    ctx = copy_context()
+
+    def _runner():
+        try:
+            # ContextVar(s) (e.g., supabase_client_var) do NOT automatically propagate to new threads.
+            # copy_context() ensures request-scoped clients/tenant info remain available.
+            result_holder["result"] = ctx.run(asyncio.run, coro)
+        except Exception as exc:
+            result_holder["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if result_holder["error"] is not None:
+        raise result_holder["error"]
+
+    return result_holder["result"]
 
 
 def setting_database():
@@ -1336,19 +1371,10 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
             
             # 입력 데이터 추가 (파일 파싱 포함)
             try:
-                # 비동기 함수를 동기 컨텍스트에서 실행
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # 이미 실행 중인 이벤트 루프가 있으면 새 태스크로 실행
-                    import nest_asyncio
-                    nest_asyncio.apply()
-                    input_data = loop.run_until_complete(
-                        get_input_data_with_file_parsing(workitem.model_dump(), process_definition)
-                    )
-                else:
-                    input_data = asyncio.run(
-                        get_input_data_with_file_parsing(workitem.model_dump(), process_definition)
-                    )
+                # 이벤트 루프 상태와 무관하게 안전하게 비동기 함수 실행
+                input_data = run_async_in_sync_context(
+                    get_input_data_with_file_parsing(workitem.model_dump(), process_definition)
+                )
             except Exception as e:
                 print(f"[WARNING] 파일 파싱 중 오류 발생, 기본 방식으로 전환: {str(e)}")
                 input_data = get_input_data(workitem.model_dump(), process_definition)
@@ -1513,29 +1539,23 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 
                 # 새로 생성된 workitem에도 입력 데이터 추가 (파일 파싱 포함)
                 try:
-                    # 비동기 함수를 동기 컨텍스트에서 실행
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        # 이미 실행 중인 이벤트 루프가 있으면 새 태스크로 실행
-                        import nest_asyncio
-                        nest_asyncio.apply()
-                        input_data = loop.run_until_complete(
-                            get_input_data_with_file_parsing(workitem.model_dump(), process_definition)
-                        )
-                    else:
-                        input_data = asyncio.run(
-                            get_input_data_with_file_parsing(workitem.model_dump(), process_definition)
-                        )
+                    # 이벤트 루프 상태와 무관하게 안전하게 비동기 함수 실행
+                    input_data = run_async_in_sync_context(
+                        get_input_data_with_file_parsing(workitem.model_dump(), process_definition)
+                    )
                 except Exception as e:
                     print(f"[WARNING] 파일 파싱 중 오류 발생, 기본 방식으로 전환: {str(e)}")
                     input_data = get_input_data(workitem.model_dump(), process_definition)
                 
+                print(f"[DEBUG] input_data: {input_data}")
+
                 if input_data:
                     try:
                         input_data_str = json.dumps(input_data, ensure_ascii=False)
                     except Exception:
                         input_data_str = str(input_data)
                     
+                    print(f"[DEBUG] input_data_str: {input_data_str}")
                     if workitem.query and '[InputData]' in workitem.query:
                         workitem.query = workitem.query.split('[InputData]')[0] + f"[InputData]\n{input_data_str}"
                     else:
@@ -2216,6 +2236,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
          → 전부 배열로 모아 { form_id: { field_id: ["<scope>:<value>", ...] } } 형태로 반환
     """
     try:
+        print(f"[DEBUG][get_field_value] field_info={field_info}, proc_inst_id={process_instance_id}, tenant_id={tenant_id}")
         field_value: Dict[str, Any] = {}
 
         process_definition_id = process_definition.processDefinitionId
@@ -2225,6 +2246,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
         activity_id = next((activity.id for activity in process_definition.activities if activity.tool == form_id), None)
         if not activity_id:
             activity_id = form_id.replace("_form", "").replace(f"{process_definition_id}_", "")
+        print(f"[DEBUG][get_field_value] resolved form_id={form_id}, field_id={field_id}, activity_id={activity_id}")
 
         def _out(wi: Any) -> Optional[dict]:
             return getattr(wi, "output", None) or (wi.get("output") if isinstance(wi, dict) else None)
@@ -2253,6 +2275,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
                 val = _val_from_form(out)
                 if val is not None:
                     field_value[form_id] = { field_id: val }
+                    print(f"[DEBUG][get_field_value] found value in current instance: {val}")
                     return field_value
 
         # 인스턴스 정보
@@ -2260,6 +2283,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
         root_proc_inst_id = getattr(instance, "root_proc_inst_id", None) or (instance.get("root_proc_inst_id") if isinstance(instance, dict) else None)
         exec_scope_raw = getattr(instance, "execution_scope", None) or (instance.get("execution_scope") if isinstance(instance, dict) else None)
         exec_scope = _to_int(exec_scope_raw, 0)
+        print(f"[DEBUG][get_field_value] root_proc_inst_id={root_proc_inst_id}, exec_scope={exec_scope}")
 
         # (2) 루트 인스턴스 단일 조회(+그룹 인덱싱)
         workitem_root = fetch_workitem_by_proc_inst_and_activity(root_proc_inst_id, activity_id, tenant_id, True)
@@ -2270,6 +2294,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
                 val = _val_from_form(out)
                 if val is not None:
                     field_value[form_id] = { field_id: val }
+                    print(f"[DEBUG][get_field_value] found value in root instance (direct): {val}")
                     return field_value
                 # (b) 그룹형: form 내부 item_value[exec_scope][field_id]
                 form = out.get(form_id)
@@ -2279,12 +2304,14 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
                             candidate = item_value[exec_scope][field_id]
                             if candidate is not None:
                                 field_value[form_id] = { field_id: candidate }
+                                print(f"[DEBUG][get_field_value] found value in root instance (grouped) at scope={exec_scope}: {candidate}")
                                 return field_value
                         except Exception:
                             pass
 
         workitems = fetch_workitems_by_root_proc_inst_id(root_proc_inst_id, tenant_id)
         if not workitems:
+            print(f"[DEBUG][get_field_value] no workitems found for root_proc_inst_id={root_proc_inst_id}")
             return None
 
         filtered: List[Any] = []
@@ -2314,6 +2341,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
 
         if values:
             field_value[form_id] = { field_id: values }
+            print(f"[DEBUG][get_field_value] collected multiple values: {values}")
             return field_value
 
         return None
@@ -2336,7 +2364,7 @@ def group_fields_by_form(field_values: dict) -> dict:
     form_groups = {}
     
     for field_key, field_value in field_values.items():
-        if not field_value:
+        if field_value is None:
             continue
             
         form_id = field_key.split('.')[0]
@@ -2361,22 +2389,27 @@ def get_input_data(workitem: dict, process_definition: Any):
         activity = process_definition.find_activity_by_id(activity_id)
 
         if not activity:
+            print(f"[WARNING][get_input_data] activity not found for activity_id={activity_id}")
             return None
         
         input_data = {}
         input_fields = activity.inputData
+        print(f"[DEBUG][get_input_data] activity_id={activity_id}, input_fields={input_fields}, proc_inst_id={workitem.get('proc_inst_id')}, tenant_id={workitem.get('tenant_id')}")
         if len(input_fields) != 0:
             # 각 필드의 값을 가져오기
             field_values = {}
             for input_field in input_fields:
                 field_value = get_field_value(input_field, process_definition, workitem.get('proc_inst_id'), workitem.get('tenant_id'))
-                if field_value:
+                if field_value is not None:
                     field_values[input_field] = field_value
+                else:
+                    print(f"[DEBUG][get_input_data] field_value is None for input_field={input_field}")
             
             # 폼별로 그룹화
             grouped_data = group_fields_by_form(field_values)
             input_data.update(grouped_data)
 
+        print(f"[DEBUG][get_input_data] final input_data={input_data}")
         return input_data
 
     except Exception as e:
