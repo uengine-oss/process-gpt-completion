@@ -16,19 +16,36 @@ def get_llm_model(default: str = "gpt-4o") -> str:
 def _proxy_base_url() -> str:
     return (
         os.getenv("LLM_PROXY_URL")
+        or os.getenv("OPENROUTER_BASE_URL")
         or "http://litellm-proxy:4000"
     )
 
 
+def _is_openrouter_url(url: str) -> bool:
+    return "openrouter.ai" in (url or "").lower()
+
+
 def _proxy_api_key() -> str:
-    api_key = (
-        os.getenv("LLM_PROXY_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-    )
+    base_url = _proxy_base_url()
+    if _is_openrouter_url(base_url):
+        candidates = [
+            os.getenv("OPENROUTER_API_KEY"),
+            os.getenv("LLM_PROXY_API_KEY"),
+            os.getenv("OPENAI_API_KEY"),
+        ]
+        api_key = next((k for k in candidates if k and k.startswith("sk-or-v1-")), None)
+        if not api_key:
+            api_key = next((k for k in candidates if k), None)
+    else:
+        api_key = (
+            os.getenv("LLM_PROXY_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        )
+
     if not api_key:
         raise RuntimeError(
-            "Missing LiteLLM proxy API key. Set `LLM_PROXY_API_KEY` "
-            "(virtual key, sk-...) or fallback to `OPENAI_API_KEY`."
+            "Missing API key. Set `OPENROUTER_API_KEY` when using OpenRouter, "
+            "or set `LLM_PROXY_API_KEY` / `OPENAI_API_KEY`."
         )
     return api_key
 

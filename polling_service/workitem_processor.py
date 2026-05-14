@@ -1429,18 +1429,17 @@ def get_gateway_condition_data(workitem: dict, process_definition: Any, gateway_
         gateway = process_definition.find_gateway_by_id(gateway_id)
         if not gateway:
             return None
-        
+
         condition_data = {}
-        if gateway.conditionData:
+        cd_fields = getattr(gateway, "conditionData", None) or []
+        if cd_fields:
             process_instance_id = workitem.get('proc_inst_id')
-            # 각 필드의 값을 가져오기
             field_values = {}
-            for condition_field in gateway.conditionData:
+            for condition_field in cd_fields:
                 field_value = get_field_value(condition_field, process_definition, process_instance_id, workitem.get('tenant_id'))
                 if field_value:
                     field_values[condition_field] = field_value
-            
-            # 폼별로 그룹화
+
             grouped_data = group_fields_by_form(field_values)
             condition_data.update(grouped_data)
 
@@ -1562,14 +1561,61 @@ async def run_prompt_and_parse(prompt_tmpl, chain_input, workitem, tenant_id, pa
 
 
 
-async def _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions):
+async def _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions, workitem: Optional[dict] = None):
     sequence_condition_data = sequence_condition_data or {}
-    nl_condition_sequences = []
+    nl_condition_sequences: list[tuple] = []
+
+    gateway_data_cache: dict[str, Optional[dict]] = {}
+
+    def _is_exclusive_gateway(gw_obj) -> bool:
+        try:
+            t = str(getattr(gw_obj, "type", None) or "").lower()
+        except Exception:
+            return False
+        if not t:
+            return False
+        if "exclusive" in t:
+            return True
+        if t in ("xor", "xorgateway"):
+            return True
+        return False
+
+    def _gateway_primary_data_for_sequence(seq) -> Optional[dict]:
+        """sequence.source 가 ExclusiveGateway 인 경우, 해당 게이트웨이의 conditionData
+        기반으로 수집한 폼 데이터({form_id: {field_id: value, ...}, ...}) 를 반환.
+        설정이 없거나 추출 실패 시 None.
+        """
+        if not workitem or not process_definition:
+            return None
+        try:
+            source_id = getattr(seq, "source", None) or getattr(seq, "sourceRef", None)
+            if not source_id:
+                return None
+            if source_id in gateway_data_cache:
+                return gateway_data_cache[source_id]
+            gw_obj = process_definition.find_gateway_by_id(source_id) if hasattr(process_definition, "find_gateway_by_id") else None
+            if not gw_obj or not _is_exclusive_gateway(gw_obj):
+                gateway_data_cache[source_id] = None
+                return None
+            try:
+                cd = get_gateway_condition_data(workitem, process_definition, source_id)
+            except Exception as e:
+                print(f"[WARN] _gateway_primary_data_for_sequence: get_gateway_condition_data failed for {source_id}: {e}")
+                cd = None
+            if not isinstance(cd, dict) or not cd:
+                cd = None
+            gateway_data_cache[source_id] = cd
+            return cd
+        except Exception as e:
+            print(f"[WARN] _gateway_primary_data_for_sequence error: {e}")
+            return None
 
     for sequence in process_definition.sequences or []:
         condition_data = sequence_condition_data.get(sequence.id)
         if not isinstance(condition_data, dict):
             continue
+
+        gateway_primary = _gateway_primary_data_for_sequence(sequence)
 
         expr = condition_data.get("conditionFunction")
         if isinstance(expr, str) and expr.strip():
@@ -1583,11 +1629,18 @@ async def _evaluate_sequence_conditions(model, parser, process_definition, all_w
                     prefix, rhs = expr_text.split(":", 1)
                     prefix = prefix.strip()
                     rhs = rhs.strip()
-                    if prefix and isinstance(all_workitem_input_data, dict):
-                        maybe_ctx = all_workitem_input_data.get(prefix)
-                        if isinstance(maybe_ctx, dict):
-                            scoped_context = maybe_ctx
-                            expr = rhs
+                    if prefix:
+                        # 우선 게이트웨이 primary 데이터에서 찾고, 없으면 전체 input 에서 검색
+                        if isinstance(gateway_primary, dict):
+                            maybe_ctx = gateway_primary.get(prefix)
+                            if isinstance(maybe_ctx, dict):
+                                scoped_context = maybe_ctx
+                                expr = rhs
+                        if scoped_context is None and isinstance(all_workitem_input_data, dict):
+                            maybe_ctx = all_workitem_input_data.get(prefix)
+                            if isinstance(maybe_ctx, dict):
+                                scoped_context = maybe_ctx
+                                expr = rhs
                 except Exception:
                     pass
 
@@ -1612,6 +1665,11 @@ async def _evaluate_sequence_conditions(model, parser, process_definition, all_w
             if scoped_context is not None:
                 eval_contexts.append(scoped_context)
             else:
+                # 게이트웨이 conditionData 가 명시되어 있으면 우선적으로 평가 컨텍스트에 넣고,
+                # 평가 실패 시에 한해 전체 input 으로 fallback.
+                if isinstance(gateway_primary, dict) and gateway_primary:
+                    _collect_contexts(gateway_primary)
+
                 if all_workitem_input_data:
                     _collect_contexts(all_workitem_input_data)
 
@@ -1642,9 +1700,15 @@ async def _evaluate_sequence_conditions(model, parser, process_definition, all_w
             _set_condition_eval(sequence_condition_data, sequence.id, condition_eval)
             continue
 
+        # condition 우선, 없으면 name(예: 디자이너에서 시퀀스 이름을 "yes"/"no"로만 지정한 경우)으로 fallback
         condition_text = condition_data.get("condition")
+        if not (isinstance(condition_text, str) and condition_text.strip()):
+            name_text = condition_data.get("name")
+            if isinstance(name_text, str) and name_text.strip():
+                condition_text = name_text
+
         if isinstance(condition_text, str) and condition_text.strip():
-            nl_condition_sequences.append((sequence.id, condition_text.strip()))
+            nl_condition_sequences.append((sequence.id, condition_text.strip(), gateway_primary))
 
     if nl_condition_sequences:
         await _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions)
@@ -1682,14 +1746,36 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
         return str(obj)
 
     runtime_context = {"current_output": _normalize(all_workitem_input_data), "previous_outputs": _normalize(workitem_input_data)}
+
+    def _annotate_gateway_primary(gp):
+        if not isinstance(gp, dict) or not gp:
+            return None
+        try:
+            return apply_field_name_annotation_recursively(gp, ui_definitions, ui_field_keys)
+        except Exception:
+            return gp
+
     # Build NL conditions with priority: condition > name (from sequence_condition_data)
+    # nl_condition_sequences items: (seq_id, condition_text, gateway_primary_data_or_None)
     conditions_payload = []
     existing_ids = set()
+    seq_to_primary: dict[str, Optional[dict]] = {}
     try:
-        for seq_id, text in nl_condition_sequences:
-            if isinstance(text, str) and text.strip():
-                conditions_payload.append({"sequenceId": seq_id, "condition": text})
-                existing_ids.add(str(seq_id))
+        for tup in nl_condition_sequences:
+            if not isinstance(tup, (list, tuple)):
+                continue
+            seq_id = tup[0] if len(tup) > 0 else None
+            text = tup[1] if len(tup) > 1 else None
+            gateway_primary = tup[2] if len(tup) > 2 else None
+            if not seq_id or not isinstance(text, str) or not text.strip():
+                continue
+            entry = {"sequenceId": seq_id, "condition": text.strip()}
+            annotated_primary = _annotate_gateway_primary(gateway_primary)
+            if annotated_primary is not None:
+                entry["primaryData"] = _normalize(annotated_primary)
+                seq_to_primary[str(seq_id)] = gateway_primary
+            conditions_payload.append(entry)
+            existing_ids.add(str(seq_id))
     except Exception:
         # Fallback: tolerate unexpected shapes
         pass
@@ -1710,15 +1796,31 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
             except Exception:
                 name_text = None
 
+            chosen_text = None
             if isinstance(cond_text, str) and cond_text.strip():
-                conditions_payload.append({"sequenceId": sid, "condition": cond_text.strip()})
-                existing_ids.add(sid_str)
+                chosen_text = cond_text.strip()
             elif isinstance(name_text, str) and name_text.strip():
-                conditions_payload.append({"sequenceId": sid, "condition": name_text.strip()})
+                chosen_text = name_text.strip()
+
+            if chosen_text is not None:
+                entry = {"sequenceId": sid, "condition": chosen_text}
+                # 이 경로에서는 gateway_primary가 별도로 들어오지 않음(상위에서 이미 처리됨).
+                # 그래도 혹시 누락된 케이스를 대비해 seq_to_primary 참조 시도.
+                gp = seq_to_primary.get(sid_str)
+                annotated_primary = _annotate_gateway_primary(gp)
+                if annotated_primary is not None:
+                    entry["primaryData"] = _normalize(annotated_primary)
+                conditions_payload.append(entry)
                 existing_ids.add(sid_str)
 
     chain_input_text = {
-        "instruction": "You are a BPMN sequence condition evaluator. Use the runtime context JSON and determine whether each natural-language condition is satisfied.",
+        "instruction": (
+            "You are a BPMN sequence condition evaluator. For each condition, decide whether it is satisfied. "
+            "PRIORITY RULES: If a condition entry has 'primaryData' (gateway-specific reference data), "
+            "evaluate the condition USING ONLY that 'primaryData'. Treat empty / missing / null / 'no' / unchecked "
+            "values literally — do NOT infer a positive answer from other forms or general context. "
+            "If 'primaryData' is absent, use runtimeContext.current_output and runtimeContext.previous_outputs."
+        ),
         "outputFormat": {"results": [{"sequenceId": "...", "conditionMet": True, "reason": "optional explanation"}]},
         "runtimeContext": runtime_context,
         "conditions": conditions_payload
@@ -1770,7 +1872,13 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
         _set_condition_eval(sequence_condition_data, seq_id, condition_met, item.get("reason"))
         updated_ids.add(seq_id)
 
-    for seq_id, _ in nl_condition_sequences:
+    for tup in nl_condition_sequences:
+        try:
+            seq_id = tup[0] if isinstance(tup, (list, tuple)) and len(tup) > 0 else None
+        except Exception:
+            seq_id = None
+        if not seq_id:
+            continue
         if seq_id not in updated_ids:
             _set_condition_eval(sequence_condition_data, seq_id, False)
 
@@ -3721,7 +3829,7 @@ async def handle_workitem(workitem):
             print(f"[ERROR] Failed to get selected info for {workitem.get('id')}: {str(e)}")
 
         sequence_condition_data = sequence_condition_data or {}
-        await _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions)
+        await _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions, workitem=workitem)
 
         attached_activities = []
         for next_activity in next_near_activities:
