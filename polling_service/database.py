@@ -2239,17 +2239,50 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
          → 전부 배열로 모아 { form_id: { field_id: ["<scope>:<value>", ...] } } 형태로 반환
     """
     try:
-        print(f"[DEBUG][get_field_value] field_info={field_info}, proc_inst_id={process_instance_id}, tenant_id={tenant_id}")
         field_value: Dict[str, Any] = {}
 
         process_definition_id = process_definition.processDefinitionId
         split_field_info = field_info.split('.')
         form_id = split_field_info[0]
         field_id = split_field_info[1]
-        activity_id = next((activity.id for activity in process_definition.activities if activity.tool == form_id), None)
+
+        # ---- form_id -> activity_id 매핑 (다단계) ----
+        # 1) activity.tool 직접 비교
+        # 2) activity.tool 에서 'formHandler:' prefix 제거 후 비교
+        # 3) form_id 의 '_form' 접미 제거 + PD ID prefix 제거 후 끝부분 토큰 매칭
+        # 4) 최후 fallback: 같은 인스턴스 모든 워크아이템 순회하여 output 안에 form_id 키가 있는지 확인
+        def _norm_tool(t: Any) -> str:
+            try:
+                s = str(t or "").strip()
+            except Exception:
+                s = ""
+            if s.startswith("formHandler:"):
+                s = s[len("formHandler:"):]
+            return s
+
+        activities = list(getattr(process_definition, "activities", None) or [])
+        activity_id: Optional[str] = None
+
+        activity_id = next((a.id for a in activities if getattr(a, "tool", None) == form_id), None)
+
         if not activity_id:
-            activity_id = form_id.replace("_form", "").replace(f"{process_definition_id}_", "")
-        print(f"[DEBUG][get_field_value] resolved form_id={form_id}, field_id={field_id}, activity_id={activity_id}")
+            activity_id = next((a.id for a in activities if _norm_tool(getattr(a, "tool", None)) == form_id), None)
+
+        if not activity_id:
+            base = form_id[:-len("_form")] if form_id.endswith("_form") else form_id
+            if process_definition_id and base.startswith(f"{process_definition_id}_"):
+                base = base[len(process_definition_id) + 1:]
+            for a in activities:
+                aid = getattr(a, "id", None)
+                if not aid:
+                    continue
+                if base == aid or base.endswith(f"_{aid}"):
+                    activity_id = aid
+                    break
+            if not activity_id and base:
+                last_token = base.split("_")[-1]
+                if any(getattr(a, "id", None) == last_token for a in activities):
+                    activity_id = last_token
 
         def _out(wi: Any) -> Optional[dict]:
             return getattr(wi, "output", None) or (wi.get("output") if isinstance(wi, dict) else None)
@@ -2270,6 +2303,21 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
         def _ci_equal(a: Optional[str], b: Optional[str]) -> bool:
             return (a or "").lower() == (b or "").lower()
 
+        # activity_id 못 찾은 경우 - 같은 인스턴스 모든 워크아이템에서 output[form_id] 직접 탐색
+        if not activity_id:
+            try:
+                wi_all = fetch_workitems_by_proc_inst_id(process_instance_id, tenant_id) or []
+            except Exception:
+                wi_all = []
+            for wi in wi_all:
+                out = _out(wi)
+                if isinstance(out, dict) and isinstance(out.get(form_id), dict):
+                    val = _val_from_form(out)
+                    if val is not None:
+                        field_value[form_id] = { field_id: val }
+                        return field_value
+            return None
+
         # (1) 현재 인스턴스 단일 조회
         workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_id, activity_id, tenant_id, True)
         if workitem:
@@ -2278,28 +2326,36 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
                 val = _val_from_form(out)
                 if val is not None:
                     field_value[form_id] = { field_id: val }
-                    print(f"[DEBUG][get_field_value] found value in current instance: {val}")
                     return field_value
+        else:
+            # activity_id 매핑은 됐지만 워크아이템이 그 ID 로 안 잡힌 케이스 -> output-key 스캔
+            try:
+                wi_all = fetch_workitems_by_proc_inst_id(process_instance_id, tenant_id) or []
+            except Exception:
+                wi_all = []
+            for wi in wi_all:
+                out = _out(wi)
+                if isinstance(out, dict) and isinstance(out.get(form_id), dict):
+                    val = _val_from_form(out)
+                    if val is not None:
+                        field_value[form_id] = { field_id: val }
+                        return field_value
 
         # 인스턴스 정보
         instance = fetch_process_instance(process_instance_id, tenant_id)
         root_proc_inst_id = getattr(instance, "root_proc_inst_id", None) or (instance.get("root_proc_inst_id") if isinstance(instance, dict) else None)
         exec_scope_raw = getattr(instance, "execution_scope", None) or (instance.get("execution_scope") if isinstance(instance, dict) else None)
         exec_scope = _to_int(exec_scope_raw, 0)
-        print(f"[DEBUG][get_field_value] root_proc_inst_id={root_proc_inst_id}, exec_scope={exec_scope}")
 
         # (2) 루트 인스턴스 단일 조회(+그룹 인덱싱)
         workitem_root = fetch_workitem_by_proc_inst_and_activity(root_proc_inst_id, activity_id, tenant_id, True)
         if workitem_root:
             out = _out(workitem_root)
             if out:
-                # (a) 직접 필드
                 val = _val_from_form(out)
                 if val is not None:
                     field_value[form_id] = { field_id: val }
-                    print(f"[DEBUG][get_field_value] found value in root instance (direct): {val}")
                     return field_value
-                # (b) 그룹형: form 내부 item_value[exec_scope][field_id]
                 form = out.get(form_id)
                 if isinstance(form, dict):
                     for _, item_value in form.items():
@@ -2307,14 +2363,12 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
                             candidate = item_value[exec_scope][field_id]
                             if candidate is not None:
                                 field_value[form_id] = { field_id: candidate }
-                                print(f"[DEBUG][get_field_value] found value in root instance (grouped) at scope={exec_scope}: {candidate}")
                                 return field_value
                         except Exception:
                             pass
 
         workitems = fetch_workitems_by_root_proc_inst_id(root_proc_inst_id, tenant_id)
         if not workitems:
-            print(f"[DEBUG][get_field_value] no workitems found for root_proc_inst_id={root_proc_inst_id}")
             return None
 
         filtered: List[Any] = []
@@ -2323,6 +2377,14 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
             if _ci_equal(wi_act, activity_id):
                 filtered.append(wi)
         if not filtered:
+            # 최후 fallback: activity_id 매칭 실패해도 output 안에 form_id 키가 있는 워크아이템 직접 탐색
+            for wi in workitems:
+                out = _out(wi)
+                if isinstance(out, dict) and isinstance(out.get(form_id), dict):
+                    val = _val_from_form(out)
+                    if val is not None:
+                        field_value[form_id] = { field_id: val }
+                        return field_value
             return None
 
         def _sort_key(wi: Any):
@@ -2344,7 +2406,6 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
 
         if values:
             field_value[form_id] = { field_id: values }
-            print(f"[DEBUG][get_field_value] collected multiple values: {values}")
             return field_value
 
         return None
@@ -2397,22 +2458,16 @@ def get_input_data(workitem: dict, process_definition: Any):
         
         input_data = {}
         input_fields = activity.inputData
-        print(f"[DEBUG][get_input_data] activity_id={activity_id}, input_fields={input_fields}, proc_inst_id={workitem.get('proc_inst_id')}, tenant_id={workitem.get('tenant_id')}")
         if len(input_fields) != 0:
-            # 각 필드의 값을 가져오기
             field_values = {}
             for input_field in input_fields:
                 field_value = get_field_value(input_field, process_definition, workitem.get('proc_inst_id'), workitem.get('tenant_id'))
                 if field_value is not None:
                     field_values[input_field] = field_value
-                else:
-                    print(f"[DEBUG][get_input_data] field_value is None for input_field={input_field}")
-            
-            # 폼별로 그룹화
+
             grouped_data = group_fields_by_form(field_values)
             input_data.update(grouped_data)
 
-        print(f"[DEBUG][get_input_data] final input_data={input_data}")
         return input_data
 
     except Exception as e:
