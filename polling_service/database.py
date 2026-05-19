@@ -463,6 +463,7 @@ class WorkItem(BaseModel):
     query: Optional[str] = None
     version_tag: Optional[str] = None
     version: Optional[str] = None
+    adhoc: Optional[bool] = None
     
     @validator('start_date', 'end_date', 'due_date', pre=True)
     def parse_datetime(cls, value):
@@ -1330,9 +1331,9 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
 
         # nextUserEmail는 LLM/roleBindings에서 결정된 최종 담당자 식별자 (이메일 또는 id/UUID)
         next_user_email = activity_data.get('nextUserEmail')
-        
+
         workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_data['proc_inst_id'], activity_data['nextActivityId'], tenant_id)
-        
+
         if workitem:
             workitem.status = activity_data['result']
             workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul')) if activity_data['result'] == 'DONE' else None
@@ -1674,6 +1675,8 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
         next_activities = process_definition.find_next_activities(initial_activity.id, True)
         for activity in next_activities:
             if safeget(activity, 'type', '') == 'endEvent':
+                continue
+            if safeget(activity, 'type', '') == 'adHocSubProcess':
                 continue
             
             prev_activities = process_definition.find_prev_activities(activity.id, [])

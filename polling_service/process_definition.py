@@ -208,7 +208,7 @@ class ProcessDefinition(BaseModel):
     
     
     def is_subprocess(self, node) -> bool:
-        return getattr(node, "type", None) in ("subProcess", "subprocess", "SubProcess")
+        return getattr(node, "type", None) in ("subProcess", "subprocess", "SubProcess", "adHocSubProcess")
 
     def find_sub_process_by_id(self, node_id: str):
         for a in self.activities:

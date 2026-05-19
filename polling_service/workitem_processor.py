@@ -948,6 +948,38 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
             upsert_workitem(workitem_data, process_instance.tenant_id)
             print(f"[INFO] Created initial activity workitem for child: {child_proc_inst_id} -> {initial_act.id}")
 
+    def create_adhoc_workitems(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope):
+        root_proc_inst_id = process_instance.proc_inst_id
+        start_date = datetime.now().isoformat()
+        
+        for act in (child_def.activities or []):
+            workitem_data = {
+                "id": str(uuid.uuid4()),
+                "user_id": endpoint,
+                "username": None,
+                "proc_inst_id": child_proc_inst_id,
+                "proc_def_id": child_proc_def_id,
+                "activity_id": act.id,
+                "activity_name": act.name,
+                "start_date": start_date,
+                "due_date": None,
+                "status": "TODO",
+                "assignees": role_bindings,
+                "reference_ids": [],
+                "duration": act.duration,
+                "tool": act.tool or 'formHandler:defaultForm',
+                "adhoc": True,
+                "output": {},
+                "retry": 0,
+                "consumer": None,
+                "description": act.description or '',
+                "tenant_id": process_instance.tenant_id,
+                "root_proc_inst_id": root_proc_inst_id,
+                "execution_scope": execution_scope,
+            }
+            upsert_workitem(workitem_data, process_instance.tenant_id)
+            print(f"[INFO] Created adhoc activity workitem for child: {child_proc_inst_id} -> {act.id}")
+
     def resolve_multi_instance_count(activity, process_result_json):
         raw = getattr(activity, 'multiInstanceCount', None)
         if raw is None:
@@ -977,19 +1009,21 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
         return raw
 
     for activity in process_result.nextActivities or []:
-        if activity.type != "subProcess":
+        is_adhoc = (activity.type == "adHocSubProcess")
+        if activity.type != "subProcess" and not is_adhoc:
             continue
         
-        prev_activities = process_definition.find_immediate_prev_activities(activity.nextActivityId)
-        for prev_activity in prev_activities:
-            for completed_activity in process_result.completedActivities:
-                if completed_activity.completedActivityId == prev_activity.id:
-                    completed_activity.result = "PENDING"
-                    break
-            for completed_activity_json in process_result_json.get("completedActivities", []):
-                if completed_activity_json.get("completedActivityId") == prev_activity.id:
-                    completed_activity_json["result"] = "PENDING"
-                    break
+        if not is_adhoc:
+            prev_activities = process_definition.find_immediate_prev_activities(activity.nextActivityId)
+            for prev_activity in prev_activities:
+                for completed_activity in process_result.completedActivities:
+                    if completed_activity.completedActivityId == prev_activity.id:
+                        completed_activity.result = "PENDING"
+                        break
+                for completed_activity_json in process_result_json.get("completedActivities", []):
+                    if completed_activity_json.get("completedActivityId") == prev_activity.id:
+                        completed_activity_json["result"] = "PENDING"
+                        break
         
         next_sub_process = process_definition.find_next_sub_process(activity.nextActivityId)
         if not next_sub_process:
@@ -1041,10 +1075,33 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                 continue
 
             try:
-                create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope)
+                if is_adhoc:
+                    parent_workitem_data = {
+                        "id": str(uuid.uuid4()),
+                        "user_id": endpoint,
+                        "username": None,
+                        "proc_inst_id": process_instance.proc_inst_id,
+                        "proc_def_id": process_instance.proc_def_id,
+                        "activity_id": activity.nextActivityId,
+                        "activity_name": next_sub_process.name or activity.nextActivityName,
+                        "start_date": datetime.now().isoformat(),
+                        "status": getattr(activity, "result", None) or "TODO",
+                        "assignees": role_bindings,
+                        "tenant_id": process_instance.tenant_id,
+                        "root_proc_inst_id": process_instance.proc_inst_id,
+                        "adhoc": True,
+                        "agent_mode": "COMPLETE",
+                        "agent_orch": "deepagents"
+                    }
+                    upsert_workitem(parent_workitem_data, process_instance.tenant_id)
+                    print(f"[INFO] Created parent workitem for adHocSubProcess: {activity.nextActivityId}")
+                    
+                    create_adhoc_workitems(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope)
+                else:
+                    create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope)
                 execution_scope += 1
             except Exception as e:
-                print(f"[ERROR] Failed to create initial workitem for child '{child_proc_inst_id}': {e}")
+                print(f"[ERROR] Failed to create workitems for child '{child_proc_inst_id}': {e}")
                 continue
 
 def _execute_script_tasks(process_instance: ProcessInstance, process_result: ProcessResult, 
