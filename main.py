@@ -16,6 +16,7 @@ from database import update_tenant_id
 from mcp_config_api import add_routes_to_app as add_mcp_routes_to_app
 from agent_chat import add_routes_to_app as add_agent_chat_routes_to_app
 from callbot_api import add_routes_to_app as add_callbot_routes_to_app
+from test_mode import add_routes_to_app as add_test_mode_routes_to_app
 
 from dotenv import load_dotenv
 
@@ -77,6 +78,7 @@ add_process_chat_routes_to_app(app)
 add_mcp_routes_to_app(app)
 add_agent_chat_routes_to_app(app)
 add_callbot_routes_to_app(app)
+add_test_mode_routes_to_app(app)
 
 import asyncio
 
