@@ -71,6 +71,8 @@ class SubProcess(BaseModel):
     duration: Optional[int] = None
     srcTrg: Optional[str] = None
     children: Optional["ProcessDefinition"] = None
+    description: Optional[str] = None
+    instruction: Optional[str] = None
 
 class ProcessSequence(BaseModel):
     id: str

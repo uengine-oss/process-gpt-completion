@@ -1076,6 +1076,12 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
 
             try:
                 if is_adhoc:
+                    adhoc_query = ""
+                    if next_sub_process.description:
+                        adhoc_query = f"[Description]\n{next_sub_process.description}\n\n"
+                    if next_sub_process.instruction:
+                        adhoc_query += f"[Instruction]\n{next_sub_process.instruction}\n\n"
+                    
                     parent_workitem_data = {
                         "id": str(uuid.uuid4()),
                         "user_id": endpoint,
@@ -1090,6 +1096,8 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                         "tenant_id": process_instance.tenant_id,
                         "root_proc_inst_id": process_instance.proc_inst_id,
                         "adhoc": True,
+                        "description": next_sub_process.description,
+                        "query": adhoc_query,
                         "agent_mode": "COMPLETE",
                         "agent_orch": "deepagents"
                     }
