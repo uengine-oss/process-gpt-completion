@@ -1448,9 +1448,10 @@ def get_workitem_position(workitem: dict) -> Tuple[bool, bool]:
         is_first = process_definition.is_starting_activity(activity_id)
         
         # 마지막 액티비티 확인 (endEvent와 연결된 액티비티)
-        end_activity = process_definition.find_end_activity()
-        is_last = end_activity and end_activity.id == activity_id
-        
+        # 분기마다 endEvent 로 진입할 수 있으므로 종료 활동은 여러 개일 수 있다.
+        end_activities = process_definition.find_end_activities()
+        is_last = any(getattr(ea, 'id', None) == activity_id for ea in end_activities)
+
         return is_first, is_last
         
     except Exception as e:

@@ -417,20 +417,55 @@ class ProcessDefinition(BaseModel):
                 source_containers.append(sequence.source)
         return source_containers
     
+    def find_end_activities(self) -> List[ProcessActivity]:
+        """endEvent 로 들어오는 '모든' 시퀀스의 source 활동을 반환한다.
+
+        여러 분기가 각자 endEvent 로 직접 진입할 수 있다(분기마다 마지막 활동이 다름).
+        그러므로 진입 시퀀스가 몇 개든·정의 순서가 어떻든 그 source 활동들은 '모두'
+        종료 활동이 될 수 있어야 한다. (첫 시퀀스 하나만 종료 활동으로 보면, 다른
+        분기로 실행된 인스턴스는 영원히 RUNNING 으로 남는다.)
+        source 가 게이트웨이면 그 게이트웨이로 들어오는 노드를 거슬러 올라가 해석한다.
+        """
+        end_ids = {
+            g.id for g in self.gateways
+            if "endevent" in str(getattr(g, "type", "") or "").lower()
+        }
+        if not end_ids:
+            return []
+
+        results: List[ProcessActivity] = []
+        seen: set = set()
+
+        def _collect_source(node_id: str, depth: int = 0):
+            if not node_id or depth > 20:
+                return
+            act = self.find_activity_by_id(node_id)
+            if act:
+                if act.id not in seen:
+                    seen.add(act.id)
+                    results.append(act)
+                return
+            # 게이트웨이가 endEvent 바로 앞에 있으면, 그 게이트웨이로 들어오는 노드를
+            # 거슬러 올라가 실제 활동을 종료 활동으로 삼는다.
+            gw = self.find_gateway_by_id(node_id)
+            if gw:
+                for seq in self.sequences:
+                    if seq.target == node_id:
+                        _collect_source(seq.source, depth + 1)
+
+        for seq in self.sequences:
+            if seq.target in end_ids:
+                _collect_source(seq.source)
+        return results
+
     def find_end_activity(self) -> Optional[ProcessActivity]:
         """
-        Finds and returns the end activity of the process, which is the one with no outgoing sequences.
-
-        Returns:
-            Optional[Activity]: The initial activity if found, None otherwise.
+        하위 호환용 — 종료 활동 중 하나를 반환한다.
+        종료 활동이 여러 개일 수 있으므로(분기마다 endEvent 진입), 완료 판정 등
+        '모든 분기'를 고려해야 하는 곳에서는 find_end_activities() 를 사용할 것.
         """
-        # Find the gateway with "endevent" as the type
-        end_id = next((g.id for g in self.gateways if "endevent" in g.type.lower()), None)
-        if end_id:
-            for seq in self.sequences:
-                if seq.target == end_id:
-                    return self.find_activity_by_id(seq.source)
-        return None
+        end_activities = self.find_end_activities()
+        return end_activities[0] if end_activities else None
 
     def find_activity_by_id(self, activity_id: str) -> Optional[ProcessActivity]:
         for activity in self.activities:

@@ -599,24 +599,23 @@ def upsert_process_instance(process_instance: ProcessInstance, tenant_id: Option
     if definition is not None:
         process_definition = definition
 
-    end_activity = process_definition.find_end_activity()
-    
+    # 종료 활동은 여러 개일 수 있다 — 분기마다 endEvent 로 직접 진입하면 각 분기의
+    # 마지막 활동이 모두 '종료 활동'이다. 진입 시퀀스의 개수/순서와 무관하게,
+    # 실제 실행된 분기의 종료 활동이 DONE 이면 인스턴스는 완료된 것으로 본다.
+    end_activities = process_definition.find_end_activities()
+
     status = None
-    if end_activity:
-        end_workitem = fetch_workitem_by_proc_inst_and_activity(process_instance.proc_inst_id, safeget(end_activity, 'id', ''), tenant_id)
-        if end_workitem:
-            if end_workitem.status == 'DONE':
-                status = 'COMPLETED'
-            else:
-                status = 'RUNNING'
-        else:
-            status = 'RUNNING'
+    if end_activities:
+        end_done = False
+        for _end_activity in end_activities:
+            end_workitem = fetch_workitem_by_proc_inst_and_activity(process_instance.proc_inst_id, safeget(_end_activity, 'id', ''), tenant_id)
+            if end_workitem and end_workitem.status == 'DONE':
+                end_done = True
+                break
+        status = 'COMPLETED' if end_done else 'RUNNING'
     else:
         if process_instance.current_activity_ids and len(process_instance.current_activity_ids) != 0:
-            if end_activity and safeget(end_activity, 'id', '') in process_instance.current_activity_ids:
-                status = 'COMPLETED'
-            else:
-                status = 'RUNNING'
+            status = 'RUNNING'
     
     # Set participants from workitems
     process_instance = set_participants_from_workitems(process_instance, tenant_id)
