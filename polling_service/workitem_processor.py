@@ -827,12 +827,26 @@ def _process_next_activities(process_instance: ProcessInstance, process_result: 
 
             expanded = process_definition.find_next_activities(next_id, True) or []
             if expanded:
+                def _resolve_email_from_role_bindings(act_obj):
+                    role_name = getattr(act_obj, "role", None)
+                    if not isinstance(role_name, str) or not role_name:
+                        return None
+                    for rb in (process_instance.role_bindings or []):
+                        if isinstance(rb, dict) and rb.get("name") == role_name:
+                            ep = rb.get("endpoint")
+                            if isinstance(ep, list):
+                                return ep[0] if ep else None
+                            if isinstance(ep, str) and ep.strip():
+                                return ep
+                            return None
+                    return None
+
                 # process_result_json에 gateway 대신 확장된 nextActivities를 반영
                 process_result_json["nextActivities"] = []
                 next_activity_dicts = [
                     Activity(
                         nextActivityId=act.id,
-                        nextUserEmail=getattr(activity, "nextUserEmail", None),
+                        nextUserEmail=_resolve_email_from_role_bindings(act),
                         result="IN_PROGRESS",
                     ).model_dump()
                     for act in expanded

@@ -398,6 +398,154 @@ def test__annotate_list_elements_with_field_names_cycle_raises_recursion(wiproc)
         assert True
 
 
+def test_resolve_next_activity_payloads_exclusive_gateway_resolves_correct_role(wiproc):
+    """Task 4.1: ExclusiveGateway selects one branch; the selected activity
+    gets its own assignee resolved from role_bindings (not copied from gateway)."""
+    gw = _Gateway("G1", type="exclusiveGateway")
+    seqs = [
+        _Seq("s1", source="A1", target="G1"),
+        _Seq("s2", source="G1", target="B1"),
+        _Seq("s3", source="G1", target="B2"),
+    ]
+    acts = [
+        _Activity("A1", role="initiator"),
+        _Activity("B1", name="Manager Review", role="manager"),
+        _Activity("B2", name="Dev Task", role="developer"),
+    ]
+    proc_def = _ProcDef(activities=acts, gateways=[gw], sequences=seqs)
+
+    workitem = {
+        "assignees": [
+            {"name": "manager", "endpoint": "mgr@example.com"},
+            {"name": "developer", "endpoint": "dev@example.com"},
+        ]
+    }
+    # Only s2 is True → B1 (manager) is selected
+    sequence_condition_data = {"s2": {"conditionEval": True}, "s3": {"conditionEval": False}}
+
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="A1", workitem=workitem, sequence_condition_data=sequence_condition_data,
+    )
+
+    assert len(payloads) == 1
+    assert payloads[0]["nextActivityId"] == "B1"
+    assert payloads[0]["nextUserEmail"] == "mgr@example.com"
+
+
+def test_resolve_next_activity_payloads_parallel_gateway_resolves_per_activity_role(wiproc):
+    """Task 4.1: ParallelGateway expands to all branches; each activity
+    gets its own assignee resolved from role_bindings individually."""
+    gw = _Gateway("G1", type="parallelGateway")
+    seqs = [
+        _Seq("s1", source="A1", target="G1"),
+        _Seq("s2", source="G1", target="B1"),
+        _Seq("s3", source="G1", target="B2"),
+    ]
+    acts = [
+        _Activity("A1", role="initiator"),
+        _Activity("B1", name="Manager Review", role="manager"),
+        _Activity("B2", name="Dev Task", role="developer"),
+    ]
+    proc_def = _ProcDef(activities=acts, gateways=[gw], sequences=seqs)
+
+    workitem = {
+        "assignees": [
+            {"name": "manager", "endpoint": "mgr@example.com"},
+            {"name": "developer", "endpoint": "dev@example.com"},
+        ]
+    }
+    sequence_condition_data = {}
+
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="A1", workitem=workitem, sequence_condition_data=sequence_condition_data,
+    )
+
+    by_id = {p["nextActivityId"]: p for p in payloads}
+    assert "B1" in by_id
+    assert "B2" in by_id
+    assert by_id["B1"]["nextUserEmail"] == "mgr@example.com"
+    assert by_id["B2"]["nextUserEmail"] == "dev@example.com"
+
+
+def test_resolve_next_activity_payloads_missing_role_returns_none(wiproc):
+    """Task 4.2: When role is not in role_bindings, nextUserEmail should be None."""
+    gw = _Gateway("G1", type="exclusiveGateway")
+    seqs = [
+        _Seq("s1", source="A1", target="G1"),
+        _Seq("s2", source="G1", target="B1"),
+    ]
+    acts = [
+        _Activity("A1"),
+        _Activity("B1", name="Unknown Role Task", role="unknown_role"),
+    ]
+    proc_def = _ProcDef(activities=acts, gateways=[gw], sequences=seqs)
+
+    workitem = {"assignees": [{"name": "manager", "endpoint": "mgr@example.com"}]}
+    sequence_condition_data = {"s2": {"conditionEval": True}}
+
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="A1", workitem=workitem, sequence_condition_data=sequence_condition_data,
+    )
+
+    assert len(payloads) == 1
+    assert payloads[0]["nextActivityId"] == "B1"
+    assert payloads[0]["nextUserEmail"] is None
+
+
+def test_resolve_next_activity_payloads_single_path_no_gateway(wiproc):
+    """Task 4.4: Single path process (no gateway) should work as before."""
+    seqs = [_Seq("s1", source="A1", target="A2")]
+    acts = [
+        _Activity("A1", role="initiator"),
+        _Activity("A2", name="Next Step", role="reviewer"),
+    ]
+    proc_def = _ProcDef(activities=acts, sequences=seqs)
+
+    workitem = {"assignees": [{"name": "reviewer", "endpoint": "rev@example.com"}]}
+    sequence_condition_data = {}
+
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="A1", workitem=workitem, sequence_condition_data=sequence_condition_data,
+    )
+
+    assert len(payloads) == 1
+    assert payloads[0]["nextActivityId"] == "A2"
+    assert payloads[0]["nextUserEmail"] == "rev@example.com"
+
+
+def test_resolve_next_activity_payloads_role_bindings_fallback_from_proc_inst(wiproc):
+    """Task 4.1/4.4: When workitem.assignees is empty, falls back to process instance role_bindings."""
+    gw = _Gateway("G1", type="exclusiveGateway")
+    seqs = [
+        _Seq("s1", source="A1", target="G1"),
+        _Seq("s2", source="G1", target="B1"),
+    ]
+    acts = [
+        _Activity("A1"),
+        _Activity("B1", name="Review", role="reviewer"),
+    ]
+    proc_def = _ProcDef(activities=acts, gateways=[gw], sequences=seqs)
+
+    workitem = {
+        "assignees": [],
+        "proc_inst_id": "test-inst-1",
+        "tenant_id": "test-tenant",
+    }
+    sequence_condition_data = {"s2": {"conditionEval": True}}
+
+    from unittest.mock import patch, MagicMock
+    mock_inst = MagicMock()
+    mock_inst.role_bindings = [{"name": "reviewer", "endpoint": "reviewer@example.com"}]
+
+    with patch.object(wiproc, "fetch_process_instance", return_value=mock_inst):
+        payloads = wiproc.resolve_next_activity_payloads(
+            proc_def, activity_id="A1", workitem=workitem, sequence_condition_data=sequence_condition_data,
+        )
+
+    assert len(payloads) == 1
+    assert payloads[0]["nextUserEmail"] == "reviewer@example.com"
+
+
 def test_iter_reference_scalars_extractor_cycle_raises_recursion(wiproc):
     cyc = {}
     cyc["self"] = cyc  # pure cycle with no scalars to satisfy limit -> unbounded recursion
@@ -509,3 +657,109 @@ def test_apply_field_name_annotation_recursively_vip_newsletter_sample(wiproc):
     assert isinstance(sm_email, dict)
     assert sm_email["name"] == "담당 영업 이메일 주소"
     assert sm_email["value"] == "minsu.park@salescorp.kr"
+
+
+# ------------------------------------------------------------
+# Task 4.3: Instance status tests for multi-branch processes
+# These test the logic in database.upsert_process_instance
+# by mocking DB calls and verifying status determination.
+# ------------------------------------------------------------
+
+def _make_mock_process_instance(current_activity_ids, proc_def, role_bindings=None):
+    """Create a minimal mock ProcessInstance for status logic testing."""
+    from unittest.mock import MagicMock
+    inst = MagicMock()
+    inst.proc_inst_id = "test-inst-1"
+    inst.proc_inst_name = "Test Instance"
+    inst.current_activity_ids = current_activity_ids
+    inst.role_bindings = role_bindings or []
+    inst.variables_data = []
+    inst.participants = []
+    inst.process_definition = proc_def
+    inst.status = "RUNNING"
+    inst.get_def_id.return_value = "test-def-1"
+    inst.dict.return_value = {
+        "proc_inst_id": "test-inst-1",
+        "proc_inst_name": "Test Instance",
+        "current_activity_ids": current_activity_ids,
+        "role_bindings": role_bindings or [],
+        "variables_data": [],
+        "participants": [],
+        "status": "RUNNING",
+    }
+    return inst
+
+
+def test_instance_stays_running_when_active_activities_exist():
+    """Task 4.3: Instance should stay RUNNING when current_activity_ids is non-empty,
+    even if an end activity's workitem is DONE."""
+    from unittest.mock import patch, MagicMock
+
+    end_act = _Activity("EndAct", name="End Activity")
+    gw_end = _Gateway("EndEvent1", type="endEvent")
+    seqs = [_Seq("s1", source="EndAct", target="EndEvent1")]
+    acts = [end_act, _Activity("BranchB_Act", name="Branch B")]
+    proc_def = _ProcDef(activities=acts, gateways=[gw_end], sequences=seqs)
+    proc_def.find_end_activities = lambda: [end_act]
+
+    proc_instance = _make_mock_process_instance(
+        current_activity_ids=["BranchB_Act"],
+        proc_def=proc_def,
+    )
+
+    done_workitem = MagicMock()
+    done_workitem.status = "DONE"
+
+    import database as db_mod
+    with patch.object(db_mod, "fetch_workitem_by_proc_inst_and_activity", return_value=done_workitem), \
+         patch.object(db_mod, "set_participants_from_workitems", return_value=proc_instance), \
+         patch.object(db_mod, "fetch_process_definition_latest_version", return_value=None), \
+         patch.object(db_mod, "supabase_client_var") as mock_client_var, \
+         patch.object(db_mod, "subdomain_var") as mock_subdomain_var:
+
+        mock_supabase = MagicMock()
+        mock_supabase.table.return_value.upsert.return_value.execute.return_value.data = [{"proc_inst_id": "test-inst-1"}]
+        mock_client_var.get.return_value = mock_supabase
+        mock_subdomain_var.get.return_value = "test-tenant"
+
+        success, result_inst = db_mod.upsert_process_instance(proc_instance, tenant_id="test-tenant")
+
+    upsert_call_args = mock_supabase.table.return_value.upsert.call_args[0][0]
+    assert upsert_call_args["status"] == "RUNNING"
+
+
+def test_instance_completes_when_no_active_activities_and_end_done():
+    """Task 4.3: Instance should be COMPLETED when current_activity_ids is empty
+    and at least one end activity workitem is DONE."""
+    from unittest.mock import patch, MagicMock
+
+    end_act = _Activity("EndAct", name="End Activity")
+    gw_end = _Gateway("EndEvent1", type="endEvent")
+    seqs = [_Seq("s1", source="EndAct", target="EndEvent1")]
+    proc_def = _ProcDef(activities=[end_act], gateways=[gw_end], sequences=seqs)
+    proc_def.find_end_activities = lambda: [end_act]
+
+    proc_instance = _make_mock_process_instance(
+        current_activity_ids=[],
+        proc_def=proc_def,
+    )
+
+    done_workitem = MagicMock()
+    done_workitem.status = "DONE"
+
+    import database as db_mod
+    with patch.object(db_mod, "fetch_workitem_by_proc_inst_and_activity", return_value=done_workitem), \
+         patch.object(db_mod, "set_participants_from_workitems", return_value=proc_instance), \
+         patch.object(db_mod, "fetch_process_definition_latest_version", return_value=None), \
+         patch.object(db_mod, "supabase_client_var") as mock_client_var, \
+         patch.object(db_mod, "subdomain_var") as mock_subdomain_var:
+
+        mock_supabase = MagicMock()
+        mock_supabase.table.return_value.upsert.return_value.execute.return_value.data = [{"proc_inst_id": "test-inst-1"}]
+        mock_client_var.get.return_value = mock_supabase
+        mock_subdomain_var.get.return_value = "test-tenant"
+
+        success, result_inst = db_mod.upsert_process_instance(proc_instance, tenant_id="test-tenant")
+
+    upsert_call_args = mock_supabase.table.return_value.upsert.call_args[0][0]
+    assert upsert_call_args["status"] == "COMPLETED"

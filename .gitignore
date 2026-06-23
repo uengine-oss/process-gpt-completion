@@ -170,3 +170,10 @@ test.html
 .vscode/tasks.json
 
 uv.lock
+
+
+.claude/
+.codex/
+.agent/
+
+openspec/

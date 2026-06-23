@@ -599,22 +599,23 @@ def upsert_process_instance(process_instance: ProcessInstance, tenant_id: Option
     if definition is not None:
         process_definition = definition
 
-    # 종료 활동은 여러 개일 수 있다 — 분기마다 endEvent 로 직접 진입하면 각 분기의
-    # 마지막 활동이 모두 '종료 활동'이다. 진입 시퀀스의 개수/순서와 무관하게,
-    # 실제 실행된 분기의 종료 활동이 DONE 이면 인스턴스는 완료된 것으로 본다.
     end_activities = process_definition.find_end_activities()
 
     status = None
+    has_active_activities = bool(process_instance.current_activity_ids)
     if end_activities:
-        end_done = False
-        for _end_activity in end_activities:
-            end_workitem = fetch_workitem_by_proc_inst_and_activity(process_instance.proc_inst_id, safeget(_end_activity, 'id', ''), tenant_id)
-            if end_workitem and end_workitem.status == 'DONE':
-                end_done = True
-                break
-        status = 'COMPLETED' if end_done else 'RUNNING'
+        if has_active_activities:
+            status = 'RUNNING'
+        else:
+            end_done = False
+            for _end_activity in end_activities:
+                end_workitem = fetch_workitem_by_proc_inst_and_activity(process_instance.proc_inst_id, safeget(_end_activity, 'id', ''), tenant_id)
+                if end_workitem and end_workitem.status == 'DONE':
+                    end_done = True
+                    break
+            status = 'COMPLETED' if end_done else 'RUNNING'
     else:
-        if process_instance.current_activity_ids and len(process_instance.current_activity_ids) != 0:
+        if has_active_activities:
             status = 'RUNNING'
     
     # Set participants from workitems
@@ -1430,13 +1431,18 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                         user_id = next_user_email
 
                 
-                # assignees 초기화
+                # assignees 초기화 — process_result_data.roleBindings를 먼저 확인하고,
+                # 매칭이 없으면 process_instance_data.role_bindings를 fallback으로 사용
                 assignees = []
-                if process_result_data.get('roleBindings'):
-                    role_bindings = process_result_data['roleBindings']
-                    for role_binding in role_bindings:
-                        if role_binding['name'] == safeget(activity, 'role', ''):
+                role_name = safeget(activity, 'role', '')
+                for rb_source in [process_result_data.get('roleBindings'), process_instance_data.get('role_bindings')]:
+                    if not rb_source:
+                        continue
+                    for role_binding in rb_source:
+                        if isinstance(role_binding, dict) and role_binding.get('name') == role_name:
                             assignees.append(role_binding)
+                    if assignees:
+                        break
                 
                 # activity.agent가 있으면 user_id에 추가 (중복 체크, 우선순위 높음)
                 if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
