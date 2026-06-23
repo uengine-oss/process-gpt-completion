@@ -3390,26 +3390,31 @@ def resolve_next_activity_payloads(
 
     role_bindings_for_next = workitem.get("assignees", []) or []
 
-    # 현재 워크아이템의 assignees 정보가 없는 경우,
-    # bpm_proc_inst.role_bindings 컬럼 값을 폴백으로 사용
-    if not role_bindings_for_next:
-        try:
-            proc_inst_id = workitem.get("proc_inst_id")
-            tenant_id = workitem.get("tenant_id")
-            if proc_inst_id and tenant_id:
-                proc_inst = fetch_process_instance(proc_inst_id, tenant_id)
-                if proc_inst is not None:
-                    rb = getattr(proc_inst, "role_bindings", None)
-                    # role_bindings가 문자열로 저장되어 있을 가능성도 고려
-                    if isinstance(rb, str):
-                        try:
-                            rb = json.loads(rb)
-                        except Exception:
-                            rb = None
-                    if isinstance(rb, list):
-                        role_bindings_for_next = rb
-        except Exception as e:
-            print(f"[WARN] Failed to fallback role_bindings from process instance: {e}")
+    # 현재 워크아이템의 assignees에는 현재 활동의 role binding만 포함될 수 있다.
+    # 다음 활동의 role은 process_instance.role_bindings에 있으므로 항상 병합한다.
+    # (workitem assignees의 동일 role은 우선순위를 갖는다.)
+    try:
+        proc_inst_id = workitem.get("proc_inst_id")
+        tenant_id = workitem.get("tenant_id")
+        if proc_inst_id and tenant_id:
+            proc_inst = fetch_process_instance(proc_inst_id, tenant_id)
+            if proc_inst is not None:
+                rb = getattr(proc_inst, "role_bindings", None)
+                if isinstance(rb, str):
+                    try:
+                        rb = json.loads(rb)
+                    except Exception:
+                        rb = None
+                if isinstance(rb, list) and rb:
+                    existing_names = {
+                        b.get("name") for b in role_bindings_for_next
+                        if isinstance(b, dict) and b.get("name")
+                    }
+                    for binding in rb:
+                        if isinstance(binding, dict) and binding.get("name") not in existing_names:
+                            role_bindings_for_next.append(binding)
+    except Exception as e:
+        print(f"[WARN] Failed to merge role_bindings from process instance: {e}")
 
     def _extract_endpoint(binding: dict | None) -> str | None:
         if not isinstance(binding, dict):
