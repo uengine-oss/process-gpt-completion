@@ -859,6 +859,103 @@ def _process_next_activities(process_instance: ProcessInstance, process_result: 
         activity_obj = process_definition.find_activity_by_id(next_id)
         check_external_customer_and_send_email(activity_obj, process_instance, process_definition)
 
+
+def _append_input_data_to_query(query: str, input_data: dict) -> str:
+    try:
+        input_data_str = json.dumps(input_data, ensure_ascii=False)
+    except Exception:
+        input_data_str = str(input_data)
+    if query and '[InputData]' in query:
+        return query.split('[InputData]')[0] + f"[InputData]\n{input_data_str}"
+    return f"{query}[InputData]\n{input_data_str}"
+
+
+def _get_immediate_prev_activity_form_data(
+    process_definition,
+    process_instance: ProcessInstance,
+    sub_process_activity_id: str,
+    process_result: ProcessResult,
+    execution_scope=None,
+) -> Optional[Dict[str, Any]]:
+    """adHocSubProcess 직전에 완료된 액티비티 워크아이템의 폼 output 전체를 반환한다."""
+    prev_activities = process_definition.find_immediate_prev_activities(sub_process_activity_id)
+    if not prev_activities:
+        return None
+
+    completed_ids = set()
+    for ca in (process_result.completedActivities or []):
+        cid = getattr(ca, "completedActivityId", None)
+        cres = (getattr(ca, "result", None) or "").upper()
+        if cid and cres in ("DONE", "SUBMITTED", "COMPLETED"):
+            completed_ids.add(str(cid))
+
+    prev_ids = {str(a.id) for a in prev_activities}
+    target_ids = [aid for aid in completed_ids if aid in prev_ids]
+    if not target_ids:
+        target_ids = [str(a.id) for a in prev_activities]
+
+    def _norm_scope(v):
+        if v is None or v == "":
+            return None
+        try:
+            return int(str(v))
+        except Exception:
+            return str(v)
+
+    want_scope = _norm_scope(execution_scope) if execution_scope is not None else None
+    tenant_id = process_instance.tenant_id
+    proc_inst_id = process_instance.proc_inst_id
+    merged: Dict[str, Any] = {}
+
+    def _pick_workitem(act_id: str):
+        prev_workitem = fetch_workitem_by_proc_inst_and_activity(
+            proc_inst_id, act_id, tenant_id
+        )
+        if want_scope is None or prev_workitem is None:
+            return prev_workitem
+        wi_scope = _norm_scope(getattr(prev_workitem, "execution_scope", None))
+        if wi_scope is None or wi_scope == want_scope:
+            return prev_workitem
+        all_wi = fetch_todolist_by_proc_inst_id(proc_inst_id, tenant_id) or []
+        scoped = [
+            w for w in all_wi
+            if str(getattr(w, "activity_id", "") or "") == str(act_id)
+            and _norm_scope(getattr(w, "execution_scope", None)) == want_scope
+        ]
+        if not scoped:
+            return prev_workitem
+
+        def _recent_key(w):
+            updated_at = getattr(w, "updated_at", None) or getattr(w, "start_date", None)
+            rework_count = getattr(w, "rework_count", 0) or 0
+            if updated_at:
+                try:
+                    if isinstance(updated_at, str):
+                        updated_at = datetime.fromisoformat(updated_at.replace('Z', '+00:00')).replace(tzinfo=None)
+                    elif hasattr(updated_at, 'replace'):
+                        updated_at = updated_at.replace(tzinfo=None)
+                except (ValueError, TypeError, AttributeError):
+                    updated_at = None
+            return (updated_at or datetime.min, rework_count)
+
+        return max(scoped, key=_recent_key)
+
+    for act_id in target_ids:
+        prev_workitem = _pick_workitem(act_id)
+        if not prev_workitem or not prev_workitem.output:
+            continue
+        output = prev_workitem.output
+        if isinstance(output, str):
+            try:
+                output = json.loads(output)
+            except Exception:
+                continue
+        if isinstance(output, dict):
+            merged.update(output)
+
+    return merged if merged else None
+
+
 def _process_sub_processes(process_instance: ProcessInstance, process_result: ProcessResult, process_result_json: dict, process_definition):
     _SENTINEL = object()
 
@@ -976,6 +1073,8 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                 "tenant_id": process_instance.tenant_id,
                 "root_proc_inst_id": root_proc_inst_id,
                 "execution_scope": execution_scope,
+                "agent_mode": "COMPLETE",
+                "agent_orch": "deepagents"
             }
             upsert_workitem(workitem_data, process_instance.tenant_id)
             print(f"[INFO] Created adhoc activity workitem for child: {child_proc_inst_id} -> {act.id}")
@@ -1081,7 +1180,17 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                         adhoc_query = f"[Description]\n{next_sub_process.description}\n\n"
                     if next_sub_process.instruction:
                         adhoc_query += f"[Instruction]\n{next_sub_process.instruction}\n\n"
-                    
+
+                    prev_form_data = _get_immediate_prev_activity_form_data(
+                        process_definition,
+                        process_instance,
+                        activity.nextActivityId,
+                        process_result,
+                        execution_scope=execution_scope,
+                    )
+                    if prev_form_data:
+                        adhoc_query = _append_input_data_to_query(adhoc_query, prev_form_data)
+
                     parent_workitem_data = {
                         "id": str(uuid.uuid4()),
                         "user_id": endpoint,
