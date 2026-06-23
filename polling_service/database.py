@@ -2446,6 +2446,8 @@ def group_fields_by_form(field_values: dict) -> dict:
 def get_input_data(workitem: dict, process_definition: Any):
     """
     워크아이템 실행에 필요한 입력 데이터 추출
+    - 활동에 설정된 inputData가 있으면 해당 필드값을 사용
+    - inputData가 없고 첫 번째 활동이 아니면, 이전 활동의 폼 출력 데이터를 fallback으로 사용
     """
     try:
         activity_id = workitem.get('activity_id')
@@ -2454,7 +2456,7 @@ def get_input_data(workitem: dict, process_definition: Any):
         if not activity:
             print(f"[WARNING][get_input_data] activity not found for activity_id={activity_id}")
             return None
-        
+
         input_data = {}
         input_fields = activity.inputData
         if len(input_fields) != 0:
@@ -2467,11 +2469,49 @@ def get_input_data(workitem: dict, process_definition: Any):
             grouped_data = group_fields_by_form(field_values)
             input_data.update(grouped_data)
 
+        if not input_data and not process_definition.is_starting_activity(activity_id):
+            input_data = _get_prev_activity_form_data(workitem, process_definition)
+
         return input_data
 
     except Exception as e:
         print(f"[ERROR] Failed to get selected info for {workitem.get('id')}: {str(e)}")
         return None
+
+
+def _get_prev_activity_form_data(workitem: dict, process_definition: Any) -> dict:
+    """
+    이전 활동의 워크아이템 output에서 폼 데이터를 수집하여 반환한다.
+    첫 번째 활동이 아닌데 inputData 설정이 없는 경우의 fallback으로 사용.
+    """
+    activity_id = workitem.get('activity_id')
+    proc_inst_id = workitem.get('proc_inst_id')
+    tenant_id = workitem.get('tenant_id')
+
+    if not proc_inst_id or not activity_id:
+        return {}
+
+    prev_activities = process_definition.find_immediate_prev_activities(activity_id)
+    if not prev_activities:
+        return {}
+
+    merged: dict = {}
+    for prev_act in prev_activities:
+        prev_workitem = fetch_workitem_by_proc_inst_and_activity(
+            proc_inst_id, prev_act.id, tenant_id
+        )
+        if not prev_workitem or not prev_workitem.output:
+            continue
+        output = prev_workitem.output
+        if isinstance(output, str):
+            try:
+                output = json.loads(output)
+            except Exception:
+                continue
+        if isinstance(output, dict):
+            merged.update(output)
+
+    return merged
 
 
 async def get_input_data_with_file_parsing(workitem: dict, process_definition: Any):
