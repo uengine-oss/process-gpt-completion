@@ -599,22 +599,23 @@ def upsert_process_instance(process_instance: ProcessInstance, tenant_id: Option
     if definition is not None:
         process_definition = definition
 
-    # 종료 활동은 여러 개일 수 있다 — 분기마다 endEvent 로 직접 진입하면 각 분기의
-    # 마지막 활동이 모두 '종료 활동'이다. 진입 시퀀스의 개수/순서와 무관하게,
-    # 실제 실행된 분기의 종료 활동이 DONE 이면 인스턴스는 완료된 것으로 본다.
     end_activities = process_definition.find_end_activities()
 
     status = None
+    has_active_activities = bool(process_instance.current_activity_ids)
     if end_activities:
-        end_done = False
-        for _end_activity in end_activities:
-            end_workitem = fetch_workitem_by_proc_inst_and_activity(process_instance.proc_inst_id, safeget(_end_activity, 'id', ''), tenant_id)
-            if end_workitem and end_workitem.status == 'DONE':
-                end_done = True
-                break
-        status = 'COMPLETED' if end_done else 'RUNNING'
+        if has_active_activities:
+            status = 'RUNNING'
+        else:
+            end_done = False
+            for _end_activity in end_activities:
+                end_workitem = fetch_workitem_by_proc_inst_and_activity(process_instance.proc_inst_id, safeget(_end_activity, 'id', ''), tenant_id)
+                if end_workitem and end_workitem.status == 'DONE':
+                    end_done = True
+                    break
+            status = 'COMPLETED' if end_done else 'RUNNING'
     else:
-        if process_instance.current_activity_ids and len(process_instance.current_activity_ids) != 0:
+        if has_active_activities:
             status = 'RUNNING'
     
     # Set participants from workitems
@@ -1430,13 +1431,18 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                         user_id = next_user_email
 
                 
-                # assignees 초기화
+                # assignees 초기화 — process_result_data.roleBindings를 먼저 확인하고,
+                # 매칭이 없으면 process_instance_data.role_bindings를 fallback으로 사용
                 assignees = []
-                if process_result_data.get('roleBindings'):
-                    role_bindings = process_result_data['roleBindings']
-                    for role_binding in role_bindings:
-                        if role_binding['name'] == safeget(activity, 'role', ''):
+                role_name = safeget(activity, 'role', '')
+                for rb_source in [process_result_data.get('roleBindings'), process_instance_data.get('role_bindings')]:
+                    if not rb_source:
+                        continue
+                    for role_binding in rb_source:
+                        if isinstance(role_binding, dict) and role_binding.get('name') == role_name:
                             assignees.append(role_binding)
+                    if assignees:
+                        break
                 
                 # activity.agent가 있으면 user_id에 추가 (중복 체크, 우선순위 높음)
                 if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
@@ -2447,6 +2453,8 @@ def group_fields_by_form(field_values: dict) -> dict:
 def get_input_data(workitem: dict, process_definition: Any):
     """
     워크아이템 실행에 필요한 입력 데이터 추출
+    - 활동에 설정된 inputData가 있으면 해당 필드값을 사용
+    - inputData가 없고 첫 번째 활동이 아니면, 이전 활동의 폼 출력 데이터를 fallback으로 사용
     """
     try:
         activity_id = workitem.get('activity_id')
@@ -2455,7 +2463,7 @@ def get_input_data(workitem: dict, process_definition: Any):
         if not activity:
             print(f"[WARNING][get_input_data] activity not found for activity_id={activity_id}")
             return None
-        
+
         input_data = {}
         input_fields = activity.inputData
         if len(input_fields) != 0:
@@ -2468,11 +2476,49 @@ def get_input_data(workitem: dict, process_definition: Any):
             grouped_data = group_fields_by_form(field_values)
             input_data.update(grouped_data)
 
+        if not input_data and not process_definition.is_starting_activity(activity_id):
+            input_data = _get_prev_activity_form_data(workitem, process_definition)
+
         return input_data
 
     except Exception as e:
         print(f"[ERROR] Failed to get selected info for {workitem.get('id')}: {str(e)}")
         return None
+
+
+def _get_prev_activity_form_data(workitem: dict, process_definition: Any) -> dict:
+    """
+    이전 활동의 워크아이템 output에서 폼 데이터를 수집하여 반환한다.
+    첫 번째 활동이 아닌데 inputData 설정이 없는 경우의 fallback으로 사용.
+    """
+    activity_id = workitem.get('activity_id')
+    proc_inst_id = workitem.get('proc_inst_id')
+    tenant_id = workitem.get('tenant_id')
+
+    if not proc_inst_id or not activity_id:
+        return {}
+
+    prev_activities = process_definition.find_immediate_prev_activities(activity_id)
+    if not prev_activities:
+        return {}
+
+    merged: dict = {}
+    for prev_act in prev_activities:
+        prev_workitem = fetch_workitem_by_proc_inst_and_activity(
+            proc_inst_id, prev_act.id, tenant_id
+        )
+        if not prev_workitem or not prev_workitem.output:
+            continue
+        output = prev_workitem.output
+        if isinstance(output, str):
+            try:
+                output = json.loads(output)
+            except Exception:
+                continue
+        if isinstance(output, dict):
+            merged.update(output)
+
+    return merged
 
 
 async def get_input_data_with_file_parsing(workitem: dict, process_definition: Any):
