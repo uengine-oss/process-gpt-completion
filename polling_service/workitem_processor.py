@@ -2852,6 +2852,21 @@ async def check_task_status(next_activity_payloads: list[dict], chain_input_next
                     return False
             return True
 
+        def _incoming_split_type(node_id: str) -> str | None:
+            for s in seqs_by_target.get(node_id, []) or []:
+                src = _norm_id(_get(s, "source") or _get(s, "sourceRef"))
+                if src and _is_gateway(src) and len(seqs_by_source.get(src, []) or []) >= 2:
+                    return _gw_type(src)
+            return None
+
+        def _implicit_join_type(current_id: str, target_id: str) -> str | None:
+            if len(seqs_by_target.get(target_id, []) or []) < 2:
+                return None
+            split_type = _incoming_split_type(current_id)
+            if split_type in ("exclusive", "inclusive", "parallel"):
+                return split_type
+            return None
+
         filtered: list[dict] = []
         cur_id = _norm_id(activity_id)
 
@@ -2864,7 +2879,15 @@ async def check_task_status(next_activity_payloads: list[dict], chain_input_next
             path_type, gw_id, join_or_split = _classify_path(cur_id, nid)
 
             keep = True
-            if path_type in ("direct", "unknown"):
+            if path_type == "direct":
+                implicit_join_type = _implicit_join_type(cur_id, nid)
+                if implicit_join_type == "parallel":
+                    keep = _all_parallel_done()
+                elif implicit_join_type in ("exclusive", "inclusive"):
+                    keep = _no_in_progress_in_parallel()
+                else:
+                    keep = _all_parallel_done()
+            elif path_type == "unknown":
                 keep = _all_parallel_done()
             elif path_type == "via_gateway":
                 gtype = _gw_type(gw_id)
