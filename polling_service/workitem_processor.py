@@ -2853,10 +2853,28 @@ async def check_task_status(next_activity_payloads: list[dict], chain_input_next
             return True
 
         def _incoming_split_type(node_id: str) -> str | None:
-            for s in seqs_by_target.get(node_id, []) or []:
-                src = _norm_id(_get(s, "source") or _get(s, "sourceRef"))
-                if src and _is_gateway(src) and len(seqs_by_source.get(src, []) or []) >= 2:
-                    return _gw_type(src)
+            seen: set[str] = set()
+            cur = node_id
+
+            while cur and cur not in seen:
+                seen.add(cur)
+                incoming = seqs_by_target.get(cur, []) or []
+                if len(incoming) != 1:
+                    return None
+
+                src = _norm_id(_get(incoming[0], "source") or _get(incoming[0], "sourceRef"))
+                if not src:
+                    return None
+
+                if _is_gateway(src):
+                    if len(seqs_by_source.get(src, []) or []) >= 2:
+                        return _gw_type(src)
+                    return None
+
+                if len(seqs_by_target.get(src, []) or []) >= 2:
+                    return None
+
+                cur = src
             return None
 
         def _implicit_join_type(current_id: str, target_id: str) -> str | None:
