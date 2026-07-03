@@ -1703,9 +1703,10 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 reference_ids = fetch_prev_task_ids(process_definition, safeget(activity, 'id', ''), process_instance_data['proc_inst_id'])
                 
                 for prev_activity in filtered_activities:
-                    start_date = start_date + timedelta(days=safeget(prev_activity, 'duration', 0))
-            
-            due_date = start_date + timedelta(days=safeget(activity, 'duration', 0)) if safeget(activity, 'duration', 0) else None
+                    # duration 키가 있어도 값이 None 일 수 있어(생성된 정의는 duration 미지정) timedelta(days=None) 크래시 방지.
+                    start_date = start_date + timedelta(days=(safeget(prev_activity, 'duration', 0) or 0))
+
+            due_date = start_date + timedelta(days=(safeget(activity, 'duration', 0) or 0)) if safeget(activity, 'duration', 0) else None
             workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_data['proc_inst_id'], safeget(activity, 'id', ''), tenant_id)
             if not workitem:
                 user_id = ""

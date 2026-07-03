@@ -246,8 +246,11 @@ async def submit_workitem(input: dict):
         workitem_data['output'] = output
         workitem_data['user_id'] = user_info.get('id')
         workitem_data['username'] = user_info.get('name')
-        workitem_data['start_date'] = workitem_data['start_date'].isoformat()
-        workitem_data['due_date'] = workitem_data['due_date'].isoformat()
+        # duration 없는 activity 는 due_date 가 None 일 수 있다(initiate 에서 None 허용) → None.isoformat() 크래시 방지.
+        _sd = workitem_data.get('start_date')
+        _dd = workitem_data.get('due_date')
+        workitem_data['start_date'] = _sd.isoformat() if hasattr(_sd, 'isoformat') else _sd
+        workitem_data['due_date'] = _dd.isoformat() if hasattr(_dd, 'isoformat') else _dd
         workitem_data['retry'] = 0
         workitem_data['consumer'] = None
         workitem_data['version_tag'] = version_tag
@@ -481,7 +484,9 @@ async def initiate_workitem(input: dict):
         "due_date": due_date,
         "status": 'TODO',
         "assignees": None,
-        "reference_ids": prev_activities,
+        # prev_activities 가 ProcessActivity 객체 리스트일 수 있어 그대로 두면 JSON 직렬화 실패
+        # ("Object of type ProcessActivity is not JSON serializable") → id 문자열로 정규화.
+        "reference_ids": [getattr(a, 'id', a) for a in (prev_activities or [])],
         "duration": activity.duration,
         "tool": activity.tool,
         "output": None,
