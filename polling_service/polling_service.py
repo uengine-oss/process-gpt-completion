@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import signal
 from typing import Set
 import os
@@ -12,15 +12,15 @@ from database import (
 )
 from workitem_processor import handle_workitem, handle_service_workitem, handle_pending_workitem
 from file_cleanup_service import file_cleanup_polling_task
-CONSUMER_FILTER = os.getenv("WORKITEM_CONSUMER")  # 예: "worker-a"
+CONSUMER_FILTER = os.getenv("WORKITEM_CONSUMER")  # ?? "worker-a"
 
-# 전역 변수로 현재 실행 중인 태스크들을 추적
+# ?꾩뿭 蹂?섎줈 ?꾩옱 ?ㅽ뻾 以묒씤 ?쒖뒪?щ뱾??異붿쟻
 running_tasks: Set[asyncio.Task] = set()
 shutdown_event = asyncio.Event()
 
 async def safe_handle_workitem(workitem):
     try:
-        # consumer 제외 규칙: consumer가 "CONSUMER_FILTER와 pod_id를 모두 포함"하면 스킵
+        # consumer ?쒖쇅 洹쒖튃: consumer媛 "CONSUMER_FILTER? pod_id瑜?紐⑤몢 ?ы븿"?섎㈃ ?ㅽ궢
         if CONSUMER_FILTER:
             current_consumer = str(workitem.get('consumer') or '')
             pod_id = socket.gethostname()
@@ -28,11 +28,11 @@ async def safe_handle_workitem(workitem):
                 print(f"[INFO] Skipping reserved workitem {workitem.get('id')} (consumer={current_consumer})")
                 return
 
-        # 워크아이템 처리 시작 로그
+        # ?뚰겕?꾩씠??泥섎━ ?쒖옉 濡쒓렇
         try:
             upsert_workitem({
                 "id": workitem['id'],
-                "log": f"'{workitem['activity_name']}' 업무를 실행합니다."
+                "log": f"'{workitem['activity_name']}' ?낅Т瑜??ㅽ뻾?⑸땲??"
             }, workitem['tenant_id'])
         except Exception as log_error:
             print(f"[WARNING] Failed to update workitem log: {log_error}")
@@ -65,10 +65,10 @@ async def safe_handle_workitem(workitem):
                     task_type = activity.get('type')
                     break
             
-            # if task_type == 'userTask' or task_type == 'scriptTask':
-            if task_type in ('userTask', 'scriptTask', 'manualTask'):
+            normalized_task_type = str(task_type or '').lower()
+            if normalized_task_type in ('usertask', 'scripttask', 'manualtask', 'callactivity'):
                 await handle_workitem(workitem)
-            elif task_type == 'serviceTask':
+            elif normalized_task_type == 'servicetask':
                 await handle_service_workitem(workitem)
         elif workitem['status'] == "PENDING":
             print(f"[DEBUG] Starting safe_handle_workitem for pending workitem: {workitem['id']}")
@@ -90,12 +90,12 @@ async def safe_handle_workitem(workitem):
                     upsert_process_instance(process_instance, workitem['tenant_id'])
                     print(f"[INFO] Updated instance {workitem['proc_inst_id']} status to RUNNING due to workitem failure")
             else:
-                workitem['log'] = f"실행하는 중 오류가 발생했습니다. 다시 시도하겠습니다. (시도 {workitem['retry']}/3)"
+                workitem['log'] = f"?ㅽ뻾?섎뒗 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎. ?ㅼ떆 ?쒕룄?섍쿋?듬땲?? (?쒕룄 {workitem['retry']}/3)"
             upsert_workitem(workitem, workitem['tenant_id'])
         except Exception as update_error:
             print(f"[ERROR] Failed to update workitem error status: {update_error}")
     finally:
-        # 워크아이템 처리 완료 시 consumer 해제
+        # ?뚰겕?꾩씠??泥섎━ ?꾨즺 ??consumer ?댁젣
         try:
             upsert_workitem({
                 "id": workitem['id'],
@@ -105,7 +105,7 @@ async def safe_handle_workitem(workitem):
         except Exception as e:
             print(f"[ERROR] Failed to release consumer lock for workitem {workitem['id']}: {str(e)}")
         
-        # 태스크 완료 시 추적 목록에서 제거
+        # ?쒖뒪???꾨즺 ??異붿쟻 紐⑸줉?먯꽌 ?쒓굅
         if asyncio.current_task() in running_tasks:
             running_tasks.remove(asyncio.current_task())
 
@@ -113,7 +113,7 @@ async def polling_workitem():
     try:
         all_workitems = []
         
-        # SUBMITTED 상태 워크아이템 조회
+        # SUBMITTED ?곹깭 ?뚰겕?꾩씠??議고쉶
         try:
             submitted_workitems = fetch_workitem_with_submitted_status()
             if submitted_workitems:
@@ -121,7 +121,7 @@ async def polling_workitem():
                 print(f"[DEBUG] Found {len(submitted_workitems)} submitted workitems")
         except Exception as e:
             print(f"[ERROR] Failed to fetch submitted workitems: {str(e)}")
-        # PENDING 상태 워크아이템 조회
+        # PENDING ?곹깭 ?뚰겕?꾩씠??議고쉶
         try:
             pending_workitems = fetch_workitem_with_pending_status()
             if pending_workitems:
@@ -136,7 +136,7 @@ async def polling_workitem():
         print(f"[INFO] Processing {len(all_workitems)} workitems")
         tasks = []
         for workitem in all_workitems:
-            # consumer 제외 규칙: consumer가 "CONSUMER_FILTER와 pod_id를 모두 포함"하면 스킵
+            # consumer ?쒖쇅 洹쒖튃: consumer媛 "CONSUMER_FILTER? pod_id瑜?紐⑤몢 ?ы븿"?섎㈃ ?ㅽ궢
             if CONSUMER_FILTER:
                 wi_consumer = str(workitem.get('consumer') or '')
                 pod_id = socket.gethostname()
@@ -144,7 +144,7 @@ async def polling_workitem():
                     print(f"[DEBUG] Skip reserved workitem {workitem.get('id')} (consumer={wi_consumer})")
                     continue
 
-            # shutdown 이벤트가 설정되었으면 새 태스크를 시작하지 않음
+            # shutdown ?대깽?멸? ?ㅼ젙?섏뿀?쇰㈃ ???쒖뒪?щ? ?쒖옉?섏? ?딆쓬
             if shutdown_event.is_set():
                 print("[INFO] Shutdown in progress, skipping new workitems")
                 break
@@ -155,7 +155,7 @@ async def polling_workitem():
         
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            # 결과 확인 및 로깅
+            # 寃곌낵 ?뺤씤 諛?濡쒓퉭
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     print(f"[ERROR] Task {i} failed: {result}")
@@ -165,28 +165,28 @@ async def polling_workitem():
             
     except Exception as e:
         print(f"[ERROR] Polling workitem failed: {str(e)}")
-        # Supabase 연결 오류인 경우 잠시 대기
+        # Supabase ?곌껐 ?ㅻ쪟??寃쎌슦 ?좎떆 ?湲?
         if "Supabase client is not configured" in str(e) or "DB fetch failed" in str(e) or "network" in str(e).lower():
             print("[INFO] Database connection error, waiting before retry...")
             await asyncio.sleep(10)
         else:
-            # 다른 오류의 경우 짧은 대기 후 재시도
+            # ?ㅻⅨ ?ㅻ쪟??寃쎌슦 吏㏃? ?湲????ъ떆??
             print("[INFO] Other error occurred, waiting before retry...")
             await asyncio.sleep(5)
 
 async def cleanup_task():
-    """주기적으로 오래된 consumer를 정리하는 태스크"""
+    # Periodically clear stale consumers.
     while not shutdown_event.is_set():
         try:
             cleanup_stale_consumers()
             print("[DEBUG] Cleanup task completed successfully")
         except Exception as e:
             print(f"[ERROR] Cleanup task error: {e}")
-            # 오류 발생 시 짧은 대기 후 재시도
+            # ?ㅻ쪟 諛쒖깮 ??吏㏃? ?湲????ъ떆??
             await asyncio.sleep(60)
             continue
         
-        # 정상적인 경우 5분 대기
+        # ?뺤긽?곸씤 寃쎌슦 5遺??湲?
         await asyncio.sleep(300)
 
 async def start_polling():
@@ -197,11 +197,11 @@ async def start_polling():
         print(f"[ERROR] Failed to configure database: {e}")
         return
 
-    # cleanup 태스크 시작
+    # cleanup ?쒖뒪???쒖옉
     cleanup_task_obj = asyncio.create_task(cleanup_task())
     print("[INFO] Cleanup task started")
     
-    # 파일 정리 폴링 태스크 시작
+    # ?뚯씪 ?뺣━ ?대쭅 ?쒖뒪???쒖옉
     file_cleanup_task_obj = asyncio.create_task(file_cleanup_polling_task(shutdown_event, polling_interval=300))
     print("[INFO] File cleanup polling task started")
 
@@ -210,7 +210,7 @@ async def start_polling():
             await polling_workitem()
         except Exception as e:
             print(f"[Polling Loop Error] {e}")
-            # 오류 발생 시 짧은 대기
+            # ?ㅻ쪟 諛쒖깮 ??吏㏃? ?湲?
             await asyncio.sleep(5)
             continue
         
@@ -219,7 +219,7 @@ async def start_polling():
             
         await asyncio.sleep(5)
     
-    # cleanup 태스크 취소
+    # cleanup ?쒖뒪??痍⑥냼
     print("[INFO] Cancelling cleanup task...")
     cleanup_task_obj.cancel()
     try:
@@ -229,7 +229,7 @@ async def start_polling():
     except Exception as e:
         print(f"[ERROR] Error cancelling cleanup task: {e}")
     
-    # 파일 정리 태스크 취소
+    # ?뚯씪 ?뺣━ ?쒖뒪??痍⑥냼
     print("[INFO] Cancelling file cleanup task...")
     file_cleanup_task_obj.cancel()
     try:
@@ -240,11 +240,11 @@ async def start_polling():
         print(f"[ERROR] Error cancelling file cleanup task: {e}")
 
 async def graceful_shutdown():
-    """Graceful shutdown을 위한 함수"""
+    # Graceful shutdown handler.
     print("[INFO] Starting graceful shutdown...")
     shutdown_event.set()
     
-    # 진행 중인 모든 태스크가 완료될 때까지 대기
+    # 吏꾪뻾 以묒씤 紐⑤뱺 ?쒖뒪?ш? ?꾨즺???뚭퉴吏 ?湲?
     if running_tasks:
         print(f"[INFO] Waiting for {len(running_tasks)} running tasks to complete...")
         await asyncio.gather(*running_tasks, return_exceptions=True)
@@ -253,13 +253,13 @@ async def graceful_shutdown():
     print("[INFO] Graceful shutdown completed")
 
 def signal_handler(signum, frame):
-    """시그널 핸들러"""
+    # Signal handler.
     print(f"[INFO] Received signal {signum}, initiating graceful shutdown...")
     asyncio.create_task(graceful_shutdown())
 
 def run_polling_service():
     try:
-        # 시그널 핸들러 등록
+        # ?쒓렇???몃뱾???깅줉
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
         

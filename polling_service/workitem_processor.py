@@ -973,6 +973,17 @@ def _get_immediate_prev_activity_form_data(
 def _process_sub_processes(process_instance: ProcessInstance, process_result: ProcessResult, process_result_json: dict, process_definition):
     _SENTINEL = object()
 
+    def parse_properties(raw_properties):
+        if isinstance(raw_properties, dict):
+            return raw_properties
+        if isinstance(raw_properties, str) and raw_properties.strip():
+            try:
+                parsed = json.loads(raw_properties)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
     def collect_participants(role_bindings):
         participants = []
         last = _SENTINEL
@@ -987,7 +998,27 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                 last = endpoint
         return participants, last
 
-    def create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope):
+    def map_role_bindings(parent_role_bindings, role_binding_specs):
+        mapped = []
+        for spec in role_binding_specs or []:
+            if not isinstance(spec, dict):
+                continue
+            source_role = spec.get("sourceRole") or spec.get("source") or spec.get("parentRole")
+            target_role = spec.get("targetRole") or spec.get("target") or spec.get("childRole")
+            if not source_role or not target_role:
+                continue
+
+            for role_binding in parent_role_bindings or []:
+                if not isinstance(role_binding, dict) or role_binding.get("name") != source_role:
+                    continue
+                cloned = dict(role_binding)
+                cloned["name"] = target_role
+                mapped.append(cloned)
+                break
+
+        return mapped
+
+    def create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope, parent_reference_info=None):
         start_event = next((gw for gw in (child_def.gateways or []) if getattr(gw, 'type', None) == 'startEvent'), None)
         
         root_proc_inst_id = process_instance.root_proc_inst_id
@@ -1015,6 +1046,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                 "retry": 0,
                 "consumer": None,
                 "description": start_event.description or '',
+                "query": _append_input_data_to_query("", parent_reference_info) if parent_reference_info else "",
                 "tenant_id": process_instance.tenant_id,
                 "root_proc_inst_id": root_proc_inst_id,
                 "execution_scope": execution_scope,
@@ -1053,6 +1085,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                 "retry": 0,
                 "consumer": None,
                 "description": initial_act.description,
+                "query": _append_input_data_to_query("", parent_reference_info) if parent_reference_info else "",
                 "tenant_id": process_instance.tenant_id,
                 "root_proc_inst_id": root_proc_inst_id,
             }
@@ -1122,8 +1155,13 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
         return raw
 
     for activity in process_result.nextActivities or []:
+        parent_activity = process_definition.find_activity_by_id(activity.nextActivityId)
+        is_call_activity = (
+            parent_activity is not None
+            and str(getattr(parent_activity, "type", "") or "").lower() == "callactivity"
+        )
         is_adhoc = (activity.type == "adHocSubProcess")
-        if activity.type != "subProcess" and not is_adhoc:
+        if activity.type != "subProcess" and not is_adhoc and not is_call_activity:
             continue
         
         if not is_adhoc:
@@ -1138,21 +1176,62 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                         completed_activity_json["result"] = "PENDING"
                         break
         
-        next_sub_process = process_definition.find_next_sub_process(activity.nextActivityId)
-        if not next_sub_process:
-            next_sub_process = process_definition.find_sub_process_by_id(activity.nextActivityId)
-        if not next_sub_process:
-            continue
+        if is_call_activity:
+            call_props = parse_properties(getattr(parent_activity, "properties", None))
+            definition_id = call_props.get("definitionId") or call_props.get("calledElement") or call_props.get("processId")
+            if not definition_id:
+                print(f"[ERROR] CallActivity '{activity.nextActivityId}' has no definitionId")
+                continue
+            definition_id = str(definition_id).replace(".bpmn", "")
 
-        try:
-            child_def = process_definition.build_subprocess_definition(next_sub_process.id)
-        except Exception as e:
-            print(f"[ERROR] Failed to build subprocess definition for '{next_sub_process.id}': {e}")
-            continue
+            try:
+                child_definition_json = fetch_process_definition_by_version(
+                    definition_id,
+                    call_props.get("version_tag") or call_props.get("versionTag"),
+                    call_props.get("version"),
+                    process_instance.tenant_id,
+                )
+                child_def = load_process_definition(child_definition_json)
+            except Exception as e:
+                print(f"[ERROR] Failed to load CallActivity definition '{definition_id}': {e}")
+                continue
 
-        child_proc_def_id = child_def.processDefinitionId or f"{process_instance.process_definition.processDefinitionId}.{next_sub_process.id}"
+            child_proc_def_id = child_def.processDefinitionId or definition_id
+            role_binding_specs = call_props.get("roleBindings") or []
+            inherit_parent_reference_info = call_props.get("inheritParentReferenceInfo") is not False
+            parent_reference_info = _get_immediate_prev_activity_form_data(
+                process_definition,
+                process_instance,
+                activity.nextActivityId,
+                process_result,
+                execution_scope=None,
+            ) if inherit_parent_reference_info else None
+            if role_binding_specs:
+                role_bindings = map_role_bindings(process_instance.role_bindings or [], role_binding_specs)
+            else:
+                role_bindings = process_instance.role_bindings or []
 
-        role_bindings = process_instance.role_bindings or []
+            for next_activity_json in process_result_json.get("nextActivities", []):
+                if next_activity_json.get("nextActivityId") == activity.nextActivityId:
+                    next_activity_json["result"] = "PENDING"
+                    break
+            activity.result = "PENDING"
+        else:
+            next_sub_process = process_definition.find_next_sub_process(activity.nextActivityId)
+            if not next_sub_process:
+                next_sub_process = process_definition.find_sub_process_by_id(activity.nextActivityId)
+            if not next_sub_process:
+                continue
+
+            try:
+                child_def = process_definition.build_subprocess_definition(next_sub_process.id)
+            except Exception as e:
+                print(f"[ERROR] Failed to build subprocess definition for '{next_sub_process.id}': {e}")
+                continue
+
+            child_proc_def_id = child_def.processDefinitionId or f"{process_instance.process_definition.processDefinitionId}.{next_sub_process.id}"
+            role_bindings = process_instance.role_bindings or []
+
         participants, last_endpoint = collect_participants(role_bindings)
         endpoint = last_endpoint if last_endpoint is not _SENTINEL else None
 
@@ -1163,6 +1242,38 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
         root_proc_inst_id = process_instance.root_proc_inst_id
         if root_proc_inst_id == None:
             root_proc_inst_id = process_instance.proc_inst_id
+
+        if is_call_activity:
+            try:
+                existing_parent_workitem = fetch_workitem_by_proc_inst_and_activity(
+                    process_instance.proc_inst_id,
+                    activity.nextActivityId,
+                    process_instance.tenant_id,
+                )
+                if not existing_parent_workitem:
+                    parent_wait_workitem_data = {
+                        "id": str(uuid.uuid4()),
+                        "user_id": endpoint,
+                        "username": None,
+                        "proc_inst_id": process_instance.proc_inst_id,
+                        "proc_def_id": process_instance.proc_def_id,
+                        "activity_id": activity.nextActivityId,
+                        "activity_name": getattr(parent_activity, "name", None) or activity.nextActivityName or activity.nextActivityId,
+                        "start_date": datetime.now().isoformat(),
+                        "status": "PENDING",
+                        "assignees": role_bindings,
+                        "tenant_id": process_instance.tenant_id,
+                        "root_proc_inst_id": root_proc_inst_id,
+                        "description": getattr(parent_activity, "description", None) or "",
+                        "reference_ids": [],
+                        "output": {},
+                    }
+                    upsert_workitem(parent_wait_workitem_data, process_instance.tenant_id)
+                    print(f"[INFO] Created parent waiting workitem for CallActivity: {activity.nextActivityId}")
+                elif str(getattr(existing_parent_workitem, "status", "") or "").upper() not in ("PENDING", "DONE", "COMPLETED"):
+                    upsert_workitem({"id": existing_parent_workitem.id, "status": "PENDING"}, process_instance.tenant_id)
+            except Exception as e:
+                print(f"[ERROR] Failed to create parent waiting workitem for CallActivity '{activity.nextActivityId}': {e}")
 
         for i in range(mi_count):
             mi_reason = mi_reasons[i] if mi_reasons else ""
@@ -1229,7 +1340,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                     
                     create_adhoc_workitems(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope)
                 else:
-                    create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope)
+                    create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope, parent_reference_info if is_call_activity else None)
                 execution_scope += 1
             except Exception as e:
                 print(f"[ERROR] Failed to create workitems for child '{child_proc_inst_id}': {e}")
@@ -1499,7 +1610,12 @@ def _progress_parent_if_all_children_completed(current_proc_inst_id: str, tenant
             return
 
         for act_id in (parent_inst.current_activity_ids or []):
-            if parent_def.find_sub_process_by_id(act_id):
+            activity = parent_def.find_activity_by_id(act_id)
+            is_call_activity = (
+                activity is not None
+                and str(getattr(activity, "type", "") or "").lower() == "callactivity"
+            )
+            if parent_def.find_sub_process_by_id(act_id) or is_call_activity:
                 workitem = fetch_workitem_by_proc_inst_and_activity(parent_id, act_id, tenant_id)
                 if workitem and getattr(workitem, "status", None) != "SUBMITTED":
                     upsert_workitem({"id": workitem.id, "status": "SUBMITTED"}, tenant_id)
@@ -4481,13 +4597,18 @@ async def handle_pending_workitem(workitem):
             print(f"[DEBUG] No child instances for parent {parent_proc_inst_id}")
             return
 
-        any_submitted_left = False
+        all_children_completed = True
         total_children = 0
         total_items_scanned = 0
         total_items_closed  = 0
 
         for child in child_instances:
             total_children += 1
+            child_status = child.get("status") if isinstance(child, dict) \
+                           else getattr(child, "status", None)
+            if str(child_status or "").upper() != "COMPLETED":
+                all_children_completed = False
+
             child_id = child.get("proc_inst_id") if isinstance(child, dict) \
                        else getattr(child, "proc_inst_id", None)
             if not child_id:
@@ -4496,14 +4617,8 @@ async def handle_pending_workitem(workitem):
             child_items = fetch_todolist_by_proc_inst_id(child_id) or []
             for ci in child_items:
                 total_items_scanned += 1
-                status = (ci.get("status") if isinstance(ci, dict) else getattr(ci, "status", None)) or ""
 
-                su = status.upper()
-                if su == "SUBMITTED":
-                    any_submitted_left = True
-                    continue
-
-        if not any_submitted_left:
+        if all_children_completed:
             try:
                 upsert_workitem({"id": wid, "status": "DONE"}, tenant_id)
                 print(f"[INFO] Parent pending workitem {wid} -> DONE "
@@ -4511,7 +4626,7 @@ async def handle_pending_workitem(workitem):
             except Exception as e:
                 print(f"[ERROR] Failed to mark parent workitem {wid} DONE: {e}")
         else:
-            print(f"[DEBUG] SUBMITTED remains in children; keep parent PENDING "
+            print(f"[DEBUG] Active children remain; keep parent PENDING "
                   f"(children={total_children}, scanned={total_items_scanned}, closed={total_items_closed})")
 
     except Exception as e:
