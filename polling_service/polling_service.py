@@ -32,7 +32,7 @@ async def safe_handle_workitem(workitem):
         try:
             upsert_workitem({
                 "id": workitem['id'],
-                "log": f"'{workitem['activity_name']}' ?낅Т瑜??ㅽ뻾?⑸땲??"
+                "log": f"'{workitem['activity_name']}' 업무를 실행합니다."
             }, workitem['tenant_id'])
         except Exception as log_error:
             print(f"[WARNING] Failed to update workitem log: {log_error}")
@@ -90,7 +90,7 @@ async def safe_handle_workitem(workitem):
                     upsert_process_instance(process_instance, workitem['tenant_id'])
                     print(f"[INFO] Updated instance {workitem['proc_inst_id']} status to RUNNING due to workitem failure")
             else:
-                workitem['log'] = f"?ㅽ뻾?섎뒗 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎. ?ㅼ떆 ?쒕룄?섍쿋?듬땲?? (?쒕룄 {workitem['retry']}/3)"
+                workitem['log'] = f"실행하는 중 오류가 발생했습니다. 다시 시도하겠습니다. (시도 {workitem['retry']}/3)"
             upsert_workitem(workitem, workitem['tenant_id'])
         except Exception as update_error:
             print(f"[ERROR] Failed to update workitem error status: {update_error}")

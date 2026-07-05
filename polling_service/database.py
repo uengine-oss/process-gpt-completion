@@ -1,4 +1,4 @@
-from supabase import create_client, Client
+﻿from supabase import create_client, Client
 from pydantic import BaseModel, validator
 from typing import Any, Dict, List, Optional, Set, Union
 from langchain_community.vectorstores import SupabaseVectorStore
@@ -106,7 +106,7 @@ def execute_sql(sql_query):
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
         
-        # Supabase Client API를 사용하여 SQL 실행
+        # Supabase Client API瑜??ъ슜?섏뿬 SQL ?ㅽ뻾
         response = supabase.rpc('exec_sql', {'query': sql_query}).execute()
         
         if response.data:
@@ -163,7 +163,7 @@ def fetch_process_definition(def_id, tenant_id: Optional[str] = None):
 
 def fetch_process_definition_version_by_arcv_id(def_id, arcv_id, tenant_id: Optional[str] = None):
     """
-    proc_def_arcv / proc_def_version 에 저장된 특정 arcv_id 버전의 프로세스 정의를 조회합니다.
+    proc_def_arcv / proc_def_version ????λ맂 ?뱀젙 arcv_id 踰꾩쟾???꾨줈?몄뒪 ?뺤쓽瑜?議고쉶?⑸땲??
     """
     try:
         supabase = supabase_client_var.get()
@@ -174,7 +174,7 @@ def fetch_process_definition_version_by_arcv_id(def_id, arcv_id, tenant_id: Opti
         if not tenant_id:
             tenant_id = subdomain
 
-        # 루트 모듈과 동일하게 proc_def_arcv 기준으로 조회
+        # 猷⑦듃 紐⑤뱢怨??숈씪?섍쾶 proc_def_arcv 湲곗??쇰줈 議고쉶
         response = (
             supabase.table("proc_def_arcv")
             .select("*")
@@ -200,21 +200,21 @@ def fetch_process_definition_by_version(
     arcv_id: Optional[str] = None,
 ):
     """
-    실행 정의(프로세스 definition)를 버전 규칙에 따라 조회합니다.
+    ?ㅽ뻾 ?뺤쓽(?꾨줈?몄뒪 definition)瑜?踰꾩쟾 洹쒖튃???곕씪 議고쉶?⑸땲??
 
-    호환/명시 우선순위:
-    - arcv_id 가 주어지면: 해당 proc_def_arcv 버전을 최우선으로 조회 (기존 동작 유지)
-    - version_tag + version 이 주어지면: proc_def_version에서 해당 tag/version을 우선 조회
+    ?명솚/紐낆떆 ?곗꽑?쒖쐞:
+    - arcv_id 媛 二쇱뼱吏硫? ?대떦 proc_def_arcv 踰꾩쟾??理쒖슦?좎쑝濡?議고쉶 (湲곗〈 ?숈옉 ?좎?)
+    - version_tag + version ??二쇱뼱吏硫? proc_def_version?먯꽌 ?대떦 tag/version???곗꽑 議고쉶
 
-    기본(명시 버전이 없을 때) 동작은 TS 방식으로 통일:
-    1) proc_def.prod_version 이 있으면 해당 버전을 우선 조회
-       - prod_version은 기존 운영상 arcv_id로 저장되는 경우가 있어 proc_def_arcv로 먼저 시도하고,
-         실패 시 proc_def_version.version 매칭도 시도
-    2) 최신 major(version_tag='major')
-    3) 최신 minor(version_tag='minor')
-    4) proc_def.definition (현재 정의)
+    湲곕낯(紐낆떆 踰꾩쟾???놁쓣 ?? ?숈옉? TS 諛⑹떇?쇰줈 ?듭씪:
+    1) proc_def.prod_version ???덉쑝硫??대떦 踰꾩쟾???곗꽑 議고쉶
+       - prod_version? 湲곗〈 ?댁쁺??arcv_id濡???λ릺??寃쎌슦媛 ?덉뼱 proc_def_arcv濡?癒쇱? ?쒕룄?섍퀬,
+         ?ㅽ뙣 ??proc_def_version.version 留ㅼ묶???쒕룄
+    2) 理쒖떊 major(version_tag='major')
+    3) 理쒖떊 minor(version_tag='minor')
+    4) proc_def.definition (?꾩옱 ?뺤쓽)
     """
-    # 공통 모듈로 로직을 위임하여 중복 제거
+    # 怨듯넻 紐⑤뱢濡?濡쒖쭅???꾩엫?섏뿬 以묐났 ?쒓굅
     from proc_def_versioning import fetch_process_definition_by_version_ts_style
 
     if not def_id:
@@ -266,16 +266,16 @@ def fetch_process_definition_latest_version(def_id, tenant_id: Optional[str] = N
 
 def update_proc_def_prod_version(def_id: str, prod_version: str, tenant_id: Optional[str] = None):
     """
-    proc_def 테이블의 prod_version 컬럼을 업데이트합니다.
-    배포 승인 시 해당 버전을 프로덕션 버전으로 설정합니다.
+    proc_def ?뚯씠釉붿쓽 prod_version 而щ읆???낅뜲?댄듃?⑸땲??
+    諛고룷 ?뱀씤 ???대떦 踰꾩쟾???꾨줈?뺤뀡 踰꾩쟾?쇰줈 ?ㅼ젙?⑸땲??
     
     Args:
-        def_id (str): 프로세스 정의 ID
-        prod_version (str): 프로덕션 버전으로 설정할 버전 (arcv_id)
-        tenant_id (Optional[str]): 테넌트 ID
+        def_id (str): ?꾨줈?몄뒪 ?뺤쓽 ID
+        prod_version (str): ?꾨줈?뺤뀡 踰꾩쟾?쇰줈 ?ㅼ젙??踰꾩쟾 (arcv_id)
+        tenant_id (Optional[str]): ?뚮꼳??ID
     
     Returns:
-        bool: 업데이트 성공 여부
+        bool: ?낅뜲?댄듃 ?깃났 ?щ?
     """
     try:
         supabase = supabase_client_var.get()
@@ -368,7 +368,7 @@ class ProcessInstance(BaseModel):
     role_bindings: Optional[List[Dict[str, Any]]] = []
     current_activity_ids: Optional[List[str]] = []
     participants: Optional[List[str]] = []
-    variables_data: Optional[List[Dict[str, Any]]] = []
+    variables_data: Optional[Any] = []
     process_definition: ProcessDefinition = None  # Add a reference to ProcessDefinition
     status: str = None
     tenant_id: str
@@ -385,8 +385,8 @@ class ProcessInstance(BaseModel):
         super().__init__(**data)
         def_id = self.get_def_id()
         tenant_id = self.tenant_id
-        # proc_def_version(arcv_id)가 있으면 해당 버전 정의를 우선 사용하되,
-        # 레거시 데이터(예: "xxx_2.0")처럼 arcv_id가 아닌 값이 들어올 수 있어 폴백을 둡니다.
+        # proc_def_version(arcv_id)媛 ?덉쑝硫??대떦 踰꾩쟾 ?뺤쓽瑜??곗꽑 ?ъ슜?섎릺,
+        # ?덇굅???곗씠???? "xxx_2.0")泥섎읆 arcv_id媛 ?꾨땶 媛믪씠 ?ㅼ뼱?????덉뼱 ?대갚???〓땲??
         definition_json = None
         if getattr(self, "proc_def_version", None):
             definition_json = fetch_process_definition_by_version(
@@ -417,8 +417,8 @@ class ProcessInstance(BaseModel):
 
 
     def get_def_id(self):
-        # inst_id 예시: "company_entrance.123e4567-e89b-12d3-a456-426614174000"
-        # 여기서 "company_entrance"가 프로세스 정의 ID입니다.
+        # inst_id ?덉떆: "company_entrance.123e4567-e89b-12d3-a456-426614174000"
+        # ?ш린??"company_entrance"媛 ?꾨줈?몄뒪 ?뺤쓽 ID?낅땲??
         return self.proc_inst_id.split(".")[0]
 
 
@@ -512,8 +512,8 @@ def fetch_process_instance(full_id: str, tenant_id: Optional[str] = None) -> Opt
     
 def fetch_child_instances_by_parent(parent_proc_inst_id: str, tenant_id: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
-    특정 부모(proc_inst_id)를 가진 모든 자식 인스턴스를 조회합니다.
-    경량 조회: proc_inst_id, status, current_activity_ids만 반환.
+    ?뱀젙 遺紐?proc_inst_id)瑜?媛吏?紐⑤뱺 ?먯떇 ?몄뒪?댁뒪瑜?議고쉶?⑸땲??
+    寃쎈웾 議고쉶: proc_inst_id, status, current_activity_ids留?諛섑솚.
     """
     try:
         supabase = supabase_client_var.get()
@@ -559,7 +559,7 @@ def insert_process_instance(process_instance_data: dict, tenant_id: Optional[str
 
 def set_participants_from_workitems(process_instance, tenant_id=None):
     """
-    proc_inst_id에 해당하는 todolist의 user_id들을 파싱하여 participants를 세팅
+    proc_inst_id???대떦?섎뒗 todolist??user_id?ㅼ쓣 ?뚯떛?섏뿬 participants瑜??명똿
     """
     workitems = fetch_todolist_by_proc_inst_id(process_instance.proc_inst_id, tenant_id)
     user_ids = []
@@ -738,7 +738,7 @@ def fetch_workitem_by_proc_inst_and_activity(
         
         if response.data:
             if len(response.data) > 1 and recent_only:
-                # updated_at이 가장 최근이거나, updated_at이 같으면 rework_count가 가장 큰 항목을 최근 워크아이템으로 간주
+                # updated_at??媛??理쒓렐?닿굅?? updated_at??媛숈쑝硫?rework_count媛 媛??????ぉ??理쒓렐 ?뚰겕?꾩씠?쒖쑝濡?媛꾩＜
                 def get_recent_key(item):
                     updated_at = item.get('updated_at')
                     rework_count = item.get('rework_count', 0)
@@ -833,9 +833,9 @@ def fetch_workitem_with_submitted_status(limit=10) -> Optional[List[dict]]:
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
         
-        # Supabase Client API를 사용하여 워크아이템 조회 및 업데이트
-        # 먼저 SUBMITTED 상태이고 consumer가 NULL인 워크아이템들을 조회
-        # 테넌트/환경별 분기 없이 전 테넌트 공통 조건으로 조회
+        # Supabase Client API瑜??ъ슜?섏뿬 ?뚰겕?꾩씠??議고쉶 諛??낅뜲?댄듃
+        # 癒쇱? SUBMITTED ?곹깭?닿퀬 consumer媛 NULL???뚰겕?꾩씠?쒕뱾??議고쉶
+        # ?뚮꼳???섍꼍蹂?遺꾧린 ?놁씠 ???뚮꼳??怨듯넻 議곌굔?쇰줈 議고쉶
         q = supabase.table('todolist').select('*').eq('status', 'SUBMITTED')
         if CONSUMER_FILTER:
             q = q.eq('consumer', CONSUMER_FILTER)
@@ -846,16 +846,16 @@ def fetch_workitem_with_submitted_status(limit=10) -> Optional[List[dict]]:
         if not response.data:
             return None
         
-        # 조회된 워크아이템들의 consumer를 현재 pod_id로 업데이트
-        # 동시성 제어를 위해 조건부 업데이트 사용
+        # 議고쉶???뚰겕?꾩씠?쒕뱾??consumer瑜??꾩옱 pod_id濡??낅뜲?댄듃
+        # ?숈떆???쒖뼱瑜??꾪빐 議곌굔遺 ?낅뜲?댄듃 ?ъ슜
         updated_workitems = []
         
-        # 배치 업데이트를 위한 워크아이템 ID 목록
+        # 諛곗튂 ?낅뜲?댄듃瑜??꾪븳 ?뚰겕?꾩씠??ID 紐⑸줉
         workitem_ids = [item['id'] for item in response.data]
         
         if workitem_ids:
             try:
-                # 배치 업데이트 시도
+                # 諛곗튂 ?낅뜲?댄듃 ?쒕룄
                 current_time = datetime.now().isoformat()
                 q_upd = supabase.table('todolist').update({
                     'consumer': pod_id,
@@ -876,7 +876,7 @@ def fetch_workitem_with_submitted_status(limit=10) -> Optional[List[dict]]:
             except Exception as batch_error:
                 print(f"[WARNING] Batch update failed, falling back to individual updates: {batch_error}")
                 
-                # 배치 업데이트가 실패하면 개별 업데이트로 폴백
+                # 諛곗튂 ?낅뜲?댄듃媛 ?ㅽ뙣?섎㈃ 媛쒕퀎 ?낅뜲?댄듃濡??대갚
                 for workitem in response.data:
                     try:
                         q_one = supabase.table('todolist').update({
@@ -913,8 +913,8 @@ def fetch_workitem_with_pending_status(limit=5) -> Optional[List[dict]]:
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
         
-        # PENDING 상태이고 consumer가 NULL인 워크아이템들을 조회
-        # 테넌트/환경별 분기 없이 전 테넌트 공통 조건으로 조회
+        # PENDING ?곹깭?닿퀬 consumer媛 NULL???뚰겕?꾩씠?쒕뱾??議고쉶
+        # ?뚮꼳???섍꼍蹂?遺꾧린 ?놁씠 ???뚮꼳??怨듯넻 議곌굔?쇰줈 議고쉶
         q = supabase.table('todolist').select('*').eq('status', 'PENDING')
         if CONSUMER_FILTER:
             q = q.eq('consumer', CONSUMER_FILTER)
@@ -935,22 +935,22 @@ def fetch_workitem_with_pending_status(limit=5) -> Optional[List[dict]]:
 
 def cleanup_stale_consumers():
     """
-    오래된 consumer를 정리하는 함수
-    30분 이상 업데이트되지 않은 SUBMITTED 상태의 워크아이템의 consumer를 해제
+    ?ㅻ옒??consumer瑜??뺣━?섎뒗 ?⑥닔
+    30遺??댁긽 ?낅뜲?댄듃?섏? ?딆? SUBMITTED ?곹깭???뚰겕?꾩씠?쒖쓽 consumer瑜??댁젣
     """
     try:
         supabase = supabase_client_var.get()
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
         
-        # 30분 전 시간 계산
+        # 30遺????쒓컙 怨꾩궛
         thirty_minutes_ago = (datetime.now() - timedelta(minutes=30)).isoformat()
         
-        # 오래된 consumer를 NULL로 업데이트
+        # ?ㅻ옒??consumer瑜?NULL濡??낅뜲?댄듃
         q = supabase.table('todolist').update({
             'consumer': None
         }).eq('status', 'SUBMITTED').not_.is_('consumer', 'null').lt('updated_at', thirty_minutes_ago)
-        # CONSUMER_FILTER는 NULL 취급 → 정리 대상에서 제외
+        # CONSUMER_FILTER??NULL 痍④툒 ???뺣━ ??곸뿉???쒖쇅
         if CONSUMER_FILTER:
             q = q.neq('consumer', CONSUMER_FILTER)
         response = q.execute()
@@ -1329,7 +1329,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
         if _is_end_event_node(activity_data['nextActivityId'], activity_data):
             continue
 
-        # nextUserEmail는 LLM/roleBindings에서 결정된 최종 담당자 식별자 (이메일 또는 id/UUID)
+        # nextUserEmail??LLM/roleBindings?먯꽌 寃곗젙??理쒖쥌 ?대떦???앸퀎??(?대찓???먮뒗 id/UUID)
         next_user_email = activity_data.get('nextUserEmail')
 
         workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_data['proc_inst_id'], activity_data['nextActivityId'], tenant_id)
@@ -1338,7 +1338,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
             workitem.status = activity_data['result']
             workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul')) if activity_data['result'] == 'DONE' else None
 
-            # 기존 workitem에 user_id가 비어 있고(nextUserEmail만 있는) 경우, 여기서 user_id/username을 보강
+            # 湲곗〈 workitem??user_id媛 鍮꾩뼱 ?덇퀬(nextUserEmail留??덈뒗) 寃쎌슦, ?ш린??user_id/username??蹂닿컯
             if (not getattr(workitem, 'user_id', None)) and next_user_email:
                 try:
                     user_info = fetch_assignee_info(next_user_email)
@@ -1348,7 +1348,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
 
                 workitem.user_id = new_user_id
 
-                # 최종 user_id 기준으로 username 재계산
+                # 理쒖쥌 user_id 湲곗??쇰줈 username ?ш퀎??
                 username = ''
                 if new_user_id:
                     if ',' in new_user_id:
@@ -1370,14 +1370,14 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 if workitem.agent_mode == 'COMPLETE' and (workitem.agent_orch == 'none' or workitem.agent_orch == None):
                     workitem.agent_orch = 'crewai-deep-research'
             
-            # 입력 데이터 추가 (파일 파싱 포함)
+            # ?낅젰 ?곗씠??異붽? (?뚯씪 ?뚯떛 ?ы븿)
             try:
-                # 이벤트 루프 상태와 무관하게 안전하게 비동기 함수 실행
+                # ?대깽??猷⑦봽 ?곹깭? 臾닿??섍쾶 ?덉쟾?섍쾶 鍮꾨룞湲??⑥닔 ?ㅽ뻾
                 input_data = run_async_in_sync_context(
                     get_input_data_with_file_parsing(workitem.model_dump(), process_definition)
                 )
             except Exception as e:
-                print(f"[WARNING] 파일 파싱 중 오류 발생, 기본 방식으로 전환: {str(e)}")
+                print(f"[WARNING] ?뚯씪 ?뚯떛 以??ㅻ쪟 諛쒖깮, 湲곕낯 諛⑹떇?쇰줈 ?꾪솚: {str(e)}")
                 input_data = get_input_data(workitem.model_dump(), process_definition)
             
             if input_data:
@@ -1404,7 +1404,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     prev_activities = process_definition.find_prev_activities(safeget(activity, 'id', ''), [])
                 start_date = datetime.now(pytz.timezone('Asia/Seoul'))
                 
-                # reference_ids 설정 (이전 액티비티 ID 목록)
+                # reference_ids ?ㅼ젙 (?댁쟾 ?≫떚鍮꾪떚 ID 紐⑸줉)
                 reference_ids = []
                 if prev_activities:
                     reference_ids = fetch_prev_task_ids(process_definition, safeget(activity, 'id', ''), process_instance_data['proc_inst_id'])
@@ -1423,16 +1423,16 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 if next_user_email:
                     try:
                         user_info = fetch_assignee_info(next_user_email)
-                        # fetch_assignee_info는 정상일 때 항상 id를 채우지만,
-                        # 어떤 경우에도 next_user_email 자체를 최종 폴백으로 사용
+                        # fetch_assignee_info???뺤긽??????긽 id瑜?梨꾩슦吏留?
+                        # ?대뼡 寃쎌슦?먮룄 next_user_email ?먯껜瑜?理쒖쥌 ?대갚?쇰줈 ?ъ슜
                         user_id = (user_info.get('id') if isinstance(user_info, dict) else None) or next_user_email
                     except Exception:
-                        # fetch_assignee_info 실패 시에도 next_user_email을 그대로 user_id로 사용
+                        # fetch_assignee_info ?ㅽ뙣 ?쒖뿉??next_user_email??洹몃?濡?user_id濡??ъ슜
                         user_id = next_user_email
 
                 
-                # assignees 초기화 — process_result_data.roleBindings를 먼저 확인하고,
-                # 매칭이 없으면 process_instance_data.role_bindings를 fallback으로 사용
+                # assignees 珥덇린????process_result_data.roleBindings瑜?癒쇱? ?뺤씤?섍퀬,
+                # 留ㅼ묶???놁쑝硫?process_instance_data.role_bindings瑜?fallback?쇰줈 ?ъ슜
                 assignees = []
                 role_name = safeget(activity, 'role', '')
                 for rb_source in [process_result_data.get('roleBindings'), process_instance_data.get('role_bindings')]:
@@ -1444,49 +1444,49 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     if assignees:
                         break
                 
-                # activity.agent가 있으면 user_id에 추가 (중복 체크, 우선순위 높음)
+                # activity.agent媛 ?덉쑝硫?user_id??異붽? (以묐났 泥댄겕, ?곗꽑?쒖쐞 ?믪쓬)
                 if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
                     agent_id = safeget(activity, 'agent', None)
                     
-                    # 기존 user_id와 조인 (중복 체크)
+                    # 湲곗〈 user_id? 議곗씤 (以묐났 泥댄겕)
                     if user_id:
                         user_ids = [uid.strip() for uid in user_id.split(',') if uid.strip()]
                         if agent_id not in user_ids:
-                            user_ids.insert(0, agent_id)  # activity.agent를 맨 앞에 추가 (우선순위)
+                            user_ids.insert(0, agent_id)  # activity.agent瑜?留??욎뿉 異붽? (?곗꽑?쒖쐞)
                         user_id = ','.join(user_ids)
                     else:
                         user_id = agent_id
                     
-                    # assignees에서 activity.role과 이름이 같은 role_binding의 endpoint를 확장
+                    # assignees?먯꽌 activity.role怨??대쫫??媛숈? role_binding??endpoint瑜??뺤옣
                     role_name = safeget(activity, 'role', '')
                     updated_role_binding = False
                     for assignee in assignees:
                         if assignee.get('name') != role_name:
                             continue
                         assignee_endpoint = assignee.get('endpoint')
-                        # endpoint가 리스트인 경우: agent_id가 없으면 append
+                        # endpoint媛 由ъ뒪?몄씤 寃쎌슦: agent_id媛 ?놁쑝硫?append
                         if isinstance(assignee_endpoint, list):
                             if agent_id not in assignee_endpoint:
                                 assignee_endpoint.append(agent_id)
                                 assignee['endpoint'] = assignee_endpoint
-                        # endpoint가 문자열/단일 값인 경우
+                        # endpoint媛 臾몄옄???⑥씪 媛믪씤 寃쎌슦
                         elif isinstance(assignee_endpoint, str) and assignee_endpoint.strip() != "":
                             if assignee_endpoint != agent_id:
                                 assignee['endpoint'] = [assignee_endpoint, agent_id]
-                        # endpoint가 없거나 빈 경우
+                        # endpoint媛 ?녾굅??鍮?寃쎌슦
                         else:
                             assignee['endpoint'] = agent_id
                         updated_role_binding = True
                         break
                     
-                    # 동일 role의 role_binding이 없으면 새로 하나 추가
+                    # ?숈씪 role??role_binding???놁쑝硫??덈줈 ?섎굹 異붽?
                     if not updated_role_binding:
                         assignees.append({
                             "name": role_name,
                             "endpoint": agent_id
                         })
                 
-                # 최종 user_id 기준으로 username 재계산
+                # 理쒖쥌 user_id 湲곗??쇰줈 username ?ш퀎??
                 username = ''
                 if user_id:
                     if ',' in user_id:
@@ -1543,14 +1543,14 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     version=getattr(process_definition, "version", None),
                 )
                 
-                # 새로 생성된 workitem에도 입력 데이터 추가 (파일 파싱 포함)
+                # ?덈줈 ?앹꽦??workitem?먮룄 ?낅젰 ?곗씠??異붽? (?뚯씪 ?뚯떛 ?ы븿)
                 try:
-                    # 이벤트 루프 상태와 무관하게 안전하게 비동기 함수 실행
+                    # ?대깽??猷⑦봽 ?곹깭? 臾닿??섍쾶 ?덉쟾?섍쾶 鍮꾨룞湲??⑥닔 ?ㅽ뻾
                     input_data = run_async_in_sync_context(
                         get_input_data_with_file_parsing(workitem.model_dump(), process_definition)
                     )
                 except Exception as e:
-                    print(f"[WARNING] 파일 파싱 중 오류 발생, 기본 방식으로 전환: {str(e)}")
+                    print(f"[WARNING] ?뚯씪 ?뚯떛 以??ㅻ쪟 諛쒖깮, 湲곕낯 諛⑹떇?쇰줈 ?꾪솚: {str(e)}")
                     input_data = get_input_data(workitem.model_dump(), process_definition)
                 
                 print(f"[DEBUG] input_data: {input_data}")
@@ -1567,7 +1567,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     else:
                         workitem.query = f"{workitem.query}\n[InputData]\n{input_data_str}"
                     
-                    print(f"[INFO] 새 workitem에 입력 데이터 추가 완료 (파일 파싱 포함): {workitem.id}")
+                    print(f"[INFO] ??workitem???낅젰 ?곗씠??異붽? ?꾨즺 (?뚯씪 ?뚯떛 ?ы븿): {workitem.id}")
         
         try:
             if workitem:
@@ -1576,7 +1576,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 workitem_dict["end_date"] = workitem.end_date.isoformat() if workitem.end_date else None
                 workitem_dict["due_date"] = workitem.due_date.isoformat() if workitem.due_date else None
 
-                # TEMP: 콜봇 테스트코드드 다음 업무 생성 시 특정 담당자(frcp9408@gmail.com)에게 브라우저 콜 트리거
+                # TEMP: 肄쒕큸 ?뚯뒪?몄퐫?쒕뱶 ?ㅼ쓬 ?낅Т ?앹꽦 ???뱀젙 ?대떦??frcp9408@gmail.com)?먭쾶 釉뚮씪?곗? 肄??몃━嫄?
                 try:
                     target_email = "frcp9408@gmail.com"
                     trigger_url = "https://monitor-faithful-slightly.ngrok-free.app/call/client"
@@ -1612,7 +1612,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 except Exception as exc:
                     print(f"[TwilioTrigger][next] Skipped trigger logic: {exc}")
 
-                # browser-automation-agent인 경우 상세한 description 생성
+                # browser-automation-agent??寃쎌슦 ?곸꽭??description ?앹꽦
                 # if workitem.agent_orch == 'browser-automation-agent':
                 #     print(f"[DEBUG] Generating browser automation description for workitem: {workitem.id}")
                 #     try:
@@ -1639,21 +1639,21 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
 
 def fetch_prev_task_ids(process_definition, current_activity_id: str, proc_inst_id: str) -> List[str]:
     """
-    현재 테스크의 시퀀스 정보를 이용해 바로 직전 테스크의 ID 목록을 반환합니다.
+    ?꾩옱 ?뚯뒪?ъ쓽 ?쒗???뺣낫瑜??댁슜??諛붾줈 吏곸쟾 ?뚯뒪?ъ쓽 ID 紐⑸줉??諛섑솚?⑸땲??
     
     Args:
-        process_definition: 프로세스 정의 객체
-        current_activity_id: 현재 테스크의 ID
-        proc_inst_id: 프로세스 인스턴스 ID
+        process_definition: ?꾨줈?몄뒪 ?뺤쓽 媛앹껜
+        current_activity_id: ?꾩옱 ?뚯뒪?ъ쓽 ID
+        proc_inst_id: ?꾨줈?몄뒪 ?몄뒪?댁뒪 ID
     
     Returns:
-        List[str]: 직전 테스크의 activity ID 목록
+        List[str]: 吏곸쟾 ?뚯뒪?ъ쓽 activity ID 紐⑸줉
     """
     prev_task_ids = []
     prev_activities = process_definition.find_immediate_prev_activities(current_activity_id)
     
     if prev_activities:
-        # 이전 액티비티들의 activity_id를 수집
+        # ?댁쟾 ?≫떚鍮꾪떚?ㅼ쓽 activity_id瑜??섏쭛
         for prev_activity in prev_activities:
             prev_task_ids.append(prev_activity.id)
     
@@ -1688,13 +1688,13 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
             start_date = datetime.now(pytz.timezone('Asia/Seoul'))
         
             if prev_activities:
-                # 동일한 srcTrg를 가진 액티비티들 중 duration이 가장 큰 것만 남기기
+                # ?숈씪??srcTrg瑜?媛吏??≫떚鍮꾪떚??以?duration??媛????寃껊쭔 ?④린湲?
                 srcTrg_groups = {}
                 for prev_activity in prev_activities:
                     if prev_activity.srcTrg not in srcTrg_groups:
                         srcTrg_groups[prev_activity.srcTrg] = []
                     srcTrg_groups[prev_activity.srcTrg].append(prev_activity)
-                # duration이 가장 큰 액티비티만 선택
+                # duration??媛?????≫떚鍮꾪떚留??좏깮
                 filtered_activities = []
                 for activities in srcTrg_groups.values():
                     max_duration_activity = max(activities, key=lambda x: x.duration if x.duration is not None else 0)
@@ -1703,7 +1703,7 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 reference_ids = fetch_prev_task_ids(process_definition, safeget(activity, 'id', ''), process_instance_data['proc_inst_id'])
                 
                 for prev_activity in filtered_activities:
-                    # duration 키가 있어도 값이 None 일 수 있어(생성된 정의는 duration 미지정) timedelta(days=None) 크래시 방지.
+                    # duration ?ㅺ? ?덉뼱??媛믪씠 None ?????덉뼱(?앹꽦???뺤쓽??duration 誘몄??? timedelta(days=None) ?щ옒??諛⑹?.
                     start_date = start_date + timedelta(days=(safeget(prev_activity, 'duration', 0) or 0))
 
             due_date = start_date + timedelta(days=(safeget(activity, 'duration', 0) or 0)) if safeget(activity, 'duration', 0) else None
@@ -1743,55 +1743,55 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                     if instruction:
                         query += f"[Instruction]\n{instruction}\n\n"
 
-                # tool 결정: activity type에 'task'가 포함되고 tool이 비어있으면 'defaultForm' 사용
+                # tool 寃곗젙: activity type??'task'媛 ?ы븿?섍퀬 tool??鍮꾩뼱?덉쑝硫?'defaultForm' ?ъ슜
                 activity_tool = safeget(activity, 'tool', '')
                 activity_type = safeget(activity, 'type', '').lower()
                 if not activity_tool and 'task' in activity_type:
                     activity_tool = 'formHandler:defaultForm'
                     
-                # activity.agent가 있으면 user_id에 추가 (중복 체크, 우선순위 높음)
+                # activity.agent媛 ?덉쑝硫?user_id??異붽? (以묐났 泥댄겕, ?곗꽑?쒖쐞 ?믪쓬)
                 if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
                     agent_id = safeget(activity, 'agent', None)
                     
-                    # 기존 user_id와 조인 (중복 체크)
+                    # 湲곗〈 user_id? 議곗씤 (以묐났 泥댄겕)
                     if user_id:
                         user_ids = [uid.strip() for uid in user_id.split(',') if uid.strip()]
                         if agent_id not in user_ids:
-                            user_ids.insert(0, agent_id)  # activity.agent를 맨 앞에 추가 (우선순위)
+                            user_ids.insert(0, agent_id)  # activity.agent瑜?留??욎뿉 異붽? (?곗꽑?쒖쐞)
                         user_id = ','.join(user_ids)
                     else:
                         user_id = agent_id
                     
-                    # assignees에서 activity.role과 이름이 같은 role_binding의 endpoint를 확장
+                    # assignees?먯꽌 activity.role怨??대쫫??媛숈? role_binding??endpoint瑜??뺤옣
                     role_name = safeget(activity, 'role', '')
                     updated_role_binding = False
                     for assignee in assignees:
                         if assignee.get('name') != role_name:
                             continue
                         assignee_endpoint = assignee.get('endpoint')
-                        # endpoint가 리스트인 경우: agent_id가 없으면 append
+                        # endpoint媛 由ъ뒪?몄씤 寃쎌슦: agent_id媛 ?놁쑝硫?append
                         if isinstance(assignee_endpoint, list):
                             if agent_id not in assignee_endpoint:
                                 assignee_endpoint.append(agent_id)
                                 assignee['endpoint'] = assignee_endpoint
-                        # endpoint가 문자열/단일 값인 경우
+                        # endpoint媛 臾몄옄???⑥씪 媛믪씤 寃쎌슦
                         elif isinstance(assignee_endpoint, str) and assignee_endpoint.strip() != "":
                             if assignee_endpoint != agent_id:
                                 assignee['endpoint'] = [assignee_endpoint, agent_id]
-                        # endpoint가 없거나 빈 경우
+                        # endpoint媛 ?녾굅??鍮?寃쎌슦
                         else:
                             assignee['endpoint'] = agent_id
                         updated_role_binding = True
                         break
                     
-                    # 동일 role의 role_binding이 없으면 새로 하나 추가
+                    # ?숈씪 role??role_binding???놁쑝硫??덈줈 ?섎굹 異붽?
                     if not updated_role_binding:
                         assignees.append({
                             "name": role_name,
                             "endpoint": agent_id
                         })
                 
-                # 최종 user_id 기준으로 username 재계산
+                # 理쒖쥌 user_id 湲곗??쇰줈 username ?ш퀎??
                 username = ''
                 if user_id:
                     if ',' in user_id:
@@ -1852,15 +1852,15 @@ def _generate_browser_automation_description(
     tenant_id: str
 ) -> str:
     """
-    browser-automation-agent용 상세한 description을 생성합니다.
+    browser-automation-agent???곸꽭??description???앹꽦?⑸땲??
     """
     try:
-        # 이전 workitem들을 가져와서 사용자 요청사항과 프로세스 흐름 파악
+        # ?댁쟾 workitem?ㅼ쓣 媛?몄????ъ슜???붿껌?ы빆怨??꾨줈?몄뒪 ?먮쫫 ?뚯븙
         all_workitems = fetch_workitems_by_proc_inst_id(process_instance_data['proc_inst_id'], tenant_id)
 
         form_data = fetch_ui_definition_by_activity_id(process_instance_data['proc_def_id'], process_instance_data['current_activity_ids'][0], tenant_id)
         
-        # 이전, 현재, 이후 workitem 정보 분석 (status 기반)
+        # ?댁쟾, ?꾩옱, ?댄썑 workitem ?뺣낫 遺꾩꽍 (status 湲곕컲)
         done_workitems = []
         current_workitem = None
         next_workitems = []
@@ -1882,77 +1882,77 @@ def _generate_browser_automation_description(
                 else:
                     next_workitems.append(workitem_info)
         
-        # LLM을 사용하여 상세한 description 생성
+        # LLM???ъ슜?섏뿬 ?곸꽭??description ?앹꽦
         prompt_template = """
-당신은 browser-automation-agent(browser-use)가 웹 브라우저를 통해 작업을 수행할 수 있도록 상세한 단계별 설명을 생성하는 AI입니다.
+?뱀떊? browser-automation-agent(browser-use)媛 ??釉뚮씪?곗?瑜??듯빐 ?묒뾽???섑뻾?????덈룄濡??곸꽭???④퀎蹂??ㅻ챸???앹꽦?섎뒗 AI?낅땲??
 
-=== 현재 작업 ===
+=== ?꾩옱 ?묒뾽 ===
 {current_workitem}
 
-=== 현재 작업에 결과로 입력되어야할(기대하는 결과값) 입력 폼 데이터입니다. 이 폼 데이터를 채워넣을 수 있는 결과를 얻기 위한 상세한 설명을 생성하세요. ===
+=== ?꾩옱 ?묒뾽??寃곌낵濡??낅젰?섏뼱?쇳븷(湲곕??섎뒗 寃곌낵媛? ?낅젰 ???곗씠?곗엯?덈떎. ?????곗씠?곕? 梨꾩썙?ｌ쓣 ???덈뒗 寃곌낵瑜??산린 ?꾪븳 ?곸꽭???ㅻ챸???앹꽦?섏꽭?? ===
 {form_data}
 
-=== 이전 작업들 ===
+=== ?댁쟾 ?묒뾽??===
 {done_workitems}
 
-=== 이후 작업들 ===
+=== ?댄썑 ?묒뾽??===
 {next_workitems}
 
-=== 분석 요구사항 ===
-1. 이전 작업에서 사용자가 입력한 구체적인 내용과 지침을 파악하세요
-2. 이후 작업에서 어떤 결과물이 필요한지 파악하세요
-3. 현재 작업이 전체 프로세스에서 어떤 역할을 하는지 이해하세요
-4. 이후 작업이 URL 제공이나 파일 다운로드라면, 현재 작업에서 해당 결과물을 얻어내는 단계를 포함하세요
+=== 遺꾩꽍 ?붽뎄?ы빆 ===
+1. ?댁쟾 ?묒뾽?먯꽌 ?ъ슜?먭? ?낅젰??援ъ껜?곸씤 ?댁슜怨?吏移⑥쓣 ?뚯븙?섏꽭??
+2. ?댄썑 ?묒뾽?먯꽌 ?대뼡 寃곌낵臾쇱씠 ?꾩슂?쒖? ?뚯븙?섏꽭??
+3. ?꾩옱 ?묒뾽???꾩껜 ?꾨줈?몄뒪?먯꽌 ?대뼡 ??븷???섎뒗吏 ?댄빐?섏꽭??
+4. ?댄썑 ?묒뾽??URL ?쒓났?대굹 ?뚯씪 ?ㅼ슫濡쒕뱶?쇰㈃, ?꾩옱 ?묒뾽?먯꽌 ?대떦 寃곌낵臾쇱쓣 ?살뼱?대뒗 ?④퀎瑜??ы븿?섏꽭??
 
-=== 생성 요구사항 ===
-- browser-use가 웹 브라우저를 통해 수행할 수 있는 구체적인 단계별 설명을 생성하세요
-- 각 단계는 실행 가능하고 명확해야 합니다
-- 이전 작업의 입력 내용을 활용하세요
-- 이후 작업에 필요한 결과물을 생성하는 단계를 포함하세요
-- 요구사항 및 사용자의 입력, 지침을 반영하여 생성하되, 불필요한 설명은 포함하지 마세요. 예를 들어 로그인 요구가 없다면 로그인 설명은 포함하지 마세요.
-- 사용자가 이전에 입력한 입력값이 있다면 그 값을 활용하여 생성하세요. 입력값이 상세하게 작성되어 있다면 조금의 보완만하여 사용하되, 입력값이 명확하지 않다면 입력값을 활용하여 설명을 상세하게 작성하세요.
+=== ?앹꽦 ?붽뎄?ы빆 ===
+- browser-use媛 ??釉뚮씪?곗?瑜??듯빐 ?섑뻾?????덈뒗 援ъ껜?곸씤 ?④퀎蹂??ㅻ챸???앹꽦?섏꽭??
+- 媛??④퀎???ㅽ뻾 媛?ν븯怨?紐낇솗?댁빞 ?⑸땲??
+- ?댁쟾 ?묒뾽???낅젰 ?댁슜???쒖슜?섏꽭??
+- ?댄썑 ?묒뾽???꾩슂??寃곌낵臾쇱쓣 ?앹꽦?섎뒗 ?④퀎瑜??ы븿?섏꽭??
+- ?붽뎄?ы빆 諛??ъ슜?먯쓽 ?낅젰, 吏移⑥쓣 諛섏쁺?섏뿬 ?앹꽦?섎릺, 遺덊븘?뷀븳 ?ㅻ챸? ?ы븿?섏? 留덉꽭?? ?덈? ?ㅼ뼱 濡쒓렇???붽뎄媛 ?녿떎硫?濡쒓렇???ㅻ챸? ?ы븿?섏? 留덉꽭??
+- ?ъ슜?먭? ?댁쟾???낅젰???낅젰媛믪씠 ?덈떎硫?洹?媛믪쓣 ?쒖슜?섏뿬 ?앹꽦?섏꽭?? ?낅젰媛믪씠 ?곸꽭?섍쾶 ?묒꽦?섏뼱 ?덈떎硫?議곌툑??蹂댁셿留뚰븯???ъ슜?섎릺, ?낅젰媛믪씠 紐낇솗?섏? ?딅떎硫??낅젰媛믪쓣 ?쒖슜?섏뿬 ?ㅻ챸???곸꽭?섍쾶 ?묒꽦?섏꽭??
 
-형식:
-1. [단계명]: [구체적인 수행 방법]
-2. [단계명]: [구체적인 수행 방법]
+?뺤떇:
+1. [?④퀎紐?: [援ъ껜?곸씤 ?섑뻾 諛⑸쾿]
+2. [?④퀎紐?: [援ъ껜?곸씤 ?섑뻾 諛⑸쾿]
 ...
 
-예시: 
-- 입력값: (접속주소 제공)여기서 파일 다운로드 해줘
-- 지침: 특정 사이트에 접속하여 파일을 다운로드
+?덉떆: 
+- ?낅젰媛? (?묒냽二쇱냼 ?쒓났)?ш린???뚯씪 ?ㅼ슫濡쒕뱶 ?댁쨾
+- 吏移? ?뱀젙 ?ъ씠?몄뿉 ?묒냽?섏뿬 ?뚯씪???ㅼ슫濡쒕뱶
 
-인 경우 설명:
-1. 특정 사이트(접속주소)에 접속
-2. 접속시 표시되는 팝업창 확인 후 팝업창 닫기
-3. 다운로드 섹션을 찾아 이동
-4. 다운로드 버튼 클릭
-5. 파일 다운로드 클릭 후 다운로드 된 파일 확인
-6. 종료
+??寃쎌슦 ?ㅻ챸:
+1. ?뱀젙 ?ъ씠???묒냽二쇱냼)???묒냽
+2. ?묒냽???쒖떆?섎뒗 ?앹뾽李??뺤씤 ???앹뾽李??リ린
+3. ?ㅼ슫濡쒕뱶 ?뱀뀡??李얠븘 ?대룞
+4. ?ㅼ슫濡쒕뱶 踰꾪듉 ?대┃
+5. ?뚯씪 ?ㅼ슫濡쒕뱶 ?대┃ ???ㅼ슫濡쒕뱶 ???뚯씪 ?뺤씤
+6. 醫낅즺
 
-입력값이 보다 상세한 경우:
-- 입력값: 
-1. https://www.g2b.go.kr/ 주소의 나라장터 접속 후 표시되는 팝업이 있다면 팝업 모두 닫기
-2. 상단 검색 돋보기 아이콘 클릭 후 "ai" 검색
-3. 조달정보 검색결과 중 입찰 공고의 "더보기"가 아닌 사업명("CMS 업무 DX 플랫폼 이미지분석 AI 구축 추진 관련 IT자원 도입")을 클릭하여 상세 페이지로 이동
-4. 하단으로 스크롤하여 "파일첨부" 섹션을 찾고 제일 상단에 있는 파일명(예시: 	제안요청서(CMS 업무 DX 플랫폼 이미지분석 AI 구축 추진 관련 IT자원 도입).hwpx) 클릭
-5. 종료
-- 지침: 특정 사이트에 접속하여 파일을 다운로드
+?낅젰媛믪씠 蹂대떎 ?곸꽭??寃쎌슦:
+- ?낅젰媛? 
+1. https://www.g2b.go.kr/ 二쇱냼???섎씪?ν꽣 ?묒냽 ???쒖떆?섎뒗 ?앹뾽???덈떎硫??앹뾽 紐⑤몢 ?リ린
+2. ?곷떒 寃???뗫낫湲??꾩씠肄??대┃ ??"ai" 寃??
+3. 議곕떖?뺣낫 寃?됯껐怨?以??낆같 怨듦퀬??"?붾낫湲?媛 ?꾨땶 ?ъ뾽紐?"CMS ?낅Т DX ?뚮옯???대?吏遺꾩꽍 AI 援ъ텞 異붿쭊 愿??IT?먯썝 ?꾩엯")???대┃?섏뿬 ?곸꽭 ?섏씠吏濡??대룞
+4. ?섎떒?쇰줈 ?ㅽ겕濡ㅽ븯??"?뚯씪泥⑤?" ?뱀뀡??李얘퀬 ?쒖씪 ?곷떒???덈뒗 ?뚯씪紐??덉떆: 	?쒖븞?붿껌??CMS ?낅Т DX ?뚮옯???대?吏遺꾩꽍 AI 援ъ텞 異붿쭊 愿??IT?먯썝 ?꾩엯).hwpx) ?대┃
+5. 醫낅즺
+- 吏移? ?뱀젙 ?ъ씠?몄뿉 ?묒냽?섏뿬 ?뚯씪???ㅼ슫濡쒕뱶
 
-인 경우 설명:
-1. https://www.g2b.go.kr/ 주소의 나라장터 접속
-2. 접속시 표시되는 팝업창 확인 후 팝업창 닫기
-3. 상단 검색 돋보기 아이콘 클릭 후 "ai" 검색
-4. 조달정보 검색결과 중 입찰 공고의 "더보기"가 아닌 사업명("CMS 업무 DX 플랫폼 이미지분석 AI 구축 추진 관련 IT자원 도입")을 클릭하여 상세 페이지로 이동
-5. 하단으로 스크롤하여 "파일첨부" 섹션을 찾고 제일 상단에 있는 파일명(예시: 제안요청서(CMS 업무 DX 플랫폼 이미지분석 AI 구축 추진 관련 IT자원 도입).hwpx) 클릭
-6. 파일 다운로드 클릭 후 다운로드 된 파일 확인
-7. 종료
+??寃쎌슦 ?ㅻ챸:
+1. https://www.g2b.go.kr/ 二쇱냼???섎씪?ν꽣 ?묒냽
+2. ?묒냽???쒖떆?섎뒗 ?앹뾽李??뺤씤 ???앹뾽李??リ린
+3. ?곷떒 寃???뗫낫湲??꾩씠肄??대┃ ??"ai" 寃??
+4. 議곕떖?뺣낫 寃?됯껐怨?以??낆같 怨듦퀬??"?붾낫湲?媛 ?꾨땶 ?ъ뾽紐?"CMS ?낅Т DX ?뚮옯???대?吏遺꾩꽍 AI 援ъ텞 異붿쭊 愿??IT?먯썝 ?꾩엯")???대┃?섏뿬 ?곸꽭 ?섏씠吏濡??대룞
+5. ?섎떒?쇰줈 ?ㅽ겕濡ㅽ븯??"?뚯씪泥⑤?" ?뱀뀡??李얘퀬 ?쒖씪 ?곷떒???덈뒗 ?뚯씪紐??덉떆: ?쒖븞?붿껌??CMS ?낅Т DX ?뚮옯???대?吏遺꾩꽍 AI 援ъ텞 異붿쭊 愿??IT?먯썝 ?꾩엯).hwpx) ?대┃
+6. ?뚯씪 ?ㅼ슫濡쒕뱶 ?대┃ ???ㅼ슫濡쒕뱶 ???뚯씪 ?뺤씤
+7. 醫낅즺
 
-위 예시처럼 입력값과 지침을 반영하여 상세한 단계별 설명(query)을 생성해주세요.
-파일 다운로드 및 동작 결과는 현재 단계의 입력 폼 형식에 맞게 생성하라고 명시하여야함. 
-생성된 결과를 입력 폼에 채워넣는 동작은 browser-use 종료 이후에 수행하도록 구현되어 있기때문에 혼란을 줄이기 위해 입력 폼을 채워넣으라는 설명은 포함하지 마세요.
+???덉떆泥섎읆 ?낅젰媛믨낵 吏移⑥쓣 諛섏쁺?섏뿬 ?곸꽭???④퀎蹂??ㅻ챸(query)???앹꽦?댁＜?몄슂.
+?뚯씪 ?ㅼ슫濡쒕뱶 諛??숈옉 寃곌낵???꾩옱 ?④퀎???낅젰 ???뺤떇??留욊쾶 ?앹꽦?섎씪怨?紐낆떆?섏뿬?쇳븿. 
+?앹꽦??寃곌낵瑜??낅젰 ?쇱뿉 梨꾩썙?ｋ뒗 ?숈옉? browser-use 醫낅즺 ?댄썑???섑뻾?섎룄濡?援ы쁽?섏뼱 ?덇린?뚮Ц???쇰???以꾩씠湲??꾪빐 ?낅젰 ?쇱쓣 梨꾩썙?ｌ쑝?쇰뒗 ?ㅻ챸? ?ы븿?섏? 留덉꽭??
 
-불필요한 설명을 최소화하고 사용자의 입력, 지침, 현재 및 이전, 이후 모든 activity의 목적, 의도를 파악하여 
-최대한 사용자의 목적에 맞는 동작을 수행시킬 수 있는 상세한 단계별 설명(query)을 생성해주세요:
+遺덊븘?뷀븳 ?ㅻ챸??理쒖냼?뷀븯怨??ъ슜?먯쓽 ?낅젰, 吏移? ?꾩옱 諛??댁쟾, ?댄썑 紐⑤뱺 activity??紐⑹쟻, ?섎룄瑜??뚯븙?섏뿬 
+理쒕????ъ슜?먯쓽 紐⑹쟻??留욌뒗 ?숈옉???섑뻾?쒗궗 ???덈뒗 ?곸꽭???④퀎蹂??ㅻ챸(query)???앹꽦?댁＜?몄슂:
 """
 
         # print(f"[DEBUG] current_workitem: {current_workitem}")
@@ -1969,11 +1969,11 @@ def _generate_browser_automation_description(
             form_data=str(form_data.fields_json) if form_data and form_data.fields_json else "NULL"
         )
         
-        # LLM 호출
+        # LLM ?몄텧
         model = create_llm(streaming=True, temperature=0)
         response = model.invoke(prompt)
         
-        # 응답에서 단계별 설명 추출
+        # ?묐떟?먯꽌 ?④퀎蹂??ㅻ챸 異붿텧
         if hasattr(response, 'content'):
             description = response.content
         else:
@@ -1983,7 +1983,7 @@ def _generate_browser_automation_description(
         
     except Exception as e:
         print(f"[ERROR] Failed to generate browser automation description: {str(e)}")
-        # 기본 description 반환
+        # 湲곕낯 description 諛섑솚
         return None
 
 
@@ -2027,34 +2027,34 @@ def delete_workitem(workitem_id: str, tenant_id: Optional[str] = None):
         raise HTTPException(status_code=404, detail=str(e)) from e
 def upsert_chat_message(chat_room_id: str, data: Any, tenant_id: Optional[str] = None) -> None:
     """
-    채팅 메시지를 upsert하는 함수
+    梨꾪똿 硫붿떆吏瑜?upsert?섎뒗 ?⑥닔
     
     Args:
-        chat_room_id: 채팅방 ID
-        data: 메시지 데이터 (dict 또는 str) - role 필드 포함
-        tenant_id: 테넌트 ID
+        chat_room_id: 梨꾪똿諛?ID
+        data: 硫붿떆吏 ?곗씠??(dict ?먮뒗 str) - role ?꾨뱶 ?ы븿
+        tenant_id: ?뚮꼳??ID
     """
     try:
         current_timestamp = int(datetime.now(pytz.timezone('Asia/Seoul')).timestamp() * 1000)
         
-        # data가 문자열인 경우 JSON으로 파싱
+        # data媛 臾몄옄?댁씤 寃쎌슦 JSON?쇰줈 ?뚯떛
         if isinstance(data, str):
             message_data = json.loads(data)
         else:
             message_data = data
         
-        # role이 없으면 기본값 설정
+        # role???놁쑝硫?湲곕낯媛??ㅼ젙
         if "role" not in message_data:
             message_data["role"] = "system"
         
-        # timestamp가 없으면 추가
+        # timestamp媛 ?놁쑝硫?異붽?
         if "timeStamp" not in message_data:
             message_data["timeStamp"] = current_timestamp
 
         if not tenant_id:
             tenant_id = subdomain_var.get()
 
-        # 채팅 아이템 데이터 구성
+        # 梨꾪똿 ?꾩씠???곗씠??援ъ꽦
         chat_item_data = {
             "id": chat_room_id,
             "uuid": str(uuid.uuid4()),
@@ -2093,14 +2093,14 @@ def fetch_user_info(email: str) -> Dict[str, str]:
 
 def fetch_assignee_info(assignee_id: str) -> Dict[str, str]:
     """
-    담당자 정보를 찾는 함수
-    담당자가 유저인지 에이전트인지 판단하고 적절한 정보를 반환합니다.
+    ?대떦???뺣낫瑜?李얜뒗 ?⑥닔
+    ?대떦?먭? ?좎??몄? ?먯씠?꾪듃?몄? ?먮떒?섍퀬 ?곸젅???뺣낫瑜?諛섑솚?⑸땲??
     
     Args:
-        assignee_id: 담당자 ID (이메일 또는 에이전트 ID)
+        assignee_id: ?대떦??ID (?대찓???먮뒗 ?먯씠?꾪듃 ID)
     
     Returns:
-        담당자 정보 딕셔너리
+        ?대떦???뺣낫 ?뺤뀛?덈━
     """
     try:
         try:
@@ -2139,26 +2139,26 @@ def fetch_assignee_info(assignee_id: str) -> Dict[str, str]:
 
 def determine_agent_mode(user_id: str, agent_mode: Optional[str] = None) -> Optional[str]:
     """
-    사용자 ID와 액티비티의 에이전트 모드를 기반으로 적절한 에이전트 모드를 결정합니다.
+    ?ъ슜??ID? ?≫떚鍮꾪떚???먯씠?꾪듃 紐⑤뱶瑜?湲곕컲?쇰줈 ?곸젅???먯씠?꾪듃 紐⑤뱶瑜?寃곗젙?⑸땲??
     
     Args:
-        user_id: 사용자 ID (쉼표로 구분된 여러 ID 가능)
-        agent_mode: 액티비티에서 설정된 에이전트 모드
+        user_id: ?ъ슜??ID (?쇳몴濡?援щ텇???щ윭 ID 媛??
+        agent_mode: ?≫떚鍮꾪떚?먯꽌 ?ㅼ젙???먯씠?꾪듃 紐⑤뱶
     
     Returns:
-        결정된 에이전트 모드 (None, "DRAFT", "COMPLETE")
+        寃곗젙???먯씠?꾪듃 紐⑤뱶 (None, "DRAFT", "COMPLETE")
     """
-    # 액티비티에서 명시적으로 에이전트 모드가 설정된 경우
+    # ?≫떚鍮꾪떚?먯꽌 紐낆떆?곸쑝濡??먯씠?꾪듃 紐⑤뱶媛 ?ㅼ젙??寃쎌슦
     if agent_mode is not None:
         if agent_mode.lower() not in ["none", "null"]:
             mode = agent_mode.upper()
             return mode
 
-    # user_id가 없으면 None 반환
+    # user_id媛 ?놁쑝硫?None 諛섑솚
     if not user_id:
         return None
     
-    # 여러 사용자 ID가 있는 경우
+    # ?щ윭 ?ъ슜??ID媛 ?덈뒗 寃쎌슦
     if ',' in user_id:
         user_ids = user_id.split(',')
         has_user = False
@@ -2171,17 +2171,17 @@ def determine_agent_mode(user_id: str, agent_mode: Optional[str] = None) -> Opti
             elif assignee_info['type'] == "agent":
                 has_agent = True
         
-        # 사용자+에이전트 조합이면 DRAFT
+        # ?ъ슜???먯씠?꾪듃 議고빀?대㈃ DRAFT
         if has_user and has_agent:
             return "DRAFT"
-        # 에이전트만 있으면 COMPLETE
+        # ?먯씠?꾪듃留??덉쑝硫?COMPLETE
         elif has_agent and not has_user:
             return "COMPLETE"
-        # 사용자만 있으면 None
+        # ?ъ슜?먮쭔 ?덉쑝硫?None
         elif has_user and not has_agent:
             return None
     
-    # 단일 사용자 ID인 경우
+    # ?⑥씪 ?ъ슜??ID??寃쎌슦
     else:
         assignee_info = fetch_assignee_info(user_id)
         if assignee_info['type'] == "agent":
@@ -2209,13 +2209,13 @@ def get_vector_store():
 
 def fetch_tenant_mcp_config(tenant_id: str) -> Optional[Dict[str, Any]]:
     """
-    테넌트의 MCP 설정을 조회합니다.
+    ?뚮꼳?몄쓽 MCP ?ㅼ젙??議고쉶?⑸땲??
     
     Args:
-        tenant_id (str): 테넌트 ID
+        tenant_id (str): ?뚮꼳??ID
         
     Returns:
-        Optional[Dict[str, Any]]: MCP 설정 정보 또는 None
+        Optional[Dict[str, Any]]: MCP ?ㅼ젙 ?뺣낫 ?먮뒗 None
     """
     try:
         supabase = supabase_client_var.get()
@@ -2238,11 +2238,11 @@ def fetch_tenant_mcp_config(tenant_id: str) -> Optional[Dict[str, Any]]:
 
 def get_field_value(field_info: str, process_definition: Any, process_instance_id: str, tenant_id: str):
     """
-    산출물에서 특정 필드의 값을 추출 (구조 변경 최소화)
-    - (1) 현재 인스턴스 단일 조회 → 값 있으면 단일값으로 반환
-    - (2) 루트 인스턴스 단일 조회(+그룹 인덱싱) → 값 있으면 단일값으로 반환
-    - (3) 루트 기준 다건 조회(fetch_workitems_by_root_proc_inst_id)
-         → 전부 배열로 모아 { form_id: { field_id: ["<scope>:<value>", ...] } } 형태로 반환
+    ?곗텧臾쇱뿉???뱀젙 ?꾨뱶??媛믪쓣 異붿텧 (援ъ“ 蹂寃?理쒖냼??
+    - (1) ?꾩옱 ?몄뒪?댁뒪 ?⑥씪 議고쉶 ??媛??덉쑝硫??⑥씪媛믪쑝濡?諛섑솚
+    - (2) 猷⑦듃 ?몄뒪?댁뒪 ?⑥씪 議고쉶(+洹몃９ ?몃뜳?? ??媛??덉쑝硫??⑥씪媛믪쑝濡?諛섑솚
+    - (3) 猷⑦듃 湲곗? ?ㅺ굔 議고쉶(fetch_workitems_by_root_proc_inst_id)
+         ???꾨? 諛곗뿴濡?紐⑥븘 { form_id: { field_id: ["<scope>:<value>", ...] } } ?뺥깭濡?諛섑솚
     """
     try:
         field_value: Dict[str, Any] = {}
@@ -2252,11 +2252,11 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
         form_id = split_field_info[0]
         field_id = split_field_info[1]
 
-        # ---- form_id -> activity_id 매핑 (다단계) ----
-        # 1) activity.tool 직접 비교
-        # 2) activity.tool 에서 'formHandler:' prefix 제거 후 비교
-        # 3) form_id 의 '_form' 접미 제거 + PD ID prefix 제거 후 끝부분 토큰 매칭
-        # 4) 최후 fallback: 같은 인스턴스 모든 워크아이템 순회하여 output 안에 form_id 키가 있는지 확인
+        # ---- form_id -> activity_id 留ㅽ븨 (?ㅻ떒怨? ----
+        # 1) activity.tool 吏곸젒 鍮꾧탳
+        # 2) activity.tool ?먯꽌 'formHandler:' prefix ?쒓굅 ??鍮꾧탳
+        # 3) form_id ??'_form' ?묐? ?쒓굅 + PD ID prefix ?쒓굅 ???앸?遺??좏겙 留ㅼ묶
+        # 4) 理쒗썑 fallback: 媛숈? ?몄뒪?댁뒪 紐⑤뱺 ?뚰겕?꾩씠???쒗쉶?섏뿬 output ?덉뿉 form_id ?ㅺ? ?덈뒗吏 ?뺤씤
         def _norm_tool(t: Any) -> str:
             try:
                 s = str(t or "").strip()
@@ -2309,7 +2309,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
         def _ci_equal(a: Optional[str], b: Optional[str]) -> bool:
             return (a or "").lower() == (b or "").lower()
 
-        # activity_id 못 찾은 경우 - 같은 인스턴스 모든 워크아이템에서 output[form_id] 직접 탐색
+        # activity_id 紐?李얠? 寃쎌슦 - 媛숈? ?몄뒪?댁뒪 紐⑤뱺 ?뚰겕?꾩씠?쒖뿉??output[form_id] 吏곸젒 ?먯깋
         if not activity_id:
             try:
                 wi_all = fetch_workitems_by_proc_inst_id(process_instance_id, tenant_id) or []
@@ -2324,7 +2324,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
                         return field_value
             return None
 
-        # (1) 현재 인스턴스 단일 조회
+        # (1) ?꾩옱 ?몄뒪?댁뒪 ?⑥씪 議고쉶
         workitem = fetch_workitem_by_proc_inst_and_activity(process_instance_id, activity_id, tenant_id, True)
         if workitem:
             out = _out(workitem)
@@ -2334,7 +2334,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
                     field_value[form_id] = { field_id: val }
                     return field_value
         else:
-            # activity_id 매핑은 됐지만 워크아이템이 그 ID 로 안 잡힌 케이스 -> output-key 스캔
+            # activity_id 留ㅽ븨? ?먯?留??뚰겕?꾩씠?쒖씠 洹?ID 濡????≫엺 耳?댁뒪 -> output-key ?ㅼ틪
             try:
                 wi_all = fetch_workitems_by_proc_inst_id(process_instance_id, tenant_id) or []
             except Exception:
@@ -2347,13 +2347,13 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
                         field_value[form_id] = { field_id: val }
                         return field_value
 
-        # 인스턴스 정보
+        # ?몄뒪?댁뒪 ?뺣낫
         instance = fetch_process_instance(process_instance_id, tenant_id)
         root_proc_inst_id = getattr(instance, "root_proc_inst_id", None) or (instance.get("root_proc_inst_id") if isinstance(instance, dict) else None)
         exec_scope_raw = getattr(instance, "execution_scope", None) or (instance.get("execution_scope") if isinstance(instance, dict) else None)
         exec_scope = _to_int(exec_scope_raw, 0)
 
-        # (2) 루트 인스턴스 단일 조회(+그룹 인덱싱)
+        # (2) 猷⑦듃 ?몄뒪?댁뒪 ?⑥씪 議고쉶(+洹몃９ ?몃뜳??
         workitem_root = fetch_workitem_by_proc_inst_and_activity(root_proc_inst_id, activity_id, tenant_id, True)
         if workitem_root:
             out = _out(workitem_root)
@@ -2383,7 +2383,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
             if _ci_equal(wi_act, activity_id):
                 filtered.append(wi)
         if not filtered:
-            # 최후 fallback: activity_id 매칭 실패해도 output 안에 form_id 키가 있는 워크아이템 직접 탐색
+            # 理쒗썑 fallback: activity_id 留ㅼ묶 ?ㅽ뙣?대룄 output ?덉뿉 form_id ?ㅺ? ?덈뒗 ?뚰겕?꾩씠??吏곸젒 ?먯깋
             for wi in workitems:
                 out = _out(wi)
                 if isinstance(out, dict) and isinstance(out.get(form_id), dict):
@@ -2423,13 +2423,13 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
 
 def group_fields_by_form(field_values: dict) -> dict:
     """
-    필드 값들을 폼별로 그룹화하는 공통 함수
+    ?꾨뱶 媛믩뱾???쇰퀎濡?洹몃９?뷀븯??怨듯넻 ?⑥닔
     
     Args:
-        field_values: {'form_id.field_name': {'form_id': {'field_name': value}}, ...} 형태의 딕셔너리
+        field_values: {'form_id.field_name': {'form_id': {'field_name': value}}, ...} ?뺥깭???뺤뀛?덈━
     
     Returns:
-        {'form_id': {'field_name': value, ...}, ...} 형태의 그룹화된 딕셔너리
+        {'form_id': {'field_name': value, ...}, ...} ?뺥깭??洹몃９?붾맂 ?뺤뀛?덈━
     """
     form_groups = {}
     
@@ -2452,9 +2452,9 @@ def group_fields_by_form(field_values: dict) -> dict:
 
 def get_input_data(workitem: dict, process_definition: Any):
     """
-    워크아이템 실행에 필요한 입력 데이터 추출
-    - 활동에 설정된 inputData가 있으면 해당 필드값을 사용
-    - inputData가 없고 첫 번째 활동이 아니면, 이전 활동의 폼 출력 데이터를 fallback으로 사용
+    ?뚰겕?꾩씠???ㅽ뻾???꾩슂???낅젰 ?곗씠??異붿텧
+    - ?쒕룞???ㅼ젙??inputData媛 ?덉쑝硫??대떦 ?꾨뱶媛믪쓣 ?ъ슜
+    - inputData媛 ?녾퀬 泥?踰덉㎏ ?쒕룞???꾨땲硫? ?댁쟾 ?쒕룞????異쒕젰 ?곗씠?곕? fallback?쇰줈 ?ъ슜
     """
     try:
         activity_id = workitem.get('activity_id')
@@ -2488,8 +2488,8 @@ def get_input_data(workitem: dict, process_definition: Any):
 
 def _get_prev_activity_form_data(workitem: dict, process_definition: Any) -> dict:
     """
-    이전 활동의 워크아이템 output에서 폼 데이터를 수집하여 반환한다.
-    첫 번째 활동이 아닌데 inputData 설정이 없는 경우의 fallback으로 사용.
+    ?댁쟾 ?쒕룞???뚰겕?꾩씠??output?먯꽌 ???곗씠?곕? ?섏쭛?섏뿬 諛섑솚?쒕떎.
+    泥?踰덉㎏ ?쒕룞???꾨땶??inputData ?ㅼ젙???녿뒗 寃쎌슦??fallback?쇰줈 ?ъ슜.
     """
     activity_id = workitem.get('activity_id')
     proc_inst_id = workitem.get('proc_inst_id')
@@ -2523,14 +2523,14 @@ def _get_prev_activity_form_data(workitem: dict, process_definition: Any) -> dic
 
 async def get_input_data_with_file_parsing(workitem: dict, process_definition: Any):
     """
-    워크아이템 실행에 필요한 입력 데이터 추출
-    inputData에 이미 파싱된 파일 내용이 포함되어 있음
-    crewai-action인 경우 10000자 이상이면 요약 처리
+    ?뚰겕?꾩씠???ㅽ뻾???꾩슂???낅젰 ?곗씠??異붿텧
+    inputData???대? ?뚯떛???뚯씪 ?댁슜???ы븿?섏뼱 ?덉쓬
+    crewai-action??寃쎌슦 10000???댁긽?대㈃ ?붿빟 泥섎━
     """
     try:
         from document_parser import summarize_text
         
-        # 기본 입력 데이터 가져오기
+        # 湲곕낯 ?낅젰 ?곗씠??媛?몄삤湲?
         input_data = get_input_data(workitem, process_definition)
         
         print(f"[DEBUG] get_input_data_with_file_parsing - workitem: {workitem.get('id')}")
@@ -2539,13 +2539,13 @@ async def get_input_data_with_file_parsing(workitem: dict, process_definition: A
             print(f"[WARNING] No input_data found")
             return None
         
-        # agent_orch가 crewai-action인 경우에만 요약 처리
+        # agent_orch媛 crewai-action??寃쎌슦?먮쭔 ?붿빟 泥섎━
         agent_orch = workitem.get('agent_orch', '')
         if agent_orch != 'crewai-action':
             print(f"[DEBUG] agent_orch is not crewai-action ({agent_orch}), skipping summarization")
             return input_data
         
-        # input_data를 문자열로 변환하여 길이 확인
+        # input_data瑜?臾몄옄?대줈 蹂?섑븯??湲몄씠 ?뺤씤
         try:
             input_data_str = json.dumps(input_data, ensure_ascii=False)
         except Exception:
@@ -2554,27 +2554,27 @@ async def get_input_data_with_file_parsing(workitem: dict, process_definition: A
         input_data_length = len(input_data_str)
         print(f"[DEBUG] input_data length: {input_data_length}")
         
-        # 10000자 이상인 경우 요약
+        # 10000???댁긽??寃쎌슦 ?붿빟
         if input_data_length > 10000:
             print(f"[INFO] input_data exceeds 10000 characters ({input_data_length}), summarizing...")
             
             try:
-                # 기존 요약 로직 사용
+                # 湲곗〈 ?붿빟 濡쒖쭅 ?ъ슜
                 summarized_str = await summarize_text(input_data_str, max_length=5000)
                 print(f"[INFO] Successfully summarized input_data from {input_data_length} to {len(summarized_str)} characters")
                 
-                # 요약된 텍스트를 JSON으로 파싱 시도
+                # ?붿빟???띿뒪?몃? JSON?쇰줈 ?뚯떛 ?쒕룄
                 try:
                     return json.loads(summarized_str)
                 except json.JSONDecodeError:
-                    # JSON 파싱 실패 시 문자열 형태로 반환
+                    # JSON ?뚯떛 ?ㅽ뙣 ??臾몄옄???뺥깭濡?諛섑솚
                     return {"summarized_content": summarized_str}
                     
             except Exception as e:
                 print(f"[ERROR] Failed to summarize input_data: {str(e)}")
                 import traceback
                 traceback.print_exc()
-                # 요약 실패 시 원본 반환
+                # ?붿빟 ?ㅽ뙣 ???먮낯 諛섑솚
                 return input_data
         
         return input_data
@@ -2583,5 +2583,6 @@ async def get_input_data_with_file_parsing(workitem: dict, process_definition: A
         print(f"[ERROR] Failed to get input data with file parsing for {workitem.get('id')}: {str(e)}")
         import traceback
         traceback.print_exc()
-        # 에러 발생시 기본 입력 데이터라도 반환
+        # ?먮윭 諛쒖깮??湲곕낯 ?낅젰 ?곗씠?곕씪??諛섑솚
         return get_input_data(workitem, process_definition)
+

@@ -239,6 +239,39 @@ def test_resolve_next_activity_payloads_exclusive_branch(wiproc):
     assert ids == ["B1"]
 
 
+@pytest.mark.asyncio
+async def test_mapper_result_context_filters_direct_conditional_sequences(wiproc):
+    seqs = [
+        _Seq("s1", source="A1", target="B1", properties=json.dumps({"conditionFunction": "fullName == 'JaneKim'"})),
+        _Seq("s2", source="A1", target="B2", properties=json.dumps({"conditionFunction": "fullName != 'JaneKim'"})),
+    ]
+    acts = [_Activity("A1"), _Activity("B1", name="Approved"), _Activity("B2", name="Review")]
+    proc_def = _ProcDef(activities=acts, sequences=seqs)
+
+    sequence_condition_data = wiproc.get_sequence_condition_data(proc_def, "A1", ["B1", "B2"])
+    await wiproc._evaluate_sequence_conditions(
+        None,
+        None,
+        proc_def,
+        {"mapper_form": {"fullName": "JaneKim"}},
+        None,
+        sequence_condition_data,
+        [],
+        workitem={"tenant_id": "test"},
+    )
+
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def,
+        activity_id="A1",
+        workitem={"assignees": []},
+        sequence_condition_data=sequence_condition_data,
+    )
+
+    assert sequence_condition_data["s1"]["conditionEval"] is True
+    assert sequence_condition_data["s2"]["conditionEval"] is False
+    assert [p.get("nextActivityId") for p in payloads] == ["B1"]
+
+
 def test_collect_ui_field_keys_basic(wiproc):
     ui_defs = [
         {"fields_json": [{"key": "email", "text": "이메일"}, {"key": "age", "text": "나이"}]},
@@ -544,6 +577,126 @@ def test_resolve_next_activity_payloads_role_bindings_fallback_from_proc_inst(wi
 
     assert len(payloads) == 1
     assert payloads[0]["nextUserEmail"] == "reviewer@example.com"
+
+
+def test_activity_mapper_updates_role_binding_for_next_activity_payload(wiproc):
+    activity = _Activity("A1")
+    activity.properties = json.dumps({
+        "mapperIn": {
+            "mappingElements": [
+                {
+                    "argument": {"text": "lane.reviewer.endpoint"},
+                    "direction": "out",
+                    "variable": {"name": "reviewerEmail"},
+                }
+            ]
+        }
+    })
+    process_instance = types.SimpleNamespace(
+        proc_inst_id="test-inst-1",
+        variables_data={},
+        role_bindings=[{"name": "reviewer", "endpoint": "old@example.com"}],
+        participants=[],
+    )
+    workitem = {
+        "id": "wi-1",
+        "activity_id": "A1",
+        "assignees": [],
+        "output": {},
+    }
+
+    mapper_result = wiproc._apply_activity_mappers(
+        process_instance,
+        activity,
+        workitem,
+        {"reviewerEmail": "mapped-reviewer@example.com"},
+        {},
+        {},
+    )
+
+    assert mapper_result["role_bindings"] == [{"name": "reviewer", "endpoint": "mapped-reviewer@example.com"}]
+    assert process_instance.role_bindings == [{"name": "reviewer", "endpoint": "mapped-reviewer@example.com"}]
+    assert workitem["assignees"] == [{"name": "reviewer", "endpoint": "mapped-reviewer@example.com"}]
+
+    proc_def = _ProcDef(
+        activities=[
+            _Activity("A1", role="requester"),
+            _Activity("A2", name="Review", role="reviewer"),
+        ],
+        sequences=[_Seq("s1", source="A1", target="A2")],
+    )
+
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def,
+        activity_id="A1",
+        workitem=workitem,
+        sequence_condition_data={},
+    )
+
+    assert len(payloads) == 1
+    assert payloads[0]["nextActivityId"] == "A2"
+    assert payloads[0]["nextUserEmail"] == "mapped-reviewer@example.com"
+
+
+def test_call_activity_out_role_binding_propagates_child_role_to_parent(wiproc, monkeypatch):
+    parent_def = _ProcDef()
+    call_activity = _Activity("Call_review", name="Review", type="callActivity")
+    call_activity.properties = json.dumps({
+        "roleBindings": [
+            {
+                "direction": "OUT",
+                "role": {"name": "보안검토담당자"},
+                "argument": "보안심사자",
+            }
+        ]
+    })
+    parent_def.activities = [call_activity]
+    parent_inst = types.SimpleNamespace(
+        proc_inst_id="parent-1",
+        parent_proc_inst_id=None,
+        current_activity_ids=["Call_review"],
+        role_bindings=[{"name": "보안검토담당자", "endpoint": "old@example.com"}],
+        process_definition=parent_def,
+    )
+    child_inst = types.SimpleNamespace(
+        proc_inst_id="child-1",
+        parent_proc_inst_id="parent-1",
+    )
+    children = [
+        {
+            "proc_inst_id": "child-1",
+            "status": "COMPLETED",
+            "role_bindings": [{"name": "보안심사자", "endpoint": "new@example.com"}],
+        }
+    ]
+    waiting_workitem = types.SimpleNamespace(
+        id="wi-call",
+        status="PENDING",
+        assignees=[{"name": "보안검토담당자", "endpoint": "old@example.com"}],
+    )
+    upserted_workitems = []
+
+    def fake_fetch_process_instance(proc_inst_id, tenant_id=None):
+        if proc_inst_id == "child-1":
+            return child_inst
+        if proc_inst_id == "parent-1":
+            return parent_inst
+        return None
+
+    monkeypatch.setattr(wiproc, "fetch_process_instance", fake_fetch_process_instance)
+    monkeypatch.setattr(wiproc, "fetch_child_instances_by_parent", lambda parent_id, tenant_id=None: children)
+    monkeypatch.setattr(wiproc, "fetch_workitem_by_proc_inst_and_activity", lambda *_args, **_kwargs: waiting_workitem)
+    monkeypatch.setattr(wiproc, "upsert_process_instance", lambda inst, tenant_id=None, process_definition=None: (True, inst))
+    monkeypatch.setattr(wiproc, "upsert_workitem", lambda data, tenant_id=None: upserted_workitems.append(data))
+
+    wiproc._progress_parent_if_all_children_completed("child-1", "test-tenant")
+
+    assert parent_inst.role_bindings == [{"name": "보안검토담당자", "endpoint": "new@example.com"}]
+    assert {
+        "id": "wi-call",
+        "assignees": [{"name": "보안검토담당자", "endpoint": "new@example.com"}],
+    } in upserted_workitems
+    assert {"id": "wi-call", "status": "SUBMITTED"} in upserted_workitems
 
 
 def test_iter_reference_scalars_extractor_cycle_raises_recursion(wiproc):

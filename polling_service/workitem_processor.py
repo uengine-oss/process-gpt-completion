@@ -1,4 +1,4 @@
-from langchain.prompts import PromptTemplate
+﻿from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain.output_parsers.json import SimpleJsonOutputParser
 from llm_factory import create_llm
@@ -32,6 +32,14 @@ from process_definition import load_process_definition
 from code_executor import execute_python_code
 from smtp_handler import generate_email_template, send_email
 from mcp_processor import mcp_processor
+from mapper_runtime import (
+    apply_mapping_result_to_instance,
+    collect_mapping_contexts,
+    evaluate_mapping_context,
+    merge_role_bindings,
+    merge_form_values,
+    read_variables_data,
+)
 
 
 if os.getenv("ENV") != "production":
@@ -745,6 +753,142 @@ def _update_process_variables(process_instance: ProcessInstance, field_mappings:
             else:
                 process_instance.variables_data.append(variable)
 
+def _extract_form_id_from_workitem(workitem: dict, ui_definition: Any = None) -> Optional[str]:
+    if ui_definition and getattr(ui_definition, "id", None):
+        return ui_definition.id
+    tool = workitem.get("tool") if isinstance(workitem, dict) else None
+    if isinstance(tool, str) and tool.startswith("formHandler:"):
+        return tool.replace("formHandler:", "", 1)
+    return None
+
+
+def _build_mapper_source_context(
+    process_instance: ProcessInstance,
+    workitem: dict,
+    output: dict,
+    previous_outputs: Any,
+    all_workitem_input_data: Any,
+) -> dict:
+    variables_data = read_variables_data(getattr(process_instance, "variables_data", None))
+    forms_by_id = {}
+    forms_by_activity = {}
+
+    def absorb_form_data(container: Any) -> None:
+        if not isinstance(container, dict):
+            return
+        for key, value in container.items():
+            if isinstance(value, dict):
+                forms_by_id.setdefault(key, value)
+
+    absorb_form_data(workitem.get("output"))
+    absorb_form_data(previous_outputs)
+    absorb_form_data(all_workitem_input_data)
+
+    if isinstance(all_workitem_input_data, dict):
+        for activity_id, value in all_workitem_input_data.items():
+            if isinstance(value, dict):
+                forms_by_activity[activity_id] = value
+
+    return {
+        "forms": {
+            "current": output or {},
+            "byId": forms_by_id,
+            "byActivity": forms_by_activity,
+        },
+        "payload": {
+            "request": {
+                "workitem": workitem,
+            },
+            "response": {},
+        },
+        "workitem": {
+            "id": workitem.get("id"),
+            "activityId": workitem.get("activity_id"),
+            "output": workitem.get("output") or {},
+        },
+        "instance": {
+            "id": process_instance.proc_inst_id,
+            "variablesData": variables_data,
+            "roleBindings": getattr(process_instance, "role_bindings", None) or [],
+            "participants": getattr(process_instance, "participants", None) or [],
+        },
+    }
+
+
+def _apply_activity_mappers(
+    process_instance: ProcessInstance,
+    activity: Any,
+    workitem: dict,
+    output: dict,
+    previous_outputs: Any,
+    all_workitem_input_data: Any,
+    form_id: Optional[str] = None,
+) -> dict:
+    mapping_contexts = collect_mapping_contexts(activity)
+    if not mapping_contexts:
+        return {"trace": [], "errors": [], "form_values": {}, "mapped": {}, "variables_data": {}, "role_bindings": []}
+
+    aggregate = {"trace": [], "errors": [], "form_values": {}, "mapped": {}, "variables_data": {}, "role_bindings": []}
+    source_context = _build_mapper_source_context(process_instance, workitem, output, previous_outputs, all_workitem_input_data)
+
+    for mapping_context in mapping_contexts:
+        result = evaluate_mapping_context(mapping_context, source_context, default_form_id=form_id)
+        aggregate["trace"].extend(result.get("trace") or [])
+        aggregate["errors"].extend(result.get("errors") or [])
+        aggregate["mapped"].update(result.get("mapped") or {})
+        aggregate["variables_data"].update(result.get("variables_data") or {})
+        aggregate["role_bindings"].extend(result.get("role_bindings") or [])
+        aggregate["form_values"] = merge_form_values(aggregate.get("form_values") or {}, result)
+
+        apply_mapping_result_to_instance(process_instance, result)
+        if result.get("role_bindings"):
+            workitem["assignees"] = merge_role_bindings(workitem.get("assignees") or [], result["role_bindings"])
+        source_context["instance"]["variablesData"] = read_variables_data(getattr(process_instance, "variables_data", None))
+        source_context["instance"]["roleBindings"] = getattr(process_instance, "role_bindings", None) or []
+
+    if isinstance(workitem.get("output"), dict):
+        workitem["output"] = merge_form_values(workitem.get("output") or {}, aggregate)
+        workitem["output"]["__mapped"] = {
+            **(workitem["output"].get("__mapped") or {}),
+            **aggregate["mapped"],
+        }
+        workitem["output"]["__mappedTrace"] = aggregate["trace"]
+
+    return aggregate
+
+def _merge_mapper_result_into_condition_context(
+    all_workitem_input_data: Any,
+    activity_id: Optional[str],
+    form_id: Optional[str],
+    mapper_result: dict,
+) -> Any:
+    if not isinstance(all_workitem_input_data, dict):
+        return all_workitem_input_data
+
+    form_values = mapper_result.get("form_values") or {}
+    if form_id and isinstance(form_values.get(form_id), dict):
+        current_form_values = form_values[form_id]
+        all_workitem_input_data[form_id] = {
+            **(all_workitem_input_data.get(form_id) if isinstance(all_workitem_input_data.get(form_id), dict) else {}),
+            **current_form_values,
+        }
+        if activity_id:
+            all_workitem_input_data[activity_id] = {
+                **(all_workitem_input_data.get(activity_id) if isinstance(all_workitem_input_data.get(activity_id), dict) else {}),
+                form_id: current_form_values,
+            }
+
+    mapped_values = mapper_result.get("mapped") or {}
+    variable_values = mapper_result.get("variables_data") or {}
+    if mapped_values or variable_values:
+        all_workitem_input_data["__mapped"] = {
+            **(all_workitem_input_data.get("__mapped") if isinstance(all_workitem_input_data.get("__mapped"), dict) else {}),
+            **mapped_values,
+            **variable_values,
+        }
+
+    return all_workitem_input_data
+
 def _process_next_activities(process_instance: ProcessInstance, process_result: ProcessResult, 
                            process_result_json: dict, process_definition):
     """Process next activities"""
@@ -1003,8 +1147,11 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
         for spec in role_binding_specs or []:
             if not isinstance(spec, dict):
                 continue
-            source_role = spec.get("sourceRole") or spec.get("source") or spec.get("parentRole")
-            target_role = spec.get("targetRole") or spec.get("target") or spec.get("childRole")
+            direction = str(spec.get("direction") or "IN-OUT").strip().upper()
+            if direction not in ("IN", "IN-OUT", ">", "<>"):
+                continue
+            source_role = spec.get("sourceRole") or spec.get("source") or spec.get("parentRole") or (spec.get("role") or {}).get("name")
+            target_role = spec.get("targetRole") or spec.get("target") or spec.get("childRole") or spec.get("argument")
             if not source_role or not target_role:
                 continue
 
@@ -1018,6 +1165,43 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
 
         return mapped
 
+    def build_call_activity_source_context(process_instance, parent_reference_info):
+        variables_data = read_variables_data(getattr(process_instance, "variables_data", None))
+        forms_current = parent_reference_info if isinstance(parent_reference_info, dict) else {}
+        forms_by_id = {}
+        forms_by_activity = {}
+
+        if isinstance(parent_reference_info, dict):
+            for key, value in parent_reference_info.items():
+                if isinstance(value, dict):
+                    forms_by_id[key] = value
+                    forms_by_activity[key] = value
+
+        return {
+            "forms": {
+                "current": forms_current,
+                "byId": forms_by_id,
+                "byActivity": forms_by_activity,
+            },
+            "payload": {"request": {}, "response": {}},
+            "workitem": {},
+            "instance": {
+                "id": process_instance.proc_inst_id,
+                "variablesData": variables_data,
+                "roleBindings": getattr(process_instance, "role_bindings", None) or [],
+                "participants": getattr(process_instance, "participants", None) or [],
+            },
+        }
+
+    def evaluate_call_activity_mapper(call_props, process_instance, parent_reference_info):
+        mapper_in = call_props.get("mapperIn")
+        if not isinstance(mapper_in, dict) or not isinstance(mapper_in.get("mappingElements"), list):
+            return {"trace": [], "errors": [], "form_values": {}, "mapped": {}, "variables_data": {}, "role_bindings": []}
+        return evaluate_mapping_context(
+            mapper_in,
+            build_call_activity_source_context(process_instance, parent_reference_info),
+            default_form_id=None,
+        )
     def create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope, parent_reference_info=None):
         start_event = next((gw for gw in (child_def.gateways or []) if getattr(gw, 'type', None) == 'startEvent'), None)
         
@@ -1164,7 +1348,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
         if activity.type != "subProcess" and not is_adhoc and not is_call_activity:
             continue
         
-        if not is_adhoc:
+        if not is_adhoc and not is_call_activity:
             prev_activities = process_definition.find_immediate_prev_activities(activity.nextActivityId)
             for prev_activity in prev_activities:
                 for completed_activity in process_result.completedActivities:
@@ -1211,6 +1395,15 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
             else:
                 role_bindings = process_instance.role_bindings or []
 
+            call_mapper_result = evaluate_call_activity_mapper(call_props, process_instance, parent_reference_info)
+            if call_mapper_result.get("role_bindings"):
+                role_bindings = merge_role_bindings(role_bindings, call_mapper_result.get("role_bindings") or [])
+            if call_mapper_result.get("trace") or call_mapper_result.get("errors"):
+                process_result_json["callActivityMapperResults"] = {
+                    **(process_result_json.get("callActivityMapperResults") or {}),
+                    activity.nextActivityId: call_mapper_result,
+                }
+
             for next_activity_json in process_result_json.get("nextActivities", []):
                 if next_activity_json.get("nextActivityId") == activity.nextActivityId:
                     next_activity_json["result"] = "PENDING"
@@ -1231,6 +1424,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
 
             child_proc_def_id = child_def.processDefinitionId or f"{process_instance.process_definition.processDefinitionId}.{next_sub_process.id}"
             role_bindings = process_instance.role_bindings or []
+            call_mapper_result = {"trace": [], "errors": [], "form_values": {}, "mapped": {}, "variables_data": {}, "role_bindings": []}
 
         participants, last_endpoint = collect_participants(role_bindings)
         endpoint = last_endpoint if last_endpoint is not _SENTINEL else None
@@ -1286,6 +1480,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                     "participants": participants,
                     "status": "NEW",
                     "role_bindings": role_bindings,
+                    "variables_data": call_mapper_result.get("variables_data") if is_call_activity and isinstance(call_mapper_result, dict) else {},
                     "start_date": datetime.now().isoformat(),
                     "tenant_id": process_instance.tenant_id,
                     "parent_proc_inst_id": process_instance.proc_inst_id,
@@ -1552,6 +1747,10 @@ def execute_next_activity(process_result_json: dict, tenant_id: Optional[str] = 
         
         # Update process variables
         _update_process_variables(process_instance, process_result.fieldMappings)
+
+        mapper_results = process_result_json.get("mapperResults") or {}
+        if mapper_results:
+            apply_mapping_result_to_instance(process_instance, mapper_results)
         
         
         # Process next activities
@@ -1616,12 +1815,98 @@ def _progress_parent_if_all_children_completed(current_proc_inst_id: str, tenant
                 and str(getattr(activity, "type", "") or "").lower() == "callactivity"
             )
             if parent_def.find_sub_process_by_id(act_id) or is_call_activity:
+                if is_call_activity:
+                    _propagate_call_activity_roles_to_parent(parent_inst, activity, children, tenant_id)
                 workitem = fetch_workitem_by_proc_inst_and_activity(parent_id, act_id, tenant_id)
                 if workitem and getattr(workitem, "status", None) != "SUBMITTED":
                     upsert_workitem({"id": workitem.id, "status": "SUBMITTED"}, tenant_id)
                     print(f"[INFO] Parent({parent_id}) subprocess workitem {workitem.id} -> SUBMITTED")
     except Exception as e:
         print(f"[ERROR] Parent progression check failed for {current_proc_inst_id}: {e}")
+
+
+def _propagate_call_activity_roles_to_parent(
+    parent_inst: ProcessInstance,
+    call_activity: Any,
+    child_rows: List[Dict[str, Any]],
+    tenant_id: Optional[str] = None,
+) -> None:
+    try:
+        call_props = _parse_json_properties(getattr(call_activity, "properties", None))
+        role_binding_specs = call_props.get("roleBindings") or []
+        reverse_specs = [
+            spec for spec in role_binding_specs
+            if isinstance(spec, dict) and _role_binding_allows_out(spec.get("direction"))
+        ]
+        if not reverse_specs:
+            return
+
+        patch: List[Dict[str, Any]] = []
+        for child in child_rows or []:
+            child_bindings = child.get("role_bindings") or []
+            if isinstance(child_bindings, str):
+                try:
+                    child_bindings = json.loads(child_bindings)
+                except Exception:
+                    child_bindings = []
+            for spec in reverse_specs:
+                parent_role = _role_binding_parent_role(spec)
+                child_role = _role_binding_child_role(spec)
+                if not parent_role or not child_role:
+                    continue
+                for child_binding in child_bindings or []:
+                    if not isinstance(child_binding, dict) or child_binding.get("name") != child_role:
+                        continue
+                    cloned = dict(child_binding)
+                    cloned["name"] = parent_role
+                    patch.append(cloned)
+                    break
+
+        if not patch:
+            return
+
+        parent_inst.role_bindings = merge_role_bindings(getattr(parent_inst, "role_bindings", None) or [], patch)
+        upsert_process_instance(parent_inst, tenant_id, getattr(parent_inst, "process_definition", None))
+
+        workitem = fetch_workitem_by_proc_inst_and_activity(parent_inst.proc_inst_id, getattr(call_activity, "id", None), tenant_id)
+        if workitem:
+            merged_assignees = merge_role_bindings(getattr(workitem, "assignees", None) or [], patch)
+            upsert_workitem({"id": workitem.id, "assignees": merged_assignees}, tenant_id)
+        print(f"[INFO] Propagated CallActivity role bindings to parent({parent_inst.proc_inst_id}): {patch}")
+    except Exception as e:
+        print(f"[ERROR] Failed to propagate CallActivity role bindings to parent {getattr(parent_inst, 'proc_inst_id', None)}: {e}")
+
+
+def _parse_json_properties(raw_properties: Any) -> Dict[str, Any]:
+    if isinstance(raw_properties, dict):
+        return raw_properties
+    if isinstance(raw_properties, str) and raw_properties.strip():
+        try:
+            parsed = json.loads(raw_properties)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _role_binding_allows_out(direction: Any) -> bool:
+    normalized = str(direction or "IN-OUT").strip().upper()
+    return normalized in {"OUT", "IN-OUT", "<", "<>"}
+
+
+def _role_binding_parent_role(spec: Dict[str, Any]) -> Optional[str]:
+    role = spec.get("role")
+    if isinstance(role, dict):
+        role_name = role.get("name")
+    elif isinstance(role, str):
+        role_name = role
+    else:
+        role_name = None
+    return spec.get("sourceRole") or spec.get("source") or spec.get("parentRole") or role_name
+
+
+def _role_binding_child_role(spec: Dict[str, Any]) -> Optional[str]:
+    return spec.get("targetRole") or spec.get("target") or spec.get("childRole") or spec.get("argument")
 
 
 
@@ -1789,11 +2074,14 @@ def get_sequence_condition_data(process_definition: Any, current_activity_id: st
 
                 properties = getattr(seq, "properties", None)
                 if properties:
-                    try:
-                        properties_json = json.loads(properties)
-                        sequence_condition_data[seq.id] = properties_json
-                    except Exception:
-                        pass
+                    if isinstance(properties, dict):
+                        sequence_condition_data[seq.id] = properties
+                    else:
+                        try:
+                            properties_json = json.loads(properties)
+                            sequence_condition_data[seq.id] = properties_json
+                        except Exception:
+                            pass
         
                 if seq.name:
                     sequence_condition_data.setdefault(seq.id, {})["name"] = seq.name
@@ -4179,6 +4467,38 @@ async def handle_workitem(workitem):
         except Exception as e:
             print(f"[ERROR] Failed to get selected info for {workitem.get('id')}: {str(e)}")
 
+        current_activity_obj = process_definition.find_activity_by_id(activity_id) if process_definition else None
+        mapper_result = _apply_activity_mappers(
+            process_instance,
+            current_activity_obj,
+            workitem,
+            output,
+            workitem_input_data,
+            all_workitem_input_data,
+            _extract_form_id_from_workitem(workitem, ui_definition),
+        )
+        if mapper_result.get("trace") or mapper_result.get("errors"):
+            if isinstance(workitem.get("output"), dict):
+                upsert_workitem(
+                    {
+                        "id": workitem["id"],
+                        "output": workitem["output"],
+                    },
+                    tenant_id,
+                )
+            form_id_for_mapper = _extract_form_id_from_workitem(workitem, ui_definition)
+            if form_id_for_mapper and mapper_result.get("form_values", {}).get(form_id_for_mapper):
+                output = {
+                    **(output or {}),
+                    **mapper_result["form_values"][form_id_for_mapper],
+                }
+            all_workitem_input_data = _merge_mapper_result_into_condition_context(
+                all_workitem_input_data,
+                activity_id,
+                form_id_for_mapper,
+                mapper_result,
+            )
+
         sequence_condition_data = sequence_condition_data or {}
         await _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions, workitem=workitem)
 
@@ -4352,6 +4672,9 @@ async def handle_workitem(workitem):
                 all_workitem_input_data,
                 tenant_id
             )
+
+            if mapper_result.get("trace") or mapper_result.get("errors"):
+                completed_json["mapperResults"] = mapper_result
 
             try:
                 execute_next_activity(completed_json, tenant_id)
@@ -4816,4 +5139,8 @@ def get_all_input_data(workitem: dict, process_definition: Any) -> Dict[str, Any
     except Exception as e:
         print(f"[ERROR] Failed to get all input data for {workitem.get('id')}: {str(e)}")
         return {}
+
+
+
+
 
