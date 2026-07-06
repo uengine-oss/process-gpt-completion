@@ -247,6 +247,11 @@ def _resolve_source(path: Any, context: Dict[str, Any]) -> Tuple[Any, str]:
                 value = _read_path(root.get("byId"), remainder)
             return value, normalized
 
+    for form_root in ("parentForm.", "childForm."):
+        if normalized.startswith(form_root):
+            remainder = normalized[len(form_root) :]
+            return _read_path(_get_path(context, "forms.byId"), remainder), normalized
+
     if normalized.startswith("[variables]."):
         return _read_path(_get_path(context, "instance.variablesData"), normalized[len("[variables].") :]), normalized
     if normalized.startswith("[Variables]."):
@@ -352,6 +357,17 @@ def _apply_target(result: Dict[str, Any], target: str, value: Any, default_form_
             result["form_values"].setdefault(form_id, {})
             _write_path(result["form_values"][form_id], field, value)
             return f"forms.{form_id}"
+
+    for form_root in ("parentForm.", "childForm."):
+        if target.startswith(form_root):
+            parts = target[len(form_root) :].split(".")
+            if len(parts) >= 2:
+                form_id = parts[0]
+                field = ".".join(parts[1:])
+                result["form_values"].setdefault(form_id, {})
+                _write_path(result["form_values"][form_id], field, value)
+                result["mapped"][f"{form_root}{form_id}.{field}"] = value
+                return f"{form_root}{form_id}"
 
     if target.startswith("callActivity.variables."):
         field = target[len("callActivity.variables.") :]

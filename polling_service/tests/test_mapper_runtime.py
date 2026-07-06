@@ -425,3 +425,43 @@ def test_call_activity_lane_endpoint_target_writes_child_role_binding():
     assert result["role_bindings"] == [{"name": "보안심사자", "endpoint": "security-reviewer@example.com"}]
     assert result["trace"][0]["scope"] == "role_bindings"
 
+
+def test_call_activity_parent_form_maps_to_child_form_values():
+    result = evaluate_mapping_context(
+        {
+            "mappingElements": [
+                {
+                    "argument": {"text": "childForm.vendor_security_form.assessmentSummary"},
+                    "direction": "out",
+                    "variable": {"name": "parentForm.vendor_onboarding_form.supplierName"},
+                },
+                {
+                    "argument": {"text": "childForm.vendor_security_form.criticalFinding"},
+                    "direction": "out",
+                    "variable": {"name": "parentForm.vendor_onboarding_form.contractValue"},
+                },
+            ]
+        },
+        {
+            "forms": {
+                "current": {},
+                "byId": {
+                    "vendor_onboarding_form": {
+                        "supplierName": "ACME Partners",
+                        "contractValue": "5000000",
+                    }
+                },
+                "byActivity": {},
+            },
+            "instance": {"variablesData": {}},
+        },
+    )
+
+    assert result["form_values"] == {
+        "vendor_security_form": {
+            "assessmentSummary": "ACME Partners",
+            "criticalFinding": "5000000",
+        }
+    }
+    assert result["trace"][0]["scope"] == "childForm.vendor_security_form"
+
