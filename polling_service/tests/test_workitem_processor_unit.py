@@ -699,6 +699,172 @@ def test_call_activity_out_role_binding_propagates_child_role_to_parent(wiproc, 
     assert {"id": "wi-call", "status": "SUBMITTED"} in upserted_workitems
 
 
+def test_call_activity_parent_form_mapping_prefills_child_initial_workitem(wiproc, monkeypatch):
+    call_activity = _Activity("Call_review", name="Security review", type="callActivity")
+    call_activity.properties = json.dumps({
+        "definitionId": "vendor-security-review",
+        "inheritParentReferenceInfo": True,
+        "mapperIn": {
+            "mappingElements": [
+                {
+                    "argument": {"text": "childForm.vendor_security_form.assessmentSummary"},
+                    "direction": "out",
+                    "variable": {"name": "parentForm.vendor_onboarding_form.supplierName"},
+                    "isKey": False,
+                },
+                {
+                    "argument": {"text": "childForm.vendor_security_form.criticalFinding"},
+                    "direction": "out",
+                    "variable": {"name": "parentForm.vendor_onboarding_form.contractValue"},
+                    "isKey": False,
+                },
+            ]
+        },
+    })
+    parent_def = _ProcDef(activities=[call_activity])
+    parent_inst = types.SimpleNamespace(
+        proc_inst_id="parent-1",
+        proc_def_id="vendor-onboarding",
+        root_proc_inst_id="parent-1",
+        role_bindings=[{"name": "securityReviewer", "endpoint": "reviewer@example.com"}],
+        participants=[],
+        variables_data={},
+        current_activity_ids=[],
+        tenant_id="localhost",
+        process_definition=parent_def,
+    )
+    process_result = types.SimpleNamespace(
+        nextActivities=[types.SimpleNamespace(nextActivityId="Call_review", nextActivityName="Security review", type="callActivity", result=None)],
+        completedActivities=[],
+    )
+    process_result_json = {"nextActivities": [{"nextActivityId": "Call_review"}]}
+    child_initial_activity = types.SimpleNamespace(
+        id="AssessRisk",
+        name="Assess Risk",
+        duration=None,
+        tool="formHandler:vendor_security_form",
+        description="",
+    )
+    child_def = types.SimpleNamespace(
+        processDefinitionId="vendor-security-review",
+        gateways=[],
+        activities=[child_initial_activity],
+        find_initial_activity=lambda: child_initial_activity,
+    )
+    inserted_instances = []
+    upserted_workitems = []
+
+    monkeypatch.setattr(wiproc, "fetch_process_definition_by_version", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(wiproc, "load_process_definition", lambda *_args, **_kwargs: child_def)
+    monkeypatch.setattr(wiproc, "fetch_workitem_by_proc_inst_and_activity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(wiproc, "insert_process_instance", lambda data, tenant_id=None: inserted_instances.append(data))
+    monkeypatch.setattr(wiproc, "upsert_workitem", lambda data, tenant_id=None: upserted_workitems.append(data))
+    monkeypatch.setattr(
+        wiproc,
+        "_get_immediate_prev_activity_form_data",
+        lambda *_args, **_kwargs: {
+            "vendor_onboarding_form": {
+                "supplierName": "ACME Partners",
+                "contractValue": "5000000",
+            }
+        },
+    )
+
+    wiproc._process_sub_processes(parent_inst, process_result, process_result_json, parent_def)
+
+    child_instances = [item for item in inserted_instances if item["proc_def_id"] == "vendor-security-review"]
+    assert len(child_instances) == 1
+    assert child_instances[0]["variables_data"] == {}
+
+    child_workitems = [item for item in upserted_workitems if item.get("proc_inst_id") == child_instances[0]["proc_inst_id"]]
+    assert len(child_workitems) == 1
+    assert child_workitems[0]["tool"] == "formHandler:vendor_security_form"
+    assert child_workitems[0]["output"]["vendor_security_form"] == {
+        "assessmentSummary": "ACME Partners",
+        "criticalFinding": "5000000",
+    }
+    assert child_workitems[0]["output"]["__mapped"]["childForm.vendor_security_form.assessmentSummary"] == "ACME Partners"
+
+
+@pytest.mark.asyncio
+async def test_child_workitem_mapped_form_output_is_used_in_ai_prompt(wiproc, monkeypatch):
+    activity = _Activity("AssessRisk", name="Assess Risk", role="securityReviewer")
+    activity.duration = None
+    activity.tool = "formHandler:vendor_security_form"
+    activity.inputData = []
+    activity.checkpoints = []
+    proc_def = _ProcDef(activities=[activity], gateways=[], sequences=[], sub_processes=[])
+    proc_def.find_next_activities = lambda *_args, **_kwargs: []
+    proc_def.find_near_next_activities = lambda *_args, **_kwargs: []
+    proc_def.find_target_containers = lambda *_args, **_kwargs: []
+    proc_def.find_block = lambda *_args, **_kwargs: None
+    proc_def.subProcesses = []
+    proc_inst = types.SimpleNamespace(
+        proc_inst_id="child-1",
+        proc_inst_name="Child review",
+        proc_def_version=None,
+    )
+    workitem = {
+        "id": "wi-child-1",
+        "activity_id": "AssessRisk",
+        "activity_name": "Assess Risk",
+        "proc_def_id": "vendor-security-review",
+        "proc_inst_id": "child-1",
+        "tenant_id": "localhost",
+        "user_id": "reviewer@example.com",
+        "assignees": [{"name": "securityReviewer", "endpoint": "reviewer@example.com"}],
+        "retry": 0,
+        "output": {
+            "vendor_security_form": {
+                "assessmentSummary": "ACME Partners",
+                "criticalFinding": "5000000",
+            },
+            "__mapped": {
+                "childForm.vendor_security_form.assessmentSummary": "ACME Partners",
+            },
+        },
+    }
+    captured = {}
+
+    monkeypatch.setattr(wiproc, "get_workitem_position", lambda *_args, **_kwargs: (False, False))
+    monkeypatch.setattr(wiproc, "fetch_process_instance", lambda *_args, **_kwargs: proc_inst)
+    monkeypatch.setattr(
+        wiproc,
+        "fetch_process_definition_by_version",
+        lambda *_args, **_kwargs: {
+            "processDefinitionName": "Vendor Security Review",
+            "gateways": [],
+            "events": [],
+            "instanceNamePattern": "",
+        },
+    )
+    monkeypatch.setattr(wiproc, "load_process_definition", lambda *_args, **_kwargs: proc_def)
+    monkeypatch.setattr(wiproc, "fetch_assignee_info", lambda email: {"name": "Reviewer", "email": email, "type": "user", "info": {}})
+    monkeypatch.setattr(wiproc, "fetch_ui_definition_by_activity_id", lambda *_args, **_kwargs: types.SimpleNamespace(id="vendor_security_form"))
+    monkeypatch.setattr(wiproc, "fetch_ui_definitions_by_def_id", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(wiproc, "get_input_data", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(wiproc, "get_all_input_data", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(wiproc, "_apply_activity_mappers", lambda *_args, **_kwargs: {"trace": [], "errors": [], "form_values": {}, "mapped": {}, "variables_data": {}, "role_bindings": []})
+    async def fake_evaluate_sequence_conditions(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(wiproc, "_evaluate_sequence_conditions", fake_evaluate_sequence_conditions)
+    monkeypatch.setattr(wiproc, "run_completed_determination", lambda completed_json, chain_input: completed_json)
+
+    async def fake_run_prompt_and_parse(_prompt_tmpl, chain_input, *_args, **_kwargs):
+        captured["completed_output"] = chain_input["output"]
+        return {"completedActivities": []}, ""
+
+    monkeypatch.setattr(wiproc, "run_prompt_and_parse", fake_run_prompt_and_parse)
+
+    await wiproc.handle_workitem(workitem)
+
+    assert captured["completed_output"] == {
+        "assessmentSummary": "ACME Partners",
+        "criticalFinding": "5000000",
+    }
+
+
 def test_iter_reference_scalars_extractor_cycle_raises_recursion(wiproc):
     cyc = {}
     cyc["self"] = cyc  # pure cycle with no scalars to satisfy limit -> unbounded recursion

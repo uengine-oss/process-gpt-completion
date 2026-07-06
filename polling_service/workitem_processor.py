@@ -1202,7 +1202,20 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
             build_call_activity_source_context(process_instance, parent_reference_info),
             default_form_id=None,
         )
-    def create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope, parent_reference_info=None):
+
+    def build_initial_output(mapper_result):
+        if not isinstance(mapper_result, dict):
+            return {}
+        output = merge_form_values({}, mapper_result)
+        mapped = mapper_result.get("mapped") or {}
+        trace = mapper_result.get("trace") or []
+        if mapped:
+            output["__mapped"] = mapped
+        if trace:
+            output["__mappedTrace"] = trace
+        return output
+
+    def create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope, parent_reference_info=None, mapper_result=None):
         start_event = next((gw for gw in (child_def.gateways or []) if getattr(gw, 'type', None) == 'startEvent'), None)
         
         root_proc_inst_id = process_instance.root_proc_inst_id
@@ -1226,7 +1239,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                 "reference_ids": [],
                 "duration": None,
                 "tool": None,
-                "output": {},
+                "output": build_initial_output(mapper_result),
                 "retry": 0,
                 "consumer": None,
                 "description": start_event.description or '',
@@ -1265,7 +1278,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                 "reference_ids": [],
                 "duration": initial_act.duration,
                 "tool": initial_act.tool,
-                "output": {},
+                "output": build_initial_output(mapper_result),
                 "retry": 0,
                 "consumer": None,
                 "description": initial_act.description,
@@ -1535,7 +1548,17 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                     
                     create_adhoc_workitems(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope)
                 else:
-                    create_initial_workitem(child_def, child_proc_inst_id, child_proc_def_id, role_bindings, endpoint, process_instance, execution_scope, parent_reference_info if is_call_activity else None)
+                    create_initial_workitem(
+                        child_def,
+                        child_proc_inst_id,
+                        child_proc_def_id,
+                        role_bindings,
+                        endpoint,
+                        process_instance,
+                        execution_scope,
+                        parent_reference_info if is_call_activity else None,
+                        call_mapper_result if is_call_activity else None,
+                    )
                 execution_scope += 1
             except Exception as e:
                 print(f"[ERROR] Failed to create workitems for child '{child_proc_inst_id}': {e}")
