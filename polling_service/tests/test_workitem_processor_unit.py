@@ -916,3 +916,108 @@ def test_instance_completes_when_no_active_activities_and_end_done():
 
     upsert_call_args = mock_supabase.table.return_value.upsert.call_args[0][0]
     assert upsert_call_args["status"] == "COMPLETED"
+
+
+class _FakeConditionModel:
+    """astream 으로 미리 정해진 JSON 텍스트를 흘려보내는 가짜 LLM."""
+
+    def __init__(self, payload):
+        self._text = json.dumps(payload, ensure_ascii=False)
+
+    async def astream(self, *_args, **_kwargs):
+        # content 속성을 가진 청크 하나로 흘려보낸다
+        class _Chunk:
+            def __init__(self, content):
+                self.content = content
+
+        yield _Chunk(self._text)
+
+
+@pytest.mark.asyncio
+async def test_nl_condition_applies_when_model_echoes_sequence_name(wiproc):
+    """LLM 이 sequenceId 대신 시퀀스 이름(예: '승인')을 돌려줘도 올바른 시퀀스에 반영되어야 한다.
+
+    회귀: 예전에는 정확한 문자열 일치만 하여, 이름/공백/대소문자가 다르면 모든 분기가
+    False 로 강제되고 Exclusive 게이트웨이의 next activity 가 사라졌다.
+    """
+    # A1 -> G1 -> (Flow_yes)"승인" B1, (Flow_no)"반려" B2
+    gw = _Gateway("G1", type="exclusiveGateway", name="XOR")
+    seqs = [
+        _Seq("s1", source="A1", target="G1"),
+        _Seq("Flow_yes", source="G1", target="B1", name="승인"),
+        _Seq("Flow_no", source="G1", target="B2", name="반려"),
+    ]
+    acts = [_Activity("A1"), _Activity("B1", name="승인 처리"), _Activity("B2", name="반려 처리")]
+    proc_def = _ProcDef(activities=acts, gateways=[gw], sequences=seqs)
+
+    sequence_condition_data = {
+        "Flow_yes": {"name": "승인"},
+        "Flow_no": {"name": "반려"},
+    }
+    nl_condition_sequences = [
+        ("Flow_yes", "승인", None),
+        ("Flow_no", "반려", None),
+    ]
+    # 모델은 올바르게 '승인' 을 선택했지만 sequenceId 자리에 '이름' 을 넣어 반환
+    model = _FakeConditionModel({
+        "results": [
+            {"sequenceId": "승인", "conditionMet": True},
+            {"sequenceId": "반려", "conditionMet": False},
+        ]
+    })
+
+    await wiproc._evaluate_nl_conditions(
+        model,
+        None,
+        {},
+        {},
+        nl_condition_sequences,
+        sequence_condition_data,
+        [],
+    )
+
+    assert sequence_condition_data["Flow_yes"]["conditionEval"] is True
+    assert sequence_condition_data["Flow_no"]["conditionEval"] is False
+
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def,
+        activity_id="A1",
+        workitem={"assignees": []},
+        sequence_condition_data=sequence_condition_data,
+    )
+    assert [p.get("nextActivityId") for p in payloads] == ["B1"]
+
+
+@pytest.mark.asyncio
+async def test_nl_condition_applies_with_whitespace_and_case_and_isMet_key(wiproc):
+    """공백/대소문자 차이가 있는 sequenceId 와 대체 verdict 키(isMet)도 인식해야 한다."""
+    gw = _Gateway("G1", type="exclusiveGateway")
+    seqs = [
+        _Seq("s1", source="A1", target="G1"),
+        _Seq("SeqA", source="G1", target="B1"),
+        _Seq("SeqB", source="G1", target="B2"),
+    ]
+    acts = [_Activity("A1"), _Activity("B1"), _Activity("B2")]
+    proc_def = _ProcDef(activities=acts, gateways=[gw], sequences=seqs)
+
+    sequence_condition_data = {"SeqA": {"condition": "x"}, "SeqB": {"condition": "y"}}
+    nl_condition_sequences = [("SeqA", "x", None), ("SeqB", "y", None)]
+    model = _FakeConditionModel({
+        "results": [
+            {"sequenceId": " seqa ", "isMet": True},   # 공백 + 소문자 + 대체 키
+            {"sequenceId": "SEQB", "isMet": False},
+        ]
+    })
+
+    await wiproc._evaluate_nl_conditions(
+        model, None, {}, {}, nl_condition_sequences, sequence_condition_data, [],
+    )
+
+    assert sequence_condition_data["SeqA"]["conditionEval"] is True
+    assert sequence_condition_data["SeqB"]["conditionEval"] is False
+
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="A1", workitem={"assignees": []},
+        sequence_condition_data=sequence_condition_data,
+    )
+    assert [p.get("nextActivityId") for p in payloads] == ["B1"]

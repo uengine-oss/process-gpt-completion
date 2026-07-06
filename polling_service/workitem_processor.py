@@ -1,4 +1,4 @@
-﻿from langchain.prompts import PromptTemplate
+from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain.output_parsers.json import SimpleJsonOutputParser
 from llm_factory import create_llm
@@ -2444,24 +2444,54 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
 
     results = []
     if isinstance(parsed_response, dict):
-        for key in ("results", "sequenceResults", "evaluations"):
+        for key in ("results", "sequenceResults", "evaluations", "decisions"):
             value = parsed_response.get(key)
             if isinstance(value, list):
                 results = value
                 break
 
+    # 모델이 sequenceId 를 정확히 그대로 돌려주지 않는 경우(공백/대소문자 차이,
+    # 또는 시퀀스 id 대신 조건 텍스트/시퀀스 이름을 반환)에도 올바른 판정이
+    # '실제' 시퀀스 id 에 매핑되도록 resolver 를 구성한다.
+    # (매핑 실패 시 아래 fallback 루프가 해당 시퀀스를 False 로 강제하여,
+    #  Exclusive 게이트웨이의 모든 분기가 False → next activity 미설정으로 이어짐)
+    def _norm_seq_key(v: Any) -> str:
+        return re.sub(r"\s+", " ", str(v)).strip().lower() if v is not None else ""
+
+    id_resolver: dict[str, str] = {}
+    valid_seq_ids: set[str] = set()
+    for tup in nl_condition_sequences:
+        if not isinstance(tup, (list, tuple)) or not tup:
+            continue
+        real_id = tup[0]
+        cond_text = tup[1] if len(tup) > 1 else None
+        if not real_id:
+            continue
+        valid_seq_ids.add(real_id)
+        id_resolver.setdefault(_norm_seq_key(real_id), real_id)
+        if cond_text:
+            id_resolver.setdefault(_norm_seq_key(cond_text), real_id)
+
+    def _resolve_seq_id(raw: Any) -> Optional[str]:
+        if raw is None:
+            return None
+        if raw in valid_seq_ids:
+            return raw
+        return id_resolver.get(_norm_seq_key(raw))
+
     updated_ids: set[str] = set()
     for item in results:
         if not isinstance(item, dict):
             continue
-        seq_id = item.get("sequenceId") or item.get("sequence_id")
+        raw_seq_id = item.get("sequenceId") or item.get("sequence_id") or item.get("id")
+        seq_id = _resolve_seq_id(raw_seq_id)
         if not seq_id:
             continue
-        condition_met = item.get("conditionMet")
-        if condition_met is None:
-            condition_met = item.get("met")
-        if condition_met is None:
-            condition_met = item.get("result")
+        condition_met = None
+        for verdict_key in ("conditionMet", "met", "result", "isMet", "value", "satisfied"):
+            if item.get(verdict_key) is not None:
+                condition_met = item.get(verdict_key)
+                break
         _set_condition_eval(sequence_condition_data, seq_id, condition_met, item.get("reason"))
         updated_ids.add(seq_id)
 

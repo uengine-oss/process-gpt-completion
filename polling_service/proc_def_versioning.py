@@ -133,7 +133,24 @@ def fetch_process_definition_by_version_ts_style(
         except Exception:
             pass
 
-    # 1) prod_version 우선
+    # ------------------------------------------------------------------
+    # 명시적 버전 핀(arcv_id / version_tag+version)이 없을 때의 기본 동작
+    #
+    # [중요] 과거에는 prod_version → 최신 major → 최신 minor → proc_def.definition
+    # 순으로 선택했는데, 이 경우 "현재 작업본(proc_def.definition)보다 오래된
+    # 발행 버전"이 우선 선택되어, 이미 삭제된 옛 액티비티가 예정업무(todolist)에
+    # 되살아나는 회귀가 발생했다. (커밋 686c942 "fix minor major version")
+    #
+    # 명시적 핀이 없다면 실행/조회 대상은 '현재 최신 작업본'이어야 하므로
+    # proc_def.definition 을 최우선으로 반환한다. (686c942 이전 동작 복원)
+    # 특정 발행 버전으로 고정 실행하려면 호출부에서 arcv_id 또는
+    # version_tag+version 을 명시적으로 넘겨야 한다.
+    # ------------------------------------------------------------------
+    if proc_def_definition:
+        return inject_meta(proc_def_definition, version, version_tag or "minor")
+
+    # 안전망: proc_def.definition 이 비어 있는 예외적 상황에서만
+    # 발행 버전(prod_version → 최신 major → 최신 minor)으로 폴백한다.
     prod_version = None
     if isinstance(proc_def_row, dict):
         prod_version = proc_def_row.get("prod_version") or proc_def_row.get("prodVersion")
@@ -167,7 +184,6 @@ def fetch_process_definition_by_version_ts_style(
         except Exception:
             pass
 
-    # 2) 최신 major
     latest_major = fetch_latest_process_definition_version_by_tag(supabase, def_id, "major", tenant_id)
     if latest_major:
         return inject_meta(
@@ -176,7 +192,6 @@ def fetch_process_definition_by_version_ts_style(
             latest_major.get("version_tag") or "major",
         )
 
-    # 3) 최신 minor
     latest_minor = fetch_latest_process_definition_version_by_tag(supabase, def_id, "minor", tenant_id)
     if latest_minor:
         return inject_meta(
@@ -185,6 +200,5 @@ def fetch_process_definition_by_version_ts_style(
             latest_minor.get("version_tag") or "minor",
         )
 
-    # 4) proc_def 현재 정의
     return inject_meta(proc_def_definition, version, version_tag or "minor")
 
