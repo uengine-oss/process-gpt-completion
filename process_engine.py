@@ -725,7 +725,7 @@ async def handle_get_feedback_diff(request: Request):
         gateways = []
         sequences = []
         next_item = process_definition.find_next_item(activity_id)
-        if 'Task' not in next_item.type:
+        if next_item and 'Task' not in next_item.type:
             gateways.append(next_item.model_dump())
             # 게이트웨이를 소스로 하는 시퀀스 중에서 액티비티를 타겟으로 하는 시퀀스만 필터링
             gateway_sequences = process_definition.find_sequences(next_item.id, None)
@@ -733,7 +733,7 @@ async def handle_get_feedback_diff(request: Request):
                 # 타겟이 액티비티인 시퀀스만 포함
                 if process_definition.find_activity_by_id(seq.target):
                     sequences.append(seq.model_dump())
-        else:
+        elif next_item:
             activities.append(next_item.model_dump())
         # 액티비티를 소스로 하는 시퀀스 중에서도 타겟이 액티비티인 시퀀스 포함
         activity_sequences = process_definition.find_sequences(activity_id, None)
