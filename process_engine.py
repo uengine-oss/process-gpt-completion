@@ -5,7 +5,7 @@ from llm_factory import create_llm
 from datetime import datetime, timedelta
 
 from database import fetch_process_definition_by_version, fetch_organization_chart, upsert_workitem, fetch_workitem_by_proc_inst_and_activity, insert_process_instance, fetch_workitem_by_id, upsert_process_definition, fetch_assignee_info, upsert_process_instance_source, fetch_process_instance
-from process_definition import load_process_definition
+from process_definition import load_process_definition, convert_definition_to_raw_json
 from compensation_handler import generate_compensation
 
 import traceback
@@ -586,98 +586,23 @@ async def handle_get_feedback(request: Request):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 diff_prompt = PromptTemplate.from_template("""
-Please analyze the activity and feedback to provide a detailed comparison of the modifiable properties.
+Please analyze the full process definition and feedback to produce an updated version of the process definition.
 
-Activities: {activities}
-Gateways: {gateways}
-Sequences: {sequences}
+Process Definition (raw JSON, schema: processDefinitionName/processDefinitionId/description/isHorizontal/data/roles/elements/subProcesses,
+where each item in `elements` is discriminated by `elementType`: "Event", "Sequence", "Activity", or "Gateway"): {process_definition_json}
 Feedback: {feedback}
 Feedback Result: {feedback_result}
 
-IMPORTANT RULES FOR conditionExamples:
-- The sequenceId must be a sequence where the target is one of the activities (from the Activities list)
-- The source can be a gateway (from the Gateways list) or an activity (from the Activities list)
-- Do NOT use sequences where:
-  * The target is an endEvent
-  * The target is not an activity
+Apply the feedback to the process definition as a whole - the feedback may imply changes to a single activity,
+or to multiple activities, roles, data, gateways, or sequences across the process. Only change what the feedback
+implies; leave everything else exactly as given.
 
-Based on the feedback, provide the before and after values for the following modifiable properties:
-- inputData: Data fields that the activity receives as input
-- checkpoints: Verification points that need to be completed
-- description: Description of what the activity does
-- instruction: Instructions for completing the activity
-- conditionExamples: Condition examples of the sequence that connects to an activity (as target). The sequenceId must be from the Sequences list where the target is an activity ID. The source can be a gateway ID or an activity ID.
+Preserve the exact JSON schema of the input (same top-level keys, same `elements` shape with `elementType`,
+same `subProcesses`/`children` structure). Do not add, rename, or remove keys beyond what feedback requires.
 
 Output format (must be wrapped in ```json and ``` markers. Do not include any other text):
 {{
-    "modifications": {{
-        "inputData": {{
-            "before": [
-                {{
-                    "key": "input data field key",
-                    "name": "input data field name (Korean)"
-                }}
-            ],
-            "after": [
-                {{
-                    "key": "input data field key",
-                    "name": "input data field name (Korean)"
-                }}
-            ],
-            "changed": true/false
-        }},
-        "checkpoints": {{
-            "before": ["original checkpoints"],
-            "after": ["modified checkpoints"],
-            "changed": true/false
-        }},
-        "description": {{
-            "before": "original description",
-            "after": "modified description",
-            "changed": true/false
-        }},
-        "instruction": {{
-            "before": "original instruction",
-            "after": "modified instruction",
-            "changed": true/false
-        }},
-        "conditionExamples": {{
-            "sequenceId": "sequence id where target is an activity (source can be a gateway or activity, but target must be an activity, NOT endEvent)",
-            "before": {{
-                "good_example": [
-                    {{
-                        "given": "original given value in the sequence condition good_example",
-                        "when": "original when value in the sequence condition good_example",
-                        "then": "original then value in the sequence condition good_example"
-                    }}
-                ],
-                "bad_example": [
-                    {{
-                        "given": "original given value in the sequence condition bad_example",
-                        "when": "original when value in the sequence condition bad_example",
-                        "then": "original then value in the sequence condition bad_example"
-                    }}
-                ]
-            }},
-            "after": {{
-                "good_example": [
-                    {{
-                        "given": "modified given value in the sequence condition good_example",
-                        "when": "modified when value in the sequence condition good_example",
-                        "then": "modified then value in the sequence condition good_example"
-                    }}
-                ],
-                "bad_example": [
-                    {{
-                        "given": "modified given value in the sequence condition bad_example",
-                        "when": "modified when value in the sequence condition bad_example",
-                        "then": "modified then value in the sequence condition bad_example"
-                    }}
-                ]
-            }},
-            "changed": true/false
-        }}
-    }},
+    "jsonModel": <the full process definition JSON, in the same schema as the input, with feedback applied>,
     "summary": "Brief summary of the key changes made based on feedback"
 }}
 """
@@ -715,37 +640,16 @@ async def handle_get_feedback_diff(request: Request):
             arcv_id,
         )
         process_definition = load_process_definition(process_definition_json)
-        
+
         activity_id = workitem.activity_id
         activity = process_definition.find_activity_by_id(activity_id)
         if activity is None:
             raise HTTPException(status_code=400, detail="No activity found")
-        
-        activities = [ activity.model_dump() ]
-        gateways = []
-        sequences = []
-        next_item = process_definition.find_next_item(activity_id)
-        if next_item and 'Task' not in next_item.type:
-            gateways.append(next_item.model_dump())
-            # 게이트웨이를 소스로 하는 시퀀스 중에서 액티비티를 타겟으로 하는 시퀀스만 필터링
-            gateway_sequences = process_definition.find_sequences(next_item.id, None)
-            for seq in gateway_sequences:
-                # 타겟이 액티비티인 시퀀스만 포함
-                if process_definition.find_activity_by_id(seq.target):
-                    sequences.append(seq.model_dump())
-        elif next_item:
-            activities.append(next_item.model_dump())
-        # 액티비티를 소스로 하는 시퀀스 중에서도 타겟이 액티비티인 시퀀스 포함
-        activity_sequences = process_definition.find_sequences(activity_id, None)
-        for seq in activity_sequences:
-            # 타겟이 액티비티인 시퀀스만 포함 (종료 이벤트 등은 제외)
-            if process_definition.find_activity_by_id(seq.target):
-                sequences.append(seq.model_dump())
+
+        raw_process_definition_json = convert_definition_to_raw_json(process_definition)
 
         chain_input = {
-            "activities": activities,
-            "gateways": gateways,
-            "sequences": sequences,
+            "process_definition_json": json.dumps(raw_process_definition_json, ensure_ascii=False),
             "feedback": workitem.temp_feedback,
             "feedback_result": workitem.log
         }
