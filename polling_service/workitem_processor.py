@@ -1,4 +1,4 @@
-from langchain.prompts import PromptTemplate
+﻿from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain.output_parsers.json import SimpleJsonOutputParser
 from llm_factory import create_llm
@@ -1617,6 +1617,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                         "assignees": role_bindings,
                         "tenant_id": process_instance.tenant_id,
                         "root_proc_inst_id": process_instance.proc_inst_id,
+                        "tool": next_sub_process.tool or 'formHandler:defaultForm',
                         "adhoc": False,
                         "description": next_sub_process.description,
                         "query": adhoc_query,

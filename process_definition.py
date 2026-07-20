@@ -431,6 +431,154 @@ def load_process_definition(definition_json: dict) -> ProcessDefinition:
             
     return process_def
 
+
+# Stored gateway.type for events has been seen as both "startEvent"/"endEvent"
+# (lowercase-first, e.g. tests/test.json) and "StartEvent"/"EndEvent" (schema example);
+# match case-insensitively and normalize output to the schema's casing.
+_EVENT_GATEWAY_TYPE_NAMES = {"startevent": "StartEvent", "endevent": "EndEvent"}
+
+
+def _normalized_event_type(gateway_type: Optional[str]) -> Optional[str]:
+    if not gateway_type:
+        return None
+    return _EVENT_GATEWAY_TYPE_NAMES.get(gateway_type.lower())
+
+
+def _raw_activity_element(activity: ProcessActivity) -> dict:
+    return {
+        "elementType": "Activity",
+        "id": activity.id,
+        "name": activity.name,
+        "type": activity.type,
+        "source": activity.srcTrg or "",
+        "description": activity.description,
+        "instruction": activity.instruction,
+        "role": activity.role,
+        "skills": [],
+        "tool": activity.tool,
+        "agent": activity.agent,
+        "agentMode": activity.agentMode,
+        "orchestration": activity.orchestration,
+        "inputData": activity.inputData or [],
+        "outputData": activity.outputData or [],
+        "checkpoints": activity.checkpoints or [],
+        "duration": str(activity.duration) if activity.duration is not None else None,
+    }
+
+
+def _raw_sequence_element(sequence: ProcessSequence) -> dict:
+    element = {
+        "elementType": "Sequence",
+        "id": sequence.id,
+        "source": sequence.source,
+        "target": sequence.target,
+    }
+    if sequence.name is not None:
+        element["name"] = sequence.name
+    if sequence.condition is not None:
+        element["condition"] = sequence.condition
+    return element
+
+
+def _raw_gateway_or_event_element(gateway: ProcessGateway) -> dict:
+    normalized_type = _normalized_event_type(gateway.type)
+    if normalized_type:
+        return {
+            "elementType": "Event",
+            "id": gateway.id,
+            "name": gateway.name,
+            "role": gateway.role,
+            "source": gateway.srcTrg or "",
+            "type": normalized_type,
+            "description": gateway.description,
+        }
+    return {
+        "elementType": "Gateway",
+        "id": gateway.id,
+        "name": gateway.name,
+        "role": gateway.role,
+        "source": gateway.srcTrg or "",
+        "type": gateway.type,
+        "description": gateway.description,
+        "conditionData": gateway.conditionData or [],
+    }
+
+
+def _raw_role(role: ProcessRole) -> dict:
+    # `origin` has no equivalent stored field on ProcessRole
+    return {
+        "name": role.name,
+        "endpoint": role.endpoint,
+        "resolutionRule": role.resolutionRule,
+        "origin": None,
+    }
+
+
+def _raw_data(data: ProcessData) -> dict:
+    return {
+        "name": data.name,
+        "description": data.description,
+        "type": data.type,
+    }
+
+
+def _raw_elements(process_definition: "ProcessDefinition") -> List[dict]:
+    elements = [_raw_activity_element(a) for a in (process_definition.activities or [])]
+    elements += [_raw_sequence_element(s) for s in (process_definition.sequences or [])]
+    elements += [_raw_gateway_or_event_element(g) for g in (process_definition.gateways or [])]
+    return elements
+
+
+def _raw_subprocess(sub_process: SubProcess) -> dict:
+    children = sub_process.children
+    raw_subprocess = {
+        "id": sub_process.id,
+        "name": sub_process.name,
+        "role": sub_process.role,
+        "type": sub_process.type,
+        "process": children.processDefinitionId if children else None,
+        "duration": str(sub_process.duration) if sub_process.duration is not None else None,
+        "properties": sub_process.properties,
+        "attachedEvents": sub_process.attachedEvents or [],
+        "processDefinitionId": children.processDefinitionId if children else None,
+        "processDefinitionName": children.processDefinitionName if children else None,
+        "children": None,
+    }
+    if children:
+        non_event_gateways = [g for g in (children.gateways or []) if not _normalized_event_type(g.type)]
+        raw_subprocess["children"] = {
+            "data": [_raw_data(d) for d in (children.data or [])],
+            "roles": [_raw_role(r) for r in (children.roles or [])],
+            # `ProcessDefinition` has no `events` field, so nested events can't be recovered
+            "events": [],
+            "gateways": [_raw_gateway_or_event_element(g) for g in non_event_gateways],
+            "sequences": [_raw_sequence_element(s) for s in (children.sequences or [])],
+            "activities": [_raw_activity_element(a) for a in (children.activities or [])],
+            "subProcesses": [_raw_subprocess(sp) for sp in (children.subProcesses or [])],
+        }
+    return raw_subprocess
+
+
+def convert_definition_to_raw_json(process_definition: "ProcessDefinition") -> dict:
+    """
+    Converts the stored ProcessDefinition shape into the raw process definition JSON
+    shape (see process-definition.schema.json): a flat `elements` array discriminated
+    by `elementType`, used as LLM input/output for the feedback-diff endpoint.
+    `isHorizontal`, `Activity.skills`, and `Role.origin` have no equivalent stored
+    field and are always emitted as a default/empty.
+    """
+    return {
+        "processDefinitionName": process_definition.processDefinitionName,
+        "processDefinitionId": process_definition.processDefinitionId,
+        "description": process_definition.description,
+        "isHorizontal": True,
+        "data": [_raw_data(d) for d in (process_definition.data or [])],
+        "roles": [_raw_role(r) for r in (process_definition.roles or [])],
+        "elements": _raw_elements(process_definition),
+        "subProcesses": [_raw_subprocess(sp) for sp in (process_definition.subProcesses or [])],
+    }
+
+
 # Example usage
 if __name__ == "__main__":
     json_str = '{"processDefinitionName": "Example Process", "processDefinitionId": "example_process", "description": "제 프로세스 설명", "data": [{"name": "example data", "description": "example data description", "type": "Text"}], "roles": [{"name": "example role", "resolutionRule": "example rule"}], "activities": [{"name": "example activity", "id": "example_activity", "type": "ScriptActivity", "description": "activity description", "instruction": "activity instruction", "role": "example role", "inputData": [{"name": "example input data"}], "outputData": [{"name": "example output data"}], "checkpoints":["checkpoint 1"], "pythonCode": "import smtplib\\nfrom email.mime.multipart import MIMEMultipart\\nfrom email.mime.text import MIMEText\\n\\nsmtp = smtplib.SMTP(\'smtp.gmail.com\', 587)\\nsmtp.starttls()\\nsmtp.login(\'jinyoungj@gmail.com\', \'raqw nmmn xuuc bsyi\')\\n\\nmsg = MIMEMultipart()\\nmsg[\'Subject\'] = \'Test mail\'\\nmsg.attach(MIMEText(\'This is a test mail.\'))\\n\\nsmtp.sendmail(\'jinyoungj@gmail.com\', \'ohsy818@gmail.com\', msg.as_string())\\nsmtp.quit()"}], "sequences": [{"source": "activity_id_1", "target": "activity_id_2"}]}'
