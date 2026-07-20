@@ -5,6 +5,7 @@ from llm_factory import create_llm
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any, Tuple
 import json
+from semantic_naming import generate_semantic_name
 import re
 import uuid
 import requests
@@ -1114,6 +1115,76 @@ def _get_immediate_prev_activity_form_data(
     return merged if merged else None
 
 
+def _coerce_variables_data_to_list(value):
+    """variables_data를 항상 list로 정규화한다.
+
+    ProcessInstance 모델은 variables_data가 List[Dict]이기를 요구하는데,
+    콜/서브 프로세스 매퍼 결과는 dict({})로 나올 수 있어 그대로 저장하면
+    이후 인스턴스 로딩(예: /complete)에서 pydantic 검증 오류가 발생한다.
+    """
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        if not value:
+            return []
+        return [{"key": k, "value": v} for k, v in value.items()]
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _merge_child_definition_roles(role_bindings, child_def):
+    """자식 프로세스 정의(child_def)의 역할들을 role_bindings에 병합한다.
+
+    부모에서 상속된 role_bindings에는 자식 정의의 역할 이름이 없기 때문에,
+    자식 액티비티의 담당자(assignee) 매칭이 실패한다. 자식 정의가 각 역할에 대해
+    가지고 있는 endpoint/default 값을 사용해 누락된 역할을 추가한다.
+    (동일한 이름의 역할이 이미 있으면 부모 상속 값을 유지한다.)
+    """
+    try:
+        child_roles = getattr(child_def, "roles", None) or []
+    except Exception:
+        child_roles = []
+
+    patch = []
+    for role in child_roles:
+        try:
+            if isinstance(role, dict):
+                rd = role
+            elif hasattr(role, "model_dump"):
+                rd = role.model_dump()
+            elif hasattr(role, "dict"):
+                rd = role.dict()
+            else:
+                rd = getattr(role, "__dict__", {}) or {}
+        except Exception:
+            rd = {}
+
+        name = rd.get("name")
+        if not name:
+            continue
+
+        endpoint = rd.get("endpoint")
+        if endpoint in (None, "", [], {}):
+            endpoint = rd.get("default")
+
+        patch.append({
+            "name": name,
+            "default": rd.get("default", endpoint),
+            "endpoint": endpoint,
+            "resolutionRule": rd.get("resolutionRule", ""),
+        })
+
+    if not patch:
+        return role_bindings or []
+
+    try:
+        return merge_role_bindings(role_bindings or [], patch)
+    except Exception as e:
+        print(f"[WARN] Failed to merge child definition roles: {e}")
+        return role_bindings or []
+
+
 def _process_sub_processes(process_instance: ProcessInstance, process_result: ProcessResult, process_result_json: dict, process_definition):
     _SENTINEL = object()
 
@@ -1439,6 +1510,11 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
             role_bindings = process_instance.role_bindings or []
             call_mapper_result = {"trace": [], "errors": [], "form_values": {}, "mapped": {}, "variables_data": {}, "role_bindings": []}
 
+        # 자식(서브/콜) 프로세스의 자체 역할(role)을 role_bindings에 병합한다.
+        # 부모에서 상속받은 role_bindings에는 자식 정의의 역할 이름(예: '교통 민원 처리 에이전트', '담당자')이
+        # 존재하지 않으므로, 이를 병합하지 않으면 자식 액티비티의 담당자 지정(assignee resolution)이 실패한다.
+        role_bindings = _merge_child_definition_roles(role_bindings, child_def)
+
         participants, last_endpoint = collect_participants(role_bindings)
         endpoint = last_endpoint if last_endpoint is not _SENTINEL else None
 
@@ -1493,7 +1569,11 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                     "participants": participants,
                     "status": "NEW",
                     "role_bindings": role_bindings,
-                    "variables_data": call_mapper_result.get("variables_data") if is_call_activity and isinstance(call_mapper_result, dict) else {},
+                    # variables_data는 List 형태로 저장해야 한다(ProcessInstance 모델이 list를 요구).
+                    # 매퍼 결과가 dict인 경우 {key,value} 리스트로 변환한다.
+                    "variables_data": _coerce_variables_data_to_list(
+                        call_mapper_result.get("variables_data") if is_call_activity and isinstance(call_mapper_result, dict) else None
+                    ),
                     "start_date": datetime.now().isoformat(),
                     "tenant_id": process_instance.tenant_id,
                     "parent_proc_inst_id": process_instance.proc_inst_id,
@@ -1727,7 +1807,12 @@ def _persist_process_data(process_instance: ProcessInstance, process_result: Pro
     next_workitems = upsert_next_workitems(process_instance.model_dump(), process_result_json, process_definition, tenant_id)
     
     # Upsert process instance
-    if process_instance.status == "NEW":
+    default_instance_name = getattr(process_definition, "processDefinitionName", None)
+    if process_result.instanceName and (
+        process_instance.status == "NEW"
+        or not process_instance.proc_inst_name
+        or process_instance.proc_inst_name == default_instance_name
+    ):
         process_instance.proc_inst_name = process_result.instanceName
     _, process_instance = upsert_process_instance(process_instance, tenant_id, process_definition)
     
@@ -2108,6 +2193,14 @@ def get_sequence_condition_data(process_definition: Any, current_activity_id: st
         
                 if seq.name:
                     sequence_condition_data.setdefault(seq.id, {})["name"] = seq.name
+
+                # Generated ProcessGPT definitions store the business branch rule
+                # in Sequence.condition. Older polling only inspected properties,
+                # so every exclusive gateway silently followed its default/first
+                # path even when meaningful conditions were present.
+                condition = getattr(seq, "condition", None)
+                if isinstance(condition, str) and condition.strip():
+                    sequence_condition_data.setdefault(seq.id, {})["condition"] = condition.strip()
                     
                 if not stop_here:
                     next_node = getattr(seq, "target", None)
@@ -4593,12 +4686,19 @@ async def handle_workitem(workitem):
         else:
             user_email_for_prompt = ','.join(workitem['user_id'].split(','))
             
-        # instance_name = process_definition_json.get("processDefinitionName") + "_" + workitem['id']
+        # 최초 제출값을 기반으로 사용자 식별이 쉬운 인스턴스명을 한 번 생성한다.
+        # 이후 단계에서는 이미 저장된 이름을 유지해 목록 정렬/표시가 흔들리지 않게 한다.
         process_instance = fetch_process_instance(process_instance_id, tenant_id)
-        if process_instance and process_instance.proc_inst_name != process_definition_json.get("processDefinitionName"):
+        process_name = process_definition_json.get("processDefinitionName") or process_definition_id
+        if process_instance and process_instance.proc_inst_name and process_instance.proc_inst_name != process_name:
             instance_name = process_instance.proc_inst_name
         else:
-            instance_name = process_definition_json.get("processDefinitionName") + "_" + process_instance_id.split('.')[1]
+            instance_name = await generate_semantic_name(
+                model,
+                kind="instance",
+                source=output,
+                process_name=process_name,
+            )
 
         completed_json = {
             "instanceId": process_instance_id,

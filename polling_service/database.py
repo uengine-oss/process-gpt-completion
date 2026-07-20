@@ -18,6 +18,7 @@ import json
 import asyncio
 import threading
 import requests
+from task_deadline import ensure_minimum_task_due_date
 
 
 supabase_client_var = ContextVar('supabase', default=None)
@@ -1190,6 +1191,7 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
             workitems.append(workitem)
             
             upsert_workitem_completed_log(workitems, process_result_data, tenant_id)
+            ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
             supabase.table('todolist').upsert(workitem_dict).execute()
             
         return workitems
@@ -1289,6 +1291,7 @@ def upsert_cancelled_workitem(process_instance_data, process_result_data, proces
             supabase = supabase_client_var.get()
             if supabase is None:
                 raise Exception("Supabase client is not configured for this request")
+            ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
             supabase.table('todolist').upsert(workitem_dict).execute()
             workitems.append(workitem)
         return workitems
@@ -1627,6 +1630,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 supabase = supabase_client_var.get()
                 if supabase is None:
                     raise Exception("Supabase client is not configured for this request")
+                ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
                 supabase.table('todolist').upsert(workitem_dict).execute()
                 workitems.append(workitem)
         except Exception as e:
@@ -1840,6 +1844,7 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 supabase = supabase_client_var.get()
                 if supabase is None:
                     raise Exception("Supabase client is not configured for this request")
+                ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
                 supabase.table('todolist').upsert(workitem_dict).execute()
     except Exception as e:
         print(f"[ERROR] upsert_todo_workitems: {str(e)}")
@@ -1993,6 +1998,7 @@ def upsert_workitem(workitem_data: dict, tenant_id: Optional[str] = None):
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
         
+        ensure_minimum_task_due_date(workitem_data)
         if "start_date" in workitem_data and workitem_data["start_date"]:
             if not isinstance(workitem_data["start_date"], str):
                 workitem_data["start_date"] = workitem_data["start_date"].isoformat()

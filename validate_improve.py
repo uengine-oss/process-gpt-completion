@@ -51,7 +51,8 @@ def _make_llm_call():
             model=model,
             messages=messages,
             temperature=0.0,
-            max_tokens=int(max_tokens or 4000),
+            # Current reasoning/chat models reject the legacy max_tokens field.
+            max_completion_tokens=int(max_tokens or 4000),
             response_format={"type": "json_object"},
         )
         content = (resp.choices[0].message.content or "").strip()

@@ -278,7 +278,10 @@ class ProcessValidator:
                 for case in cases:
                     try:
                         trace = await self._run_trace(
-                            proc_def_id, current, case.get("activity_inputs") or {}
+                            proc_def_id,
+                            current,
+                            case.get("activity_inputs") or {},
+                            case.get("expected_activity_order") or [],
                         )
                     except EngineUnreachable as e:
                         report["skipped"] = True
@@ -344,7 +347,7 @@ class ProcessValidator:
                     self._rep("")
                     self._rep(f"### 케이스: {c.get('name')}")
                     if pinst:
-                        self._rep(f"- 실행 엔진 인스턴스 proc_inst_id: `{pinst}` (DB 보존)")
+                        self._rep(f"- 실행 엔진 인스턴스 proc_inst_id: `{pinst}` (검증 후 정리)")
                     self._rep(
                         "- 실제 실행 경로: "
                         + (" → ".join(nmap.get(a, a) for a in _act) or "(진행 없음)")
@@ -643,6 +646,7 @@ class ProcessValidator:
                         "key": f.get("key") or f.get("name"),
                         "label": f.get("text") or f.get("alias"),
                         "type": f.get("type") or "text",
+                        "options": f.get("options") or [],
                     })
             act_payload.append({
                 "id": aid,
@@ -658,6 +662,7 @@ class ProcessValidator:
         gw_payload = [{
             "id": g.get("id"), "name": g.get("name"), "type": g.get("type"),
             "condition": g.get("condition"),
+            "conditionData": g.get("conditionData") or [],
         } for g in gateways]
         ev_payload = [{"id": e.get("id"), "type": e.get("type"), "name": e.get("name")}
                       for e in events]
@@ -678,7 +683,9 @@ class ProcessValidator:
             "- 각 케이스의 '기대 실행 순서'는 sequences 배열이 아니라, 액티비티의 이름·설명·"
             "지시사항이 의미하는 '논리적으로 올바른 순서'로 추론한다. (sequences 에는 오류가 있을 수 있다.)\n"
             "- 각 케이스의 입력값은 그 케이스가 의도한 분기를 실제로 타도록 정한다 "
-            "(게이트웨이 조건을 만족/불만족시키는 값)."
+            "(게이트웨이 조건을 만족/불만족시키는 값).\n"
+            "- 재작업 루프로 같은 activity_id가 여러 번 실행되면 activity_inputs 값은 "
+            "방문 순서대로 객체 배열([첫 제출값, 두 번째 제출값])로 작성한다."
         )
         user = (
             "다음 BPMN 프로세스의 분기별 테스트 케이스를 만든다. JSON 으로만 응답하라.\n\n"
@@ -693,7 +700,7 @@ class ProcessValidator:
             '  "cases": [\n'
             '    {\n'
             '      "name": "<이 케이스가 타는 경로 설명, 예: 심의 승인 경로>",\n'
-            '      "activity_inputs": { "<activity_id>": { "<form_field_key>": <예시값>, ... }, ... },\n'
+            '      "activity_inputs": { "<activity_id>": { "<form_field_key>": <예시값>, ... } 또는 [<1회차 객체>, <2회차 객체>], ... },\n'
             '      "expected_activity_order": ["<activity_id>", ...]\n'
             '    }\n'
             "  ],\n"
@@ -703,7 +710,8 @@ class ProcessValidator:
             "- cases: 게이트웨이의 모든 분기가 최소 한 케이스에서 실행되도록 만든다. "
             "게이트웨이가 없으면 cases 는 1개.\n"
             "- activity_inputs: 각 액티비티의 form_fields 에 맞춰 현실적인 예시값. 필드 type 에 맞게. "
-            "form_fields 가 없으면 빈 객체 {}. 그 케이스가 의도한 분기를 타도록 값을 정한다.\n"
+            "form_fields 가 없으면 빈 객체 {}. 그 케이스가 의도한 분기를 타도록 값을 정한다. "
+            "expected_activity_order에 같은 activity_id가 반복되면 그 id의 입력은 반드시 같은 개수의 객체 배열로 둔다.\n"
             "- expected_activity_order: 그 케이스에서 startEvent 직후~endEvent 직전까지 실행될 "
             "액티비티 id 를 '의미상 올바른' 순서로. 게이트웨이/이벤트 id 는 넣지 않는다.\n"
             f"- activity_id 는 반드시 다음 중 하나여야 한다: {json.dumps(valid_ids, ensure_ascii=False)}\n"
@@ -723,7 +731,7 @@ class ProcessValidator:
     # 3) 실제 실행 (엔진 driving)
     # ------------------------------------------------------------------ #
     async def _run_trace(self, proc_def_id: str, proc_json: dict,
-                          activity_inputs: dict) -> dict:
+                          activity_inputs: dict, expected_order: list = None) -> dict:
         """엔진을 운영과 동일한 실제 경로로 driving 해 start→end 트레이스를 수집한다.
 
         한 번 호출 = 한 케이스(분기) 실행. 매 호출이 /initiate 로 '새 인스턴스'를
@@ -781,22 +789,27 @@ class ProcessValidator:
                 errors.append(f"/initiate 응답 형식 오류: {_trunc(init, 160)}")
                 return self._trace_result(proc_inst_id, actual_order, False, last_status, errors, 0)
 
-            submitted: set = set()
+            from collections import Counter
+            expected_visits = Counter(str(item) for item in (expected_order or []))
+            visit_counts: dict[str, int] = {}
             queue: list = [str(first_aid)]
 
             try:
                 while queue and step < max_steps:
                     aid = queue.pop(0)
-                    if aid in submitted:
+                    occurrence = visit_counts.get(aid, 0)
+                    visit_limit = max(1, expected_visits.get(aid, 1)) + 1
+                    if occurrence >= visit_limit:
+                        errors.append(f"반복 상한 초과[{aid}]: {occurrence}회")
                         continue
-                    submitted.add(aid)
+                    visit_counts[aid] = occurrence + 1
                     step += 1
                     actual_order.append(aid)
 
                     # --- ② 폼 제출 (실제 /complete — task_id 없이 activity_id 로) ---
                     #   submit_workitem 이 (proc_inst_id, activity_id)로 워크아이템을 찾아
                     #   SUBMITTED 로 만든다 = 프론트의 폼 제출과 동일 경로.
-                    fv = self._form_values_for(aid, activity_inputs, form_id_by_act)
+                    fv = self._form_values_for(aid, activity_inputs, form_id_by_act, occurrence)
                     await self._submit(client, base, proc_def_id, proc_inst_id, aid, fv, errors)
 
                     # --- ③ 폴링 서비스가 다음으로 진행할 때까지 대기 ---
@@ -808,7 +821,7 @@ class ProcessValidator:
                         break
                     for next_aid in (state.get("current_activity_ids") or []):
                         next_aid = str(next_aid)
-                        if next_aid in submitted or next_aid in queue:
+                        if next_aid in queue:
                             continue
                         if not self._is_submittable(node_type, next_aid):
                             # 게이트웨이/이벤트/serviceTask 등 — 검증기가 제출하지 않는다.
@@ -941,13 +954,16 @@ class ProcessValidator:
         return res
 
     @staticmethod
-    def _form_values_for(activity_id, activity_inputs: dict, form_id_by_act: dict) -> dict:
+    def _form_values_for(activity_id, activity_inputs: dict, form_id_by_act: dict,
+                         occurrence: int = 0) -> dict:
         """엔진 제출용 form_values 를 만든다.
 
         게이트웨이 조건 평가가 form_id 로 묶인 값을 읽을 수도, 평탄한 값을 읽을 수도 있어
         둘 다 제공한다: {<field>: v, ..., <form_id>: {<field>: v, ...}}.
         """
         flat = activity_inputs.get(str(activity_id)) or {}
+        if isinstance(flat, list):
+            flat = flat[min(max(occurrence, 0), len(flat) - 1)] if flat else {}
         if not isinstance(flat, dict):
             flat = {}
         out = dict(flat)
@@ -1083,6 +1099,8 @@ class ProcessValidator:
             "- 액티비티/게이트웨이/이벤트의 id 는 절대 바꾸지 않는다(폼이 id 로 연결되어 있다).\n"
             "- 액티비티를 삭제하거나 새로 만들지 않는다. 순서만 시퀀스로 바로잡는다.\n"
             "- 게이트웨이 분기가 있으면 모든 분기 시퀀스를 유지하되, 조건이 틀렸으면 condition 을 고친다.\n"
+            "- gateways[].conditionData 는 반드시 '<form_id>.<field_name>' 문자열 배열이다. "
+            "객체를 넣지 말고, 실제 분기 판단 문구는 sequences[].condition 문자열에 둔다.\n"
             "- sequences 는 전체 목록을 빠짐없이 반환한다. 절대 일부만 반환하지 마라 — "
             "누락하면 그 흐름이 사라져 프로세스가 끊긴다.\n"
         )
@@ -1140,6 +1158,17 @@ class ProcessValidator:
         has_end = any(str(e.get("type") or "").lower() == "endevent" for e in events)
         if not has_start or not has_end:
             return False, "start/end 이벤트 누락"
+        for gateway in (defn.get("gateways") or []):
+            condition_data = gateway.get("conditionData") if isinstance(gateway, dict) else None
+            if condition_data is not None and (
+                not isinstance(condition_data, list)
+                or any(not isinstance(value, str) for value in condition_data)
+            ):
+                return False, "gateway.conditionData 는 문자열 배열이어야 함"
+        for sequence in seqs:
+            if isinstance(sequence, dict) and sequence.get("condition") is not None \
+                    and not isinstance(sequence.get("condition"), str):
+                return False, "sequence.condition 은 문자열이어야 함"
         return True, ""
 
     # ------------------------------------------------------------------ #
@@ -1254,22 +1283,13 @@ class ProcessValidator:
             lines.append(f"- 비고: {report.get('note')}")
         if self._test_proc_inst_ids:
             lines.append("")
-            lines.append("## 검증용 실행 인스턴스 (DB 보존됨)")
+            lines.append("## 검증용 실행 인스턴스 (정리 완료)")
             lines.append(
                 "검증기가 실제 엔진(/initiate·/complete)으로 만든 실행 인스턴스다. "
-                "PDF2BPMN_VALIDATION_CLEANUP=false 이므로 삭제하지 않고 남겨둔다. "
-                "아래 쿼리로 폴링 서비스가 진행시킨 워크아이템 흐름을 직접 확인할 수 있다:"
+                "각 케이스의 경로를 수집한 뒤 검증용 인스턴스와 워크아이템은 자동 삭제했다:"
             )
             for pid in self._test_proc_inst_ids:
                 lines.append(f"- proc_inst_id `{pid}`")
-                lines.append(
-                    f"  - `SELECT activity_id, activity_name, status, start_date, end_date "
-                    f"FROM todolist WHERE proc_inst_id = '{pid}' ORDER BY start_date;`"
-                )
-                lines.append(
-                    f"  - `SELECT status, current_activity_ids FROM bpm_proc_inst "
-                    f"WHERE proc_inst_id = '{pid}';`"
-                )
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self._report_path)), exist_ok=True)
             with open(self._report_path, "w", encoding="utf-8") as f:

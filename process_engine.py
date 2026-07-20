@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from database import fetch_process_definition_by_version, fetch_organization_chart, upsert_workitem, fetch_workitem_by_proc_inst_and_activity, insert_process_instance, fetch_workitem_by_id, upsert_process_definition, fetch_assignee_info, upsert_process_instance_source, fetch_process_instance
 from process_definition import load_process_definition
 from compensation_handler import generate_compensation
+from semantic_naming import generate_semantic_name
 
 import traceback
 import uuid
@@ -47,6 +48,21 @@ async def handle_submit(request: Request):
     except Exception as e:
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+async def handle_generate_name(request: Request):
+    """Generate a stable, user-identifiable title without blocking core flows on AI errors."""
+    payload = await request.json()
+    kind = str(payload.get("kind") or "chat").strip().lower()
+    if kind not in {"chat", "instance"}:
+        raise HTTPException(status_code=400, detail="kind must be 'chat' or 'instance'")
+    name = await generate_semantic_name(
+        model,
+        kind=kind,
+        source=payload.get("source"),
+        process_name=str(payload.get("process_name") or ""),
+    )
+    return {"name": name}
     
 
 async def create_process_instance(process_definition, process_instance_id, is_initiate=False, role_bindings=[], project_id=None):
@@ -951,6 +967,7 @@ async def handle_rework_complete(request: Request):
 
 def add_routes_to_app(app) :
     app.add_api_route("/complete", handle_submit, methods=["POST"])
+    app.add_api_route("/generate-name", handle_generate_name, methods=["POST"])
     app.add_api_route("/vision-complete", handle_submit, methods=["POST"])
     app.add_api_route("/role-binding", handle_role_binding, methods=["POST"])
     app.add_api_route("/initiate", handle_initiate, methods=["POST"])

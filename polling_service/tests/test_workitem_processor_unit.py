@@ -154,12 +154,13 @@ def wiproc():
 # Dummy process definition structures for local tests
 # ------------------------------------------------------------
 class _Seq:
-    def __init__(self, id, source, target, name=None, properties=None):
+    def __init__(self, id, source, target, name=None, properties=None, condition=None):
         self.id = id
         self.source = source
         self.target = target
         self.name = name
         self.properties = properties
+        self.condition = condition
 
 
 class _Gateway:
@@ -211,7 +212,19 @@ class _ProcDef:
 # ------------------------------------------------------------
 # Tests
 # ------------------------------------------------------------
- 
+
+
+def test_sequence_condition_data_includes_generated_condition_text(wiproc):
+    proc_def = _ProcDef(sequences=[
+        _Seq("s1", source="A1", target="G1"),
+        _Seq("s2", source="G1", target="B1", condition="승인인 경우"),
+        _Seq("s3", source="G1", target="B2", condition="반려인 경우"),
+    ])
+
+    result = wiproc.get_sequence_condition_data(proc_def, "A1", ["B1", "B2"])
+
+    assert result["s2"]["condition"] == "승인인 경우"
+    assert result["s3"]["condition"] == "반려인 경우"
 
 
 def test_resolve_next_activity_payloads_exclusive_branch(wiproc):
