@@ -4855,7 +4855,11 @@ async def handle_service_workitem(workitem):
     def extract_tool_results_from_agent_messages(messages):
         """
         LangChain agent의 메시지 리스트에서 도구 실행 결과만 추출하여
-        {tool_name: {status, ...}} 형태의 딕셔너리로 반환
+        {tool_name: {status/result, ...}} 형태의 딕셔너리로 반환한다.
+
+        기존 MCP들은 주로 ``status=success``를 반환하지만 업무 도메인 MCP는
+        ``result=ok|error|dry_run`` envelope를 사용할 수 있다. 두 형식을 모두
+        원문 그대로 보존해야 PO/receipt 식별자와 다음 활동 입력이 유실되지 않는다.
         """
         tool_results = {}
         for msg in messages:
@@ -4863,13 +4867,43 @@ async def handle_service_workitem(workitem):
             if hasattr(msg, "name") and hasattr(msg, "content"):
                 try:
                     content = msg.content
-                    if content and (content.startswith("{") or content.startswith("[")):
-                        parsed = json.loads(content)
-                        if isinstance(parsed, dict) and "status" in parsed:
+                    candidates = []
+                    if isinstance(content, str):
+                        candidates.append(content)
+                    elif isinstance(content, dict):
+                        candidates.append(content)
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, str):
+                                candidates.append(block)
+                            elif isinstance(block, dict):
+                                if isinstance(block.get("text"), str):
+                                    candidates.append(block["text"])
+                                else:
+                                    candidates.append(block)
+
+                    for candidate in candidates:
+                        parsed = candidate
+                        if isinstance(candidate, str):
+                            stripped = candidate.strip()
+                            if not stripped or stripped[0] not in "[{":
+                                continue
+                            parsed = json.loads(stripped)
+                        if isinstance(parsed, dict) and (
+                            "status" in parsed
+                            or "result" in parsed
+                            or "document" in parsed
+                            or "document_id" in parsed
+                        ):
                             tool_results[msg.name] = parsed
                         elif isinstance(parsed, list):
                             for item in parsed:
-                                if isinstance(item, dict) and "status" in item:
+                                if isinstance(item, dict) and (
+                                    "status" in item
+                                    or "result" in item
+                                    or "document" in item
+                                    or "document_id" in item
+                                ):
                                     tool_results[msg.name] = item
                 except Exception:
                     continue
@@ -4942,7 +4976,14 @@ async def handle_service_workitem(workitem):
         result_summary = []
         
         for tool_name, result in tool_results.items():
-            if isinstance(result, dict) and result.get("status") == "success":
+            is_success = (
+                isinstance(result, dict)
+                and (
+                    result.get("status") == "success"
+                    or result.get("result") in {"ok", "dry_run"}
+                )
+            )
+            if is_success:
                 success_count += 1
                 connection_type = result.get("connection_type", "unknown")
                 result_summary.append(f"{tool_name} ({connection_type}): 성공")
@@ -5293,8 +5334,6 @@ def get_all_input_data(workitem: dict, process_definition: Any) -> Dict[str, Any
     except Exception as e:
         print(f"[ERROR] Failed to get all input data for {workitem.get('id')}: {str(e)}")
         return {}
-
-
 
 
 

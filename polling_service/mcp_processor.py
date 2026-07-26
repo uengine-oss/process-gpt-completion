@@ -165,6 +165,10 @@ class MCPProcessor:
             
             activity_description = activity.description
             activity_name = activity.name
+            requested_tool = None
+            activity_tool = getattr(activity, "tool", None)
+            if isinstance(activity_tool, str) and activity_tool.startswith("mcp:"):
+                requested_tool = activity_tool.split(":", 1)[1].strip()
             prev_activities = process_definition.find_prev_activities(activity.id, [])
             prev_activities_output = ""
             
@@ -175,18 +179,37 @@ class MCPProcessor:
             else:
                 prev_activities_output = "이전 산출물이 없습니다."
 
+            tool_instruction = ""
+            if requested_tool:
+                tool_instruction = f"""
+이 활동에 지정된 MCP 도구는 `{requested_tool}`입니다.
+반드시 이 도구만 정확히 한 번 호출하고, 도구 결과를 받은 뒤 다른 도구를 호출하지 마세요.
+"""
+
             prompt = f"""
+프로세스 인스턴스: {workitem.get('proc_inst_id')}
 활동 이름: {activity_name}
 활동 설명: {activity_description}
 
 위 활동을 수행하기 위해 사용 가능한 도구들을 활용해주세요.
 도구를 사용할 때는 각 도구가 요구하는 파라미터 스키마에 맞게 파라미터를 전달해야 합니다.
 파라미터가 없는 도구는 빈 오브젝트({{}})를 전달하세요.
+{tool_instruction}
 
 이전 산출물: {prev_activities_output}
 """
 
             tools = sanitize_mcp_tools(self.mcp_tools)
+            if requested_tool:
+                tools = [tool for tool in tools if tool.name == requested_tool]
+                if not tools:
+                    available = sorted(tool.name for tool in sanitize_mcp_tools(self.mcp_tools))
+                    return {
+                        "error": (
+                            f"Requested MCP tool '{requested_tool}' is not available. "
+                            f"Available tools: {available}"
+                        )
+                    }
             # tools = [self.wrap_tool_for_empty_args(tool) for tool in tools]
             llm = create_llm(streaming=False)
             agent = create_react_agent(llm, tools)
