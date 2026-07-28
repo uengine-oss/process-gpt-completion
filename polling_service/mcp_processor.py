@@ -41,6 +41,9 @@ def sanitize_mcp_tools(tools):
                 except Exception as e:
                     print(f"[ERROR] Failed to patch tool {tool.name}: {e}")
                     continue
+
+            # dict 스키마라도 properties/required가 있으면 정상 JSON Schema이므로 그대로 추가
+            sanitized.append(tool)
         else:
             # 정상적인 StructuredTool은 그대로 추가
             sanitized.append(tool)

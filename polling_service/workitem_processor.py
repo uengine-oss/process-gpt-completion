@@ -5006,7 +5006,35 @@ async def handle_service_workitem(workitem):
             "log": log_message,
             "output": tool_results
         }, tenant_id)
-        
+
+        # 다음 활동이 serviceTask면 이 경로(핸들러가 직접 처리)에서는
+        # execute_next_activity()가 호출되지 않으므로 여기서 직접 SUBMITTED로
+        # 전환한다 — 그러지 않으면 연속된 serviceTask 체인이 첫 번째 다음에서
+        # 멈춘다(userTask 완료 경로만 _check_service_tasks를 거침).
+        try:
+            proc_def_id = workitem.get('proc_def_id')
+            process_definition_json = fetch_process_definition_by_version(
+                proc_def_id,
+                workitem.get('version_tag'),
+                workitem.get('version'),
+                tenant_id,
+                None,
+            )
+            process_definition = load_process_definition(process_definition_json)
+            for next_activity in process_definition.find_near_next_activities(workitem.get('activity_id'), False):
+                if getattr(next_activity, "type", None) == "serviceTask":
+                    next_workitem = fetch_workitem_by_proc_inst_and_activity(
+                        workitem.get('proc_inst_id'), next_activity.id, tenant_id
+                    )
+                    if next_workitem and next_workitem.status == "TODO":
+                        upsert_workitem({
+                            "id": next_workitem.id,
+                            "status": "SUBMITTED",
+                        }, tenant_id)
+                        print(f"[DEBUG] Advanced next serviceTask to SUBMITTED: {next_activity.id}")
+        except Exception as e:
+            print(f"[ERROR] Failed to advance next service task after {workitem['id']}: {str(e)}")
+
         # 채팅 메시지 추가
         def summarize_agent_messages(messages):
             lines = []
