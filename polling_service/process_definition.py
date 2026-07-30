@@ -348,6 +348,70 @@ class ProcessDefinition(BaseModel):
                 continue
         return results
 
+    def find_all_downstream_activities(self, start_activity_id: str, include_events: bool = False) -> List:
+        """시작 액티비티에서 도달 가능한 모든 하위 액티비티를 전개한다.
+
+        '예정업무'(status=TODO) 사전 생성 전용이다.
+        게이트웨이의 분기 중 하나가 종료 이벤트여도 나머지 분기(실제 태스크)를 계속 따라간다.
+        find_next_activities 는 게이트웨이에 이벤트 분기가 하나라도 있으면 나머지 분기 확장을
+        건너뛰므로(has_event 게이트), 배타 게이트웨이 뒤의 업무가 예정업무에서 통째로 누락된다.
+
+        주의: 런타임 활성화(current_activity_ids / nextActivities) 용도로 쓰면 안 된다.
+        배타 게이트웨이의 모든 분기를 반환하므로, 실행 중 분기가 동시에 활성화된다.
+        그 경로는 기존대로 find_next_activities 를 사용해야 한다.
+        """
+        results: List = []
+        visited: set = set()
+        attached_visited: set = set()
+        stack: List[str] = [seq.target for seq in self.sequences if seq.source == start_activity_id]
+
+        while stack:
+            node_id = stack.pop(0)
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+
+            def _advance(from_id: str):
+                for seq in self.sequences:
+                    if seq.source == from_id and seq.target not in visited:
+                        stack.append(seq.target)
+
+            sub = self.find_sub_process_by_id(node_id)
+            if sub:
+                if sub not in results:
+                    results.append(sub)
+                self.process_attached_events(sub, results, include_events, attached_visited)
+                _advance(node_id)
+                continue
+
+            act = self.find_activity_by_id(node_id)
+            if act:
+                if act not in results:
+                    results.append(act)
+                self.process_attached_events(act, results, include_events, attached_visited)
+                _advance(node_id)
+                continue
+
+            node = self.find_gateway_by_id(node_id)
+            if node:
+                node_type = str(getattr(node, "type", "") or "").lower()
+                if "endevent" in node_type:
+                    # 종료 이벤트: 흐름의 끝이므로 더 진행하지 않는다.
+                    if include_events and node not in results:
+                        results.append(node)
+                    continue
+                if "event" in node_type:
+                    # 시작/중간 이벤트: 액티비티는 아니지만 흐름은 이어진다.
+                    if include_events and node not in results:
+                        results.append(node)
+                    _advance(node_id)
+                    continue
+                # 게이트웨이: 모든 분기를 따라간다.
+                _advance(node_id)
+                continue
+
+        return results
+
     def find_near_next_activities(self, current_item_id: str, include_events: bool = True):
         results: List = []
         visited: set = set()

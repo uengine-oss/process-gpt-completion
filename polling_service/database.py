@@ -1681,7 +1681,11 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
         else:
             execution_scope =''
 
-        next_activities = process_definition.find_next_activities(initial_activity.id, True)
+        # 예정업무는 도달 가능한 하위 업무 전체를 사전 생성한다.
+        # find_next_activities 는 게이트웨이에 종료 이벤트 분기가 있으면 나머지 분기 확장을
+        # 건너뛰어(has_event 게이트), 배타 게이트웨이 뒤의 업무가 통째로 누락됐다.
+        # (런타임 활성화 경로는 기존 find_next_activities 를 그대로 사용한다.)
+        next_activities = process_definition.find_all_downstream_activities(initial_activity.id, True)
         for activity in next_activities:
             if safeget(activity, 'type', '') == 'endEvent':
                 continue
