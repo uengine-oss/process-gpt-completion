@@ -4855,7 +4855,11 @@ async def handle_service_workitem(workitem):
     def extract_tool_results_from_agent_messages(messages):
         """
         LangChain agent의 메시지 리스트에서 도구 실행 결과만 추출하여
-        {tool_name: {status, ...}} 형태의 딕셔너리로 반환
+        {tool_name: {status/result, ...}} 형태의 딕셔너리로 반환한다.
+
+        기존 MCP들은 주로 ``status=success``를 반환하지만 업무 도메인 MCP는
+        ``result=ok|error|dry_run`` envelope를 사용할 수 있다. 두 형식을 모두
+        원문 그대로 보존해야 PO/receipt 식별자와 다음 활동 입력이 유실되지 않는다.
         """
         tool_results = {}
         for msg in messages:
@@ -4863,13 +4867,43 @@ async def handle_service_workitem(workitem):
             if hasattr(msg, "name") and hasattr(msg, "content"):
                 try:
                     content = msg.content
-                    if content and (content.startswith("{") or content.startswith("[")):
-                        parsed = json.loads(content)
-                        if isinstance(parsed, dict) and "status" in parsed:
+                    candidates = []
+                    if isinstance(content, str):
+                        candidates.append(content)
+                    elif isinstance(content, dict):
+                        candidates.append(content)
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, str):
+                                candidates.append(block)
+                            elif isinstance(block, dict):
+                                if isinstance(block.get("text"), str):
+                                    candidates.append(block["text"])
+                                else:
+                                    candidates.append(block)
+
+                    for candidate in candidates:
+                        parsed = candidate
+                        if isinstance(candidate, str):
+                            stripped = candidate.strip()
+                            if not stripped or stripped[0] not in "[{":
+                                continue
+                            parsed = json.loads(stripped)
+                        if isinstance(parsed, dict) and (
+                            "status" in parsed
+                            or "result" in parsed
+                            or "document" in parsed
+                            or "document_id" in parsed
+                        ):
                             tool_results[msg.name] = parsed
                         elif isinstance(parsed, list):
                             for item in parsed:
-                                if isinstance(item, dict) and "status" in item:
+                                if isinstance(item, dict) and (
+                                    "status" in item
+                                    or "result" in item
+                                    or "document" in item
+                                    or "document_id" in item
+                                ):
                                     tool_results[msg.name] = item
                 except Exception:
                     continue
@@ -4942,7 +4976,14 @@ async def handle_service_workitem(workitem):
         result_summary = []
         
         for tool_name, result in tool_results.items():
-            if isinstance(result, dict) and result.get("status") == "success":
+            is_success = (
+                isinstance(result, dict)
+                and (
+                    result.get("status") == "success"
+                    or result.get("result") in {"ok", "dry_run"}
+                )
+            )
+            if is_success:
                 success_count += 1
                 connection_type = result.get("connection_type", "unknown")
                 result_summary.append(f"{tool_name} ({connection_type}): 성공")
@@ -4965,7 +5006,35 @@ async def handle_service_workitem(workitem):
             "log": log_message,
             "output": tool_results
         }, tenant_id)
-        
+
+        # 다음 활동이 serviceTask면 이 경로(핸들러가 직접 처리)에서는
+        # execute_next_activity()가 호출되지 않으므로 여기서 직접 SUBMITTED로
+        # 전환한다 — 그러지 않으면 연속된 serviceTask 체인이 첫 번째 다음에서
+        # 멈춘다(userTask 완료 경로만 _check_service_tasks를 거침).
+        try:
+            proc_def_id = workitem.get('proc_def_id')
+            process_definition_json = fetch_process_definition_by_version(
+                proc_def_id,
+                workitem.get('version_tag'),
+                workitem.get('version'),
+                tenant_id,
+                None,
+            )
+            process_definition = load_process_definition(process_definition_json)
+            for next_activity in process_definition.find_near_next_activities(workitem.get('activity_id'), False):
+                if getattr(next_activity, "type", None) == "serviceTask":
+                    next_workitem = fetch_workitem_by_proc_inst_and_activity(
+                        workitem.get('proc_inst_id'), next_activity.id, tenant_id
+                    )
+                    if next_workitem and next_workitem.status == "TODO":
+                        upsert_workitem({
+                            "id": next_workitem.id,
+                            "status": "SUBMITTED",
+                        }, tenant_id)
+                        print(f"[DEBUG] Advanced next serviceTask to SUBMITTED: {next_activity.id}")
+        except Exception as e:
+            print(f"[ERROR] Failed to advance next service task after {workitem['id']}: {str(e)}")
+
         # 채팅 메시지 추가
         def summarize_agent_messages(messages):
             lines = []
@@ -5293,8 +5362,6 @@ def get_all_input_data(workitem: dict, process_definition: Any) -> Dict[str, Any
     except Exception as e:
         print(f"[ERROR] Failed to get all input data for {workitem.get('id')}: {str(e)}")
         return {}
-
-
 
 
 
