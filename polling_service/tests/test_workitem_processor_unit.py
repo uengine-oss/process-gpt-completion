@@ -787,7 +787,11 @@ def test_call_activity_parent_form_mapping_prefills_child_initial_workitem(wipro
 
     child_instances = [item for item in inserted_instances if item["proc_def_id"] == "vendor-security-review"]
     assert len(child_instances) == 1
-    assert child_instances[0]["variables_data"] == {}
+    # variables_data 는 항상 list 로 정규화된다(_coerce_variables_data_to_list).
+    # ProcessInstance 모델이 List[Dict] 를 요구하므로 매퍼 결과가 빈 dict 여도 [] 로 저장해야 하며,
+    # dict 를 그대로 넣으면 이후 인스턴스 로딩(/complete)에서 pydantic 검증 오류가 난다.
+    # 이 매핑은 폼 값만 다루므로 인스턴스 변수는 비어 있다.
+    assert child_instances[0]["variables_data"] == []
 
     child_workitems = [item for item in upserted_workitems if item.get("proc_inst_id") == child_instances[0]["proc_inst_id"]]
     assert len(child_workitems) == 1
