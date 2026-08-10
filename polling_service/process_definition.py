@@ -51,6 +51,10 @@ class ProcessActivity(BaseModel):
     agent: Optional[str] = None
     agentMode: Optional[str] = None
     orchestration: Optional[str] = None
+    # cliagents 오케스트레이션의 실행 설정({agent_cli, model, permission}).
+    # 모델에 선언하지 않으면 파싱 단계에서 조용히 사라져, 화면에서 고른 CLI 가
+    # 워크아이템까지 도달하지 못한다.
+    agentConfig: Optional[Dict[str, Any]] = None
     isDeploy: Optional[bool] = False
     
     def __hash__(self):
@@ -96,6 +100,7 @@ class ProcessGateway(BaseModel):
     duration: Optional[int] = None
     agentMode: Optional[str] = None
     orchestration: Optional[str] = None
+    agentConfig: Optional[Dict[str, Any]] = None
     @root_validator(pre=True)
     def check_condition(cls, values):
         if values.get('condition') == "":

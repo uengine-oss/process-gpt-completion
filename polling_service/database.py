@@ -456,6 +456,10 @@ class WorkItem(BaseModel):
     log: Optional[str] = None
     agent_mode: Optional[str] = None
     agent_orch: Optional[str] = None
+    # cliagents 오케스트레이션이 "어떤 CLI(claude-code/codex)·모델·권한으로 실행할지"를
+    # 담아 나르는 필드. 오케스트레이션마다 형태가 달라 컬럼을 늘리는 대신
+    # 액티비티 정의의 agentConfig 를 그대로 싣는다.
+    agent_config: Optional[Dict[str, Any]] = None
     feedback: Optional[List[Dict[str, Any]]] = []
     temp_feedback: Optional[str] = None
     execution_scope: Optional[str] = None
@@ -1140,6 +1144,7 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                     description=description,
                     query=query,
                     agent_orch=agent_orch,
+                    agent_config=safeget(activity, 'agentConfig', None),
                     agent_mode=safeget(activity, 'agentMode', None),
                     log=log,
                     root_proc_inst_id=process_instance_data.get('root_proc_inst_id') or process_instance_data.get('proc_inst_id'),
@@ -1276,6 +1281,7 @@ def upsert_cancelled_workitem(process_instance_data, process_result_data, proces
                     description=description,
                     query=query,
                     agent_orch=agent_orch,
+                    agent_config=safeget(activity, 'agentConfig', None),
                     agent_mode=safeget(activity, 'agentMode', None),
                     root_proc_inst_id=process_instance_data.get('root_proc_inst_id') or process_instance_data.get('proc_inst_id'),
                     execution_scope=execution_scope,
@@ -1540,6 +1546,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                     description=description,
                     query=query,
                     agent_orch=agent_orch,
+                    agent_config=safeget(activity, 'agentConfig', None),
                     root_proc_inst_id=process_instance_data.get('root_proc_inst_id') or process_instance_data.get('proc_inst_id'),
                     execution_scope=execution_scope,
                     version_tag=getattr(process_definition, "version_tag", None),
@@ -1831,6 +1838,7 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                     description=description,
                     query=query,
                     agent_orch=agent_orch,
+                    agent_config=safeget(activity, 'agentConfig', None),
                     root_proc_inst_id=process_instance_data.get('root_proc_inst_id') or process_instance_data.get('proc_inst_id'),
                     execution_scope=execution_scope,
                     version_tag=getattr(process_definition, "version_tag", None),
@@ -2592,3 +2600,103 @@ async def get_input_data_with_file_parsing(workitem: dict, process_definition: A
         # ?먮윭 諛쒖깮??湲곕낯 ?낅젰 ?곗씠?곕씪??諛섑솚
         return get_input_data(workitem, process_definition)
 
+
+
+# ---------------------------------------------------------------------------
+# 분기 판단 이력(Gateway Decision Journal)
+# ---------------------------------------------------------------------------
+DECISION_EVENT_TYPES = ("gateway_decision", "gateway_decision_trace")
+
+
+def insert_events(event_rows: List[dict], tenant_id: Optional[str] = None, client: Any = None) -> None:
+    """이벤트 저장소에 행들을 추가한다.
+
+    진행 경로 밖(백그라운드)에서 호출되므로 supabase 클라이언트를 명시적으로 받을 수 있다.
+    ContextVar 는 스레드 간 자동 전파되지 않기 때문이다.
+    """
+    if not event_rows:
+        return
+
+    supabase = client if client is not None else supabase_client_var.get()
+    if supabase is None:
+        raise Exception("Supabase client is not configured for this request")
+
+    if not tenant_id:
+        tenant_id = subdomain_var.get()
+
+    rows = []
+    for row in event_rows:
+        item = dict(row)
+        item.setdefault("id", str(uuid.uuid4()))
+        item["tenant_id"] = item.get("tenant_id") or tenant_id
+        rows.append(item)
+
+    supabase.table("events").insert(rows).execute()
+
+
+def fetch_decision_events_by_proc_inst_id(
+    proc_inst_id: str,
+    tenant_id: Optional[str] = None,
+    client: Any = None,
+) -> List[dict]:
+    """프로세스 인스턴스의 분기 판단 이력을 판단 시각 순서로 조회한다.
+
+    이력이 없는 과거 인스턴스는 빈 목록으로 응답한다(오류가 아니다).
+    """
+    return _fetch_decision_events("proc_inst_id", proc_inst_id, tenant_id, client)
+
+
+def fetch_decision_events_by_todo_id(
+    todo_id: str,
+    tenant_id: Optional[str] = None,
+    client: Any = None,
+) -> List[dict]:
+    """워크아이템 한 건이 유발한 분기 판단 이력을 조회한다."""
+    return _fetch_decision_events("todo_id", todo_id, tenant_id, client)
+
+
+def _fetch_decision_events(
+    column: str,
+    value: str,
+    tenant_id: Optional[str] = None,
+    client: Any = None,
+) -> List[dict]:
+    if not value:
+        return []
+
+    supabase = client if client is not None else supabase_client_var.get()
+    if supabase is None:
+        raise Exception("Supabase client is not configured for this request")
+
+    if not tenant_id:
+        tenant_id = subdomain_var.get()
+
+    try:
+        query = (
+            supabase.table("events")
+            .select("*")
+            .eq(column, value)
+            .in_("event_type", list(DECISION_EVENT_TYPES))
+        )
+        # events 테이블에는 tenant_id 가 뒤늦게 추가되어 과거 행은 NULL 일 수 있다.
+        # 테넌트 범위를 벗어난 이력이 새어 나가지 않도록 명시적으로 걸러 낸다.
+        query = query.eq("tenant_id", tenant_id)
+        response = query.order("timestamp", desc=False).execute()
+    except Exception as e:
+        print(f"[WARN] Failed to fetch decision events by {column}={value}: {e}")
+        return []
+
+    return list(response.data or [])
+
+
+def fetch_traversed_sequence_ids(
+    proc_inst_id: str,
+    tenant_id: Optional[str] = None,
+    client: Any = None,
+) -> List[str]:
+    """인스턴스에서 실제로 지나간 시퀀스 집합을 확정해 돌려준다."""
+    from decision_journal import collect_traversed_sequence_ids
+
+    events = fetch_decision_events_by_proc_inst_id(proc_inst_id, tenant_id, client)
+    decisions = [e for e in events if e.get("event_type") == "gateway_decision"]
+    return collect_traversed_sequence_ids(decisions)

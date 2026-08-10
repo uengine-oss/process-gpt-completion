@@ -27,7 +27,24 @@ from database import (
     upsert_todo_workitems, upsert_workitem, ProcessInstance,
     fetch_todolist_by_proc_inst_id, execute_rpc, upsert_cancelled_workitem, insert_process_instance,
     fetch_child_instances_by_parent, fetch_organization_chart, fetch_workitems_by_root_proc_inst_id,
-    get_field_value, group_fields_by_form, get_input_data, update_proc_def_prod_version
+    get_field_value, group_fields_by_form, get_input_data, update_proc_def_prod_version,
+    insert_events, supabase_client_var
+)
+from decision_journal import (
+    DecisionRecorder,
+    METHOD_EXPRESSION,
+    METHOD_NATURAL_LANGUAGE,
+    RULE_ALL_BRANCHES,
+    RULE_DEFAULT_FLOW,
+    RULE_FILTERED,
+    RULE_NO_CANDIDATE,
+    RULE_PRIORITY,
+    RULE_SINGLE_TRUE,
+    RULE_UNCONDITIONAL,
+    VERDICT_FALSE,
+    VERDICT_TRUE,
+    VERDICT_UNDETERMINED,
+    normalize_verdict,
 )
 from process_definition import load_process_definition
 from code_executor import execute_python_code
@@ -619,6 +636,53 @@ def upsert_worker():
 
 # 프로그램 시작 시 한 번만 실행
 threading.Thread(target=upsert_worker, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# 분기 판단 이력 기록 큐
+#
+# 판단 이력 기록은 프로세스 진행의 임계 경로에 들어가면 안 된다. 이벤트 저장소가
+# 느리거나 실패해도 다음 활동 워크아이템 생성은 그대로 진행되어야 하므로,
+# 기록은 별도 큐로 넘기고 실패는 예외를 전파하지 않고 신호로만 남긴다.
+# 대가는 이력이 유실될 수 있다는 점이며, 이는 진행 보호를 우선한 의도된 선택이다.
+# ---------------------------------------------------------------------------
+decision_event_queue = queue.Queue()
+
+
+def decision_event_worker():
+    while True:
+        try:
+            event_rows, tenant_id, client = decision_event_queue.get()
+        except Exception:
+            continue
+        try:
+            insert_events(event_rows, tenant_id, client=client)
+        except Exception as e:
+            # 관측 가능한 신호로만 남기고 진행에는 영향을 주지 않는다.
+            print(f"[ERROR] decision journal: 판단 이력 기록 실패 (tenant={tenant_id}, rows={len(event_rows or [])}): {e}")
+        finally:
+            try:
+                decision_event_queue.task_done()
+            except Exception:
+                pass
+
+
+threading.Thread(target=decision_event_worker, daemon=True).start()
+
+
+def flush_decision_journal(recorder, tenant_id: Optional[str] = None) -> None:
+    """수집된 판단 이력을 진행 경로 밖으로 넘긴다. 절대 예외를 던지지 않는다."""
+    try:
+        if recorder is None or not recorder.has_records():
+            return
+        event_rows = recorder.build_events()
+        if not event_rows:
+            return
+        # ContextVar 는 스레드 간 전파되지 않으므로 클라이언트를 지금 붙잡아 넘긴다.
+        client = supabase_client_var.get()
+        decision_event_queue.put((event_rows, tenant_id, client))
+    except Exception as e:
+        print(f"[ERROR] decision journal: 판단 이력 큐 적재 실패: {e}")
 
 def initialize_role_bindings(process_result_json: dict) -> list:
     """Initialize role_bindings from process_result_json"""
@@ -2271,7 +2335,7 @@ async def run_prompt_and_parse(prompt_tmpl, chain_input, workitem, tenant_id, pa
 
 
 
-async def _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions, workitem: Optional[dict] = None):
+async def _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions, workitem: Optional[dict] = None, recorder=None):
     sequence_condition_data = sequence_condition_data or {}
     nl_condition_sequences: list[tuple] = []
 
@@ -2408,6 +2472,25 @@ async def _evaluate_sequence_conditions(model, parser, process_definition, all_w
                 print(f"[WARN] conditionFunction eval failed on {sequence.id}: {last_error}")
 
             _set_condition_eval(sequence_condition_data, sequence.id, condition_eval)
+
+            if recorder is not None:
+                # 평가가 아예 성립하지 않은 경우("판정 불가")와 거짓으로 판정한 경우를 구분해 남긴다.
+                # 엔진은 두 경우 모두 거짓으로 취급하므로, 이 구분이 오분기 조사의 출발점이 된다.
+                if evaluated:
+                    verdict = VERDICT_TRUE if condition_eval else VERDICT_FALSE
+                    eval_error = None
+                else:
+                    verdict = VERDICT_UNDETERMINED
+                    eval_error = str(last_error) if last_error else "조건식을 평가할 수 있는 입력이 없음"
+                recorder.record_sequence_evaluation(
+                    sequence.id,
+                    method=METHOD_EXPRESSION,
+                    verdict=verdict,
+                    effective=bool(condition_eval),
+                    expression=expr,
+                    error=eval_error,
+                    input_snapshot=gateway_primary if isinstance(gateway_primary, dict) and gateway_primary else None,
+                )
             continue
 
         # condition 우선, 없으면 name(예: 디자이너에서 시퀀스 이름을 "yes"/"no"로만 지정한 경우)으로 fallback
@@ -2421,7 +2504,7 @@ async def _evaluate_sequence_conditions(model, parser, process_definition, all_w
             nl_condition_sequences.append((sequence.id, condition_text.strip(), gateway_primary))
 
     if nl_condition_sequences:
-        await _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions)
+        await _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions, recorder=recorder)
 
 
 def _set_condition_eval(sequence_condition_data, seq_id, condition_met, reason=None):
@@ -2442,7 +2525,7 @@ def _set_condition_eval(sequence_condition_data, seq_id, condition_met, reason=N
         entry["conditionReason"] = reason.strip()
 
 
-async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions):
+async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions, recorder=None):
     ui_field_keys = collect_ui_field_keys(ui_definitions)
     all_workitem_input_data = apply_field_name_annotation_recursively(all_workitem_input_data, ui_definitions, ui_field_keys)
     workitem_input_data = apply_field_name_annotation_recursively(workitem_input_data, ui_definitions, ui_field_keys)
@@ -2539,6 +2622,42 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
     prompt_tmpl = PromptTemplate.from_template('{chain_input_text}')
     chain_input = {"chain_input_text": json.dumps(chain_input_text, ensure_ascii=False)}
 
+    # 이 판정의 대상이 된 시퀀스 목록. 원문 이력과 판단 이력을 잇는 데 쓴다.
+    traced_sequence_ids = [str(entry.get("sequenceId")) for entry in conditions_payload if entry.get("sequenceId")]
+    condition_texts = {
+        str(entry.get("sequenceId")): entry.get("condition")
+        for entry in conditions_payload
+        if entry.get("sequenceId")
+    }
+    primary_by_seq = {
+        str(entry.get("sequenceId")): entry.get("primaryData")
+        for entry in conditions_payload
+        if entry.get("sequenceId") and entry.get("primaryData") is not None
+    }
+
+    def _record_trace(response_value: Any) -> None:
+        if recorder is None:
+            return
+        recorder.record_llm_trace(
+            prompt=chain_input_text,
+            response=response_value,
+            sequence_ids=traced_sequence_ids,
+        )
+
+    def _record_all(verdict: str, error: Optional[str]) -> None:
+        if recorder is None:
+            return
+        for entry in conditions_payload:
+            recorder.record_sequence_evaluation(
+                entry.get("sequenceId"),
+                method=METHOD_NATURAL_LANGUAGE,
+                verdict=verdict,
+                effective=False,
+                expression=entry.get("condition"),
+                error=error,
+                input_snapshot=entry.get("primaryData"),
+            )
+
     try:
         response_text = ''
         async for chunk in model.astream(prompt_tmpl.format(**chain_input)):
@@ -2547,7 +2666,11 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
                 response_text += token
     except Exception as e:
         print(f"[WARN] condition prompt failed: {e}")
+        _record_trace(None)
+        _record_all(VERDICT_UNDETERMINED, f"모델 호출 실패: {e}")
         return
+
+    _record_trace(response_text)
 
     parsed_response = None
     try:
@@ -2557,6 +2680,7 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
             parsed_response = parser.parse(response_text)
         except Exception as parse_error:
             print(f"[WARN] condition prompt parse failed: {parse_error}")
+            _record_all(VERDICT_UNDETERMINED, f"모델 응답 파싱 실패: {parse_error}")
             return
 
     results = []
@@ -2612,6 +2736,17 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
         _set_condition_eval(sequence_condition_data, seq_id, condition_met, item.get("reason"))
         updated_ids.add(seq_id)
 
+        if recorder is not None:
+            recorder.record_sequence_evaluation(
+                seq_id,
+                method=METHOD_NATURAL_LANGUAGE,
+                verdict=normalize_verdict(condition_met),
+                effective=bool(sequence_condition_data.get(seq_id, {}).get("conditionEval")),
+                expression=condition_texts.get(str(seq_id)),
+                reason=item.get("reason"),
+                input_snapshot=primary_by_seq.get(str(seq_id)),
+            )
+
     for tup in nl_condition_sequences:
         try:
             seq_id = tup[0] if isinstance(tup, (list, tuple)) and len(tup) > 0 else None
@@ -2621,6 +2756,18 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
             continue
         if seq_id not in updated_ids:
             _set_condition_eval(sequence_condition_data, seq_id, False)
+            if recorder is not None:
+                # 모델이 이 시퀀스에 대한 판정을 돌려주지 않아 엔진이 거짓으로 강제한 경우.
+                # "거짓으로 판정했다"가 아니라 "판정하지 못했다"로 남긴다.
+                recorder.record_sequence_evaluation(
+                    seq_id,
+                    method=METHOD_NATURAL_LANGUAGE,
+                    verdict=VERDICT_UNDETERMINED,
+                    effective=False,
+                    expression=condition_texts.get(str(seq_id)),
+                    error="모델 응답에 이 시퀀스의 판정이 없어 거짓으로 처리됨",
+                    input_snapshot=primary_by_seq.get(str(seq_id)),
+                )
 
 
 # NEW: Minimal timer event expression checker
@@ -3975,6 +4122,7 @@ def resolve_next_activity_payloads(
     activity_id: str,
     workitem: dict,
     sequence_condition_data: dict | None,
+    recorder=None,
 ) -> list[dict[str, Any]]:
     """Derive next activity payloads from process definition and evaluated conditions."""
     if not process_definition:
@@ -4081,6 +4229,55 @@ def resolve_next_activity_payloads(
             return bool(sc.get("conditionEval"))
         return True
 
+    def _seq_id(seq_obj: Any) -> str | None:
+        return getattr(seq_obj, "id", None)
+
+    def _seq_target(seq_obj: Any) -> str | None:
+        return getattr(seq_obj, "target", None) or getattr(seq_obj, "targetRef", None)
+
+    def _describe_target(target_id: str | None) -> dict[str, Any]:
+        """선택된 갈래가 가리키는 다음 노드를 사람이 읽을 수 있게 기술한다."""
+        if not target_id:
+            return {}
+        for finder in ("find_activity_by_id", "find_sub_process_by_id", "find_event_by_id", "find_gateway_by_id"):
+            try:
+                node = getattr(process_definition, finder)(target_id)
+            except Exception:
+                node = None
+            if node:
+                return {
+                    "activityId": target_id,
+                    "activityName": getattr(node, "name", None) or target_id,
+                    "type": getattr(node, "type", None),
+                }
+        return {"activityId": target_id}
+
+    def _record_decision(
+        source_id: str,
+        source_node: Any,
+        source_type: str,
+        selection_rule: str,
+        candidate_seqs: list[Any],
+        chosen_seqs: list[Any],
+    ) -> None:
+        if recorder is None:
+            return
+        try:
+            recorder.record_decision(
+                source_id=source_id,
+                source_name=getattr(source_node, "name", None) if source_node is not None else None,
+                source_type=source_type,
+                branch_type=(getattr(source_node, "type", None) if source_node is not None else None),
+                selection_rule=selection_rule,
+                candidate_sequence_ids=[_seq_id(s) for s in candidate_seqs if _seq_id(s)],
+                selected_sequence_ids=[_seq_id(s) for s in chosen_seqs if _seq_id(s)],
+                selected_targets=[
+                    _describe_target(_seq_target(s)) for s in chosen_seqs if _seq_target(s)
+                ],
+            )
+        except Exception as e:
+            print(f"[WARN] decision journal: 분기 판단 수집 실패 {source_id}: {e}")
+
     def _allowed_targets_from(source_id: str) -> list[str]:
         # If source is a gateway, apply gateway-specific rules
         gateway_obj = process_definition.find_gateway_by_id(source_id)
@@ -4119,8 +4316,10 @@ def resolve_next_activity_payloads(
                         unknown_seqs.append(s)
 
                 chosen: list[Any] = []
+                selection_rule = RULE_NO_CANDIDATE
                 if len(true_seqs) == 1:
                     chosen = true_seqs
+                    selection_rule = RULE_SINGLE_TRUE
                 elif len(true_seqs) > 1:
                     # Use priority if available; if equal and no default, deterministically pick first
                     def _priority(seq_obj: Any) -> tuple[int, int]:
@@ -4142,12 +4341,17 @@ def resolve_next_activity_payloads(
                     sorted_true = sorted(true_seqs, key=_priority)
                     # Deterministic selection even if all priorities are equal and no default
                     chosen = [sorted_true[0]]
+                    selection_rule = RULE_PRIORITY
                 else:
                     # No explicit True
                     if default_seq is not None:
                         chosen = [default_seq]
+                        selection_rule = RULE_DEFAULT_FLOW
                     else:
                         chosen = []  # exclude (no stall globally; just this branch)
+                        selection_rule = RULE_NO_CANDIDATE
+
+                _record_decision(source_id, gateway_obj, "gateway", selection_rule, out_seqs, chosen)
 
                 targets: list[str] = []
                 for s in chosen:
@@ -4157,22 +4361,44 @@ def resolve_next_activity_payloads(
                 return targets
 
             # Other gateway types: fall back to non-strict filtering
+            allowed_seqs = [seq for seq in out_seqs if _sequence_condition_allows(getattr(seq, "id", None))]
+            # 병렬 분기는 모든 갈래가 실행되므로 필터링이 아니라 전체 진행으로 기술한다.
+            gateway_rule = RULE_ALL_BRANCHES if gw_type == "parallel" else RULE_FILTERED
+            _record_decision(source_id, gateway_obj, "gateway", gateway_rule, out_seqs, allowed_seqs)
+
             targets: list[str] = []
-            for seq in out_seqs:
-                if _sequence_condition_allows(getattr(seq, "id", None)):
-                    tgt = getattr(seq, "target", None) or getattr(seq, "targetRef", None)
-                    if tgt:
-                        targets.append(tgt)
+            for seq in allowed_seqs:
+                tgt = getattr(seq, "target", None) or getattr(seq, "targetRef", None)
+                if tgt:
+                    targets.append(tgt)
             return targets
 
         # Non-gateway source: apply condition filter as-is
+        source_out_seqs = [
+            seq for seq in sequences_all
+            if (getattr(seq, "source", None) or getattr(seq, "sourceRef", None)) == source_id
+        ]
+        allowed_seqs = [seq for seq in source_out_seqs if _sequence_condition_allows(getattr(seq, "id", None))]
+
+        if source_out_seqs:
+            source_node = None
+            try:
+                source_node = process_definition.find_activity_by_id(source_id)
+            except Exception:
+                source_node = None
+            # 갈래가 하나뿐이고 조건 평가가 없었다면 분기 판단이 아니라 단일 경로 진행이다.
+            activity_rule = (
+                RULE_UNCONDITIONAL
+                if len(source_out_seqs) == 1 and not isinstance((sequence_condition_data or {}).get(_seq_id(source_out_seqs[0])), dict)
+                else RULE_FILTERED
+            )
+            _record_decision(source_id, source_node, "activity", activity_rule, source_out_seqs, allowed_seqs)
+
         targets: list[str] = []
-        for seq in sequences_all:
-            source_ref = getattr(seq, "source", None) or getattr(seq, "sourceRef", None)
-            if source_ref == source_id and _sequence_condition_allows(getattr(seq, "id", None)):
-                target_ref = getattr(seq, "target", None) or getattr(seq, "targetRef", None)
-                if target_ref:
-                    targets.append(target_ref)
+        for seq in allowed_seqs:
+            target_ref = getattr(seq, "target", None) or getattr(seq, "targetRef", None)
+            if target_ref:
+                targets.append(target_ref)
         return targets
 
     def _collect_next_nodes() -> list[tuple[str, Any]]:
@@ -4587,12 +4813,26 @@ async def handle_workitem(workitem):
     if form_id and isinstance(output, dict) and output.get(form_id):
         output = output.get(form_id)
 
+    # 이 워크아이템 처리에서 일어나는 분기 판단을 모을 저널.
+    # 수집만 하고, 저장은 진행 경로 밖에서 이뤄진다.
+    decision_recorder = DecisionRecorder(
+        proc_inst_id=process_instance_id,
+        root_proc_inst_id=workitem.get('root_proc_inst_id') or process_instance_id,
+        proc_def_id=process_definition_id,
+        proc_def_version=(workitem.get('version') or workitem.get('version_tag')),
+        activity_id=activity_id,
+        workitem_id=workitem.get('id'),
+        tenant_id=tenant_id,
+        execution_scope=workitem.get('execution_scope'),
+        rework_count=workitem.get('rework_count'),
+    )
+
     try:
         next_activities = []
         next_near_activities = []
         gateway_condition_data = None
         sequence_condition_data = None
-        
+
         if process_definition:
             next_activities = [activity.id for activity in process_definition.find_next_activities(activity_id, True)]
             next_near_activities = [activity.id for activity in process_definition.find_near_next_activities(activity_id, True)]
@@ -4647,7 +4887,7 @@ async def handle_workitem(workitem):
             )
 
         sequence_condition_data = sequence_condition_data or {}
-        await _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions, workitem=workitem)
+        await _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions, workitem=workitem, recorder=decision_recorder)
 
         attached_activities = []
         for next_activity in next_near_activities:
@@ -4773,6 +5013,7 @@ async def handle_workitem(workitem):
                 activity_id,
                 workitem,
                 sequence_condition_data,
+                recorder=decision_recorder,
             )
 
 
@@ -4812,8 +5053,27 @@ async def handle_workitem(workitem):
         
             next_activity_payloads = await check_subprocess_expression(next_activity_payloads, chain_input_next)
 
+            payloads_before_join = list(next_activity_payloads or [])
             next_activity_payloads = await check_task_status(next_activity_payloads, chain_input_next)
-            
+
+            # 병합 게이트에서 걸러진 대상은 "진행"이 아니라 "다른 갈래 대기"다.
+            try:
+                kept_ids = {p.get("nextActivityId") for p in (next_activity_payloads or [])}
+                deferred_ids = [
+                    p.get("nextActivityId")
+                    for p in payloads_before_join
+                    if p.get("nextActivityId") and p.get("nextActivityId") not in kept_ids
+                ]
+                if deferred_ids:
+                    waiting_for = [
+                        item for item in merged_workitems_from_step
+                        if str(item.get("status") or "").upper() not in ("DONE", "COMPLETED", "CANCELLED")
+                    ]
+                    decision_recorder.mark_deferred(deferred_ids, waiting_for=waiting_for)
+            except Exception as e:
+                print(f"[WARN] decision journal: 대기 판정 수집 실패: {e}")
+
+
             next_activity_payloads = await check_role_binding(next_activity_payloads, chain_input_next)
 
             completed_json["nextActivities"] = next_activity_payloads
@@ -4838,6 +5098,9 @@ async def handle_workitem(workitem):
     except Exception as e:
         print(f"[ERROR] Error in handle_workitem for workitem {workitem['id']}: {str(e)}")
         raise e
+    finally:
+        # 진행 성공·실패와 무관하게 지금까지 모인 판단 이력을 내보낸다.
+        flush_decision_journal(decision_recorder, tenant_id)
 
 
 async def handle_service_workitem(workitem):

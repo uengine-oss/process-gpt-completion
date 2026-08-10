@@ -588,6 +588,10 @@ class WorkItem(BaseModel):
     log: Optional[str] = None
     agent_mode: Optional[str] = None
     agent_orch: Optional[str] = None
+    # cliagents 오케스트레이션이 "어떤 CLI(claude-code/codex)·모델·권한으로 실행할지"를
+    # 담아 나르는 필드. 오케스트레이션마다 형태가 달라 컬럼을 늘리는 대신
+    # 액티비티 정의의 agentConfig 를 그대로 싣는다.
+    agent_config: Optional[Dict[str, Any]] = None
     feedback: Optional[List[Dict[str, Any]]] = []
     temp_feedback: Optional[str] = None
     execution_scope: Optional[str] = None
