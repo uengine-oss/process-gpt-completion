@@ -12,12 +12,16 @@ def _version_as_float(v: Any) -> float:
 
 def fetch_proc_def_row(supabase, def_id: str, tenant_id: str) -> Optional[dict]:
     """
-    proc_def 테이블에서 row 전체를 조회합니다. (definition/bpmn/prod_version 등 포함)
+    proc_def 테이블에서 버전 결정에 필요한 컬럼만 조회합니다.
+
+    이전에는 select("*") 였는데, 호출부(fetch_process_definition_by_version_ts_style)가 실제로
+    사용하는 필드는 definition 과 prod_version 뿐이다. proc_def 행에는 bpmn XML 원문이 함께 들어 있어
+    (운영 기준 uengine 테넌트 평균 약 17KB/행) 워크아이템마다 불필요한 대용량 전송이 발생했다.
     - supabase: supabase python client
     """
     response = (
         supabase.table("proc_def")
-        .select("*")
+        .select("definition, prod_version")
         .eq("id", def_id.lower())
         .eq("tenant_id", tenant_id)
         .execute()

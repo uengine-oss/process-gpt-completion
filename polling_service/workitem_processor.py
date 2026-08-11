@@ -4808,12 +4808,26 @@ async def handle_workitem(workitem):
                 process_definition_json.get('events', [])
             )
             
-            next_activity_payloads = await check_event_expression(next_activity_payloads, chain_input_next)
-        
-            next_activity_payloads = await check_subprocess_expression(next_activity_payloads, chain_input_next)
+            # 후처리 4종은 모두 next_activity_payloads 를 제자리(in-place)로 채운 뒤 같은 리스트를 돌려준다.
+            # 각 단계가 LLM 을 한 번씩 호출하므로 순차 실행 시 2~5초짜리 왕복이 그대로 누적됐다.
+            #
+            # 병렬화 범위를 나눈 이유:
+            #  - check_event_expression 은 dueDate/expression 만 기록해 다른 단계와 겹치지 않는다. → 병렬 가능
+            #  - check_subprocess_expression 은 chain_input_next 의 previous_outputs 항목에 표시용 name 을
+            #    덧붙이고(약 3182행), check_role_binding 은 그 previous_outputs 를 읽어 담당자를 유추한다.
+            #    즉 이 둘 사이에는 실제 순서 의존성이 있어 함께 묶어 순차로 유지한다.
+            #  - check_task_status 는 LLM 없이 동작하는 필터이며, check_role_binding 은 그 뒤에서
+            #    "걸러진 후보"만 보고 담당자를 정한다. 이 순서를 바꾸면 role_binding 이 보는 후보 집합이
+            #    달라져 배정 결과가 바뀔 수 있으므로 subprocess → task_status → role_binding 순서는 그대로 둔다.
+            #
+            # 결과적으로 event 만 subprocess 와 겹쳐 실행해 LLM 왕복 1회를 임계 경로에서 걷어낸다.
+            await asyncio.gather(
+                check_event_expression(next_activity_payloads, chain_input_next),
+                check_subprocess_expression(next_activity_payloads, chain_input_next),
+            )
 
             next_activity_payloads = await check_task_status(next_activity_payloads, chain_input_next)
-            
+
             next_activity_payloads = await check_role_binding(next_activity_payloads, chain_input_next)
 
             completed_json["nextActivities"] = next_activity_payloads

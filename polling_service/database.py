@@ -10,6 +10,7 @@ from contextvars import ContextVar, copy_context
 from dotenv import load_dotenv
 from llm_factory import create_llm, create_embedding
 
+import copy
 import pytz
 import socket
 import os
@@ -24,6 +25,74 @@ from task_deadline import ensure_minimum_task_due_date
 supabase_client_var = ContextVar('supabase', default=None)
 subdomain_var = ContextVar('subdomain', default='localhost')
 CONSUMER_FILTER = os.getenv("WORKITEM_CONSUMER")
+
+
+# ---------------------------------------------------------------------------
+# 워크아이템 1건 처리 범위의 조회 캐시 (request-scoped memoization)
+#
+# 배경: 하나의 워크아이템을 처리하는 동안 동일한 proc_def 행을 3~4회 반복 조회했다.
+#   polling_service.safe_handle_workitem -> fetch_process_definition_by_version
+#   workitem_processor.get_workitem_position -> 동일 조회
+#   workitem_processor.handle_workitem -> 동일 조회
+# proc_def 행에는 definition JSON + bpmn XML 이 들어 있어 수백 KB~1MB 에 달하고,
+# 이 조회들은 모두 동기(blocking)라 이벤트 루프까지 함께 멈춘다.
+#
+# TTL 캐시가 아니라 "처리 1건 범위"로 한정한 이유:
+#   정의를 수정한 직후의 다음 워크아이템은 항상 최신 정의를 읽어야 하므로,
+#   워크아이템 경계를 넘겨 캐시하면 stale 정의로 실행될 위험이 있다.
+#
+# 각 워크아이템은 asyncio.create_task 로 개별 Task 에서 실행되므로
+# ContextVar 값이 워크아이템별로 자연히 격리된다.
+# ---------------------------------------------------------------------------
+_workitem_scope_cache_var: ContextVar = ContextVar('workitem_scope_cache', default=None)
+
+# None 자체가 유효한 조회 결과(정의 없음)이므로, 캐시 미스와 구분하기 위한 센티널.
+_CACHE_MISS = object()
+
+
+def begin_workitem_scope():
+    """워크아이템 처리 범위의 조회 캐시를 연다. 반환된 토큰을 end_workitem_scope 에 넘겨야 한다."""
+    return _workitem_scope_cache_var.set({})
+
+
+def end_workitem_scope(token) -> None:
+    """begin_workitem_scope 로 연 범위를 닫는다."""
+    try:
+        _workitem_scope_cache_var.reset(token)
+    except Exception:
+        # 다른 컨텍스트에서 reset 되는 예외 상황에서도 처리 흐름을 막지 않는다.
+        _workitem_scope_cache_var.set(None)
+
+
+def _scope_cache_get(key, miss=None):
+    cache = _workitem_scope_cache_var.get()
+    if cache is None:
+        return miss
+    if key not in cache:
+        return miss
+    # [중요] 반드시 복사본을 돌려준다.
+    #
+    # load_process_definition() 은 전달받은 definition dict 를 "제자리에서 변형"한다.
+    #   if 'events' in definition_json:
+    #       definition_json['gateways'].append(...)   # events 를 gateways 에 밀어넣음
+    # 캐시 없이 매번 새로 조회하던 때에는 호출마다 새 dict 라 문제가 없었지만,
+    # 같은 dict 를 여러 호출이 공유하면 호출할 때마다 events 가 gateways 에 중복 누적된다.
+    # (실측: 3회 호출 시 gateways 6 -> 8 -> 10 -> 12)
+    # 중복된 이벤트는 게이트웨이 분기 판정(has_event 게이트)을 망가뜨려
+    # 다음 액티비티가 엉뚱하게(예: 마지막 태스크로) 정해질 수 있다.
+    return copy.deepcopy(cache[key])
+
+
+def _scope_cache_put(key, value):
+    cache = _workitem_scope_cache_var.get()
+    if cache is not None:
+        # 캐시에도 호출부와 분리된 사본을 넣어, 호출부의 변형이 캐시에 스며들지 않게 한다.
+        try:
+            cache[key] = copy.deepcopy(value)
+        except Exception:
+            # 복사할 수 없는 값이면 캐시하지 않는다(정확성 우선).
+            cache.pop(key, None)
+    return value
 
 
 def run_async_in_sync_context(coro):
@@ -229,10 +298,16 @@ def fetch_process_definition_by_version(
     if not tenant_id:
         tenant_id = subdomain
 
+    # 동일 워크아이템 처리 중 같은 (정의, 버전) 조합은 한 번만 조회한다. (위 _workitem_scope_cache_var 설명 참고)
+    cache_key = ('proc_def_by_version', str(def_id).lower(), tenant_id, version_tag, str(version), arcv_id)
+    cached = _scope_cache_get(cache_key, miss=_CACHE_MISS)
+    if cached is not _CACHE_MISS:
+        return cached
+
     def fetch_arcv_rows(arcv: str) -> List[dict]:
         return fetch_process_definition_version_by_arcv_id(def_id, arcv, tenant_id) or []
 
-    return fetch_process_definition_by_version_ts_style(
+    result = fetch_process_definition_by_version_ts_style(
         supabase=supabase,
         def_id=def_id,
         tenant_id=tenant_id,
@@ -241,6 +316,7 @@ def fetch_process_definition_by_version(
         arcv_id=arcv_id,
         fetch_arcv_rows=fetch_arcv_rows,
     )
+    return _scope_cache_put(cache_key, result)
 
 
 def fetch_process_definition_latest_version(def_id, tenant_id: Optional[str] = None):

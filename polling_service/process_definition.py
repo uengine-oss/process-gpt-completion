@@ -841,9 +841,16 @@ class ProcessDefinition(BaseModel):
 
 def load_process_definition(definition_json: dict) -> ProcessDefinition:
     # Events를 게이트웨이 리스트에 추가
-    if 'events' in definition_json:
-        if 'gateways' not in definition_json:
-            definition_json['gateways'] = []
+    #
+    # [중요] 전달받은 definition_json 을 변형하면 안 된다.
+    # 예전에는 definition_json['gateways'] 에 직접 append 했는데, 호출부가 같은 dict 로
+    # 이 함수를 두 번 이상 호출하면 events 가 gateways 에 중복 누적됐다.
+    # (한 워크아이템 처리 중 이 함수는 3~4번 호출된다. 매번 새로 조회할 때는 드러나지 않다가,
+    #  정의 조회를 캐시하자 같은 dict 를 공유하게 되어 중복이 발생했다.)
+    # 중복 이벤트는 게이트웨이 분기 판정을 망가뜨려 다음 액티비티가 잘못 정해진다.
+    if isinstance(definition_json, dict) and 'events' in definition_json:
+        definition_json = dict(definition_json)  # 얕은 복사 — 원본 보호
+        merged_gateways = list(definition_json.get('gateways') or [])
         for event in definition_json['events']:
             gateway = {
                 'id': event['id'],
@@ -856,7 +863,8 @@ def load_process_definition(definition_json: dict) -> ProcessDefinition:
                 'description': event.get('description', ''),
                 'srcTrg': None
             }
-            definition_json['gateways'].append(gateway)
+            merged_gateways.append(gateway)
+        definition_json['gateways'] = merged_gateways
 
     process_def = ProcessDefinition(**definition_json)
     

@@ -8,7 +8,8 @@ from database import (
     setting_database, fetch_workitem_with_submitted_status, 
     upsert_workitem, cleanup_stale_consumers,
     fetch_process_definition_by_version, fetch_workitem_with_pending_status,
-    fetch_process_instance, upsert_process_instance
+    fetch_process_instance, upsert_process_instance,
+    begin_workitem_scope, end_workitem_scope
 )
 from workitem_processor import handle_workitem, handle_service_workitem, handle_pending_workitem
 from file_cleanup_service import file_cleanup_polling_task
@@ -19,6 +20,9 @@ running_tasks: Set[asyncio.Task] = set()
 shutdown_event = asyncio.Event()
 
 async def safe_handle_workitem(workitem):
+    # 이 워크아이템 처리 동안만 유효한 조회 캐시를 연다.
+    # (proc_def 재조회가 3~4회씩 반복되던 문제 해소 — database._workitem_scope_cache_var 주석 참고)
+    _scope_token = begin_workitem_scope()
     try:
         # consumer ?쒖쇅 洹쒖튃: consumer媛 "CONSUMER_FILTER? pod_id瑜?紐⑤몢 ?ы븿"?섎㈃ ?ㅽ궢
         if CONSUMER_FILTER:
@@ -108,6 +112,9 @@ async def safe_handle_workitem(workitem):
         # ?쒖뒪???꾨즺 ??異붿쟻 紐⑸줉?먯꽌 ?쒓굅
         if asyncio.current_task() in running_tasks:
             running_tasks.remove(asyncio.current_task())
+
+        # 워크아이템 범위 조회 캐시 해제 (다음 실행은 항상 최신 정의를 다시 읽는다)
+        end_workitem_scope(_scope_token)
 
 async def polling_workitem():
     try:
