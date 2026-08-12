@@ -17,6 +17,7 @@ from mcp_config_api import add_routes_to_app as add_mcp_routes_to_app
 from agent_chat import add_routes_to_app as add_agent_chat_routes_to_app
 from callbot_api import add_routes_to_app as add_callbot_routes_to_app
 from test_mode import add_routes_to_app as add_test_mode_routes_to_app
+from process_start_api import add_routes_to_app as add_process_start_routes_to_app
 from validate_improve import add_routes_to_app as add_validate_improve_routes_to_app
 
 from dotenv import load_dotenv
@@ -81,6 +82,7 @@ add_agent_chat_routes_to_app(app)
 add_callbot_routes_to_app(app)
 add_test_mode_routes_to_app(app)
 add_validate_improve_routes_to_app(app)
+add_process_start_routes_to_app(app)
 
 import asyncio
 

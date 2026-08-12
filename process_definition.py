@@ -115,32 +115,83 @@ class ProcessDefinition(BaseModel):
         Returns:
             bool: True if it's the starting activity, False otherwise.
         """
-        start_event = next((event for event in self.gateways if event.type == "startEvent"), None)
-        if not start_event:
+        start_event_id = self.find_start_event_id()
+        if not start_event_id:
             return False
 
         for sequence in self.sequences:
-            if sequence.source == start_event.id and sequence.target == activity_id:
+            if sequence.source == start_event_id and sequence.target == activity_id:
                 return True
         return False
 
+    def _is_start_typed_node(self, node_id: str) -> bool:
+        """노드 타입이 startEvent 계열인지. (load_process_definition 이 events 를 gateways 로 합쳐둔다)"""
+        node = self.find_gateway_by_id(node_id)
+        return bool(node and "start" in str(getattr(node, "type", "") or "").lower())
+
+    def find_start_event_id(self) -> Optional[str]:
+        """프로세스의 시작 지점 노드 id 를 찾는다.
+
+        id 문자열('start_event' 등)에 의존하지 않고 그래프 구조로 판별한다.
+            시작 지점 = 나가는 연결(outgoing)은 있고 들어오는 연결(incoming)은 없는 노드
+        보정 규칙:
+            1) 후보가 여럿이면 type 이 startEvent 인 것을 우선한다.
+            2) 서브프로세스 내부의 시작 이벤트는 제외한다.
+
+        기존 구현은 `start_event.id in seq.source` 로 '부분 문자열' 비교를 했고,
+        시작 이벤트가 없으면 AttributeError 로 죽었다.
+        """
+        targets = {seq.target for seq in self.sequences}
+        candidates: List[str] = []
+        for seq in self.sequences:
+            if seq.source and seq.source not in targets and seq.source not in candidates:
+                candidates.append(seq.source)
+
+        if not candidates:
+            node = next((g for g in self.gateways if str(getattr(g, "type", "")) == "startEvent"), None)
+            return node.id if node else None
+
+        sub_process_ids = {sp.id for sp in (getattr(self, "subProcesses", None) or [])}
+        if sub_process_ids:
+            top_level = []
+            for cid in candidates:
+                node = self.find_gateway_by_id(cid)
+                owner = getattr(node, "process", None) if node else None
+                if not (owner and owner in sub_process_ids):
+                    top_level.append(cid)
+            if top_level:
+                candidates = top_level
+
+        typed = next((cid for cid in candidates if self._is_start_typed_node(cid)), None)
+        return typed or candidates[0]
+
     def find_initial_activity(self) -> Optional[ProcessActivity]:
         """
-        Finds and returns the initial activity of the process, which is the one with no incoming sequences.
+        프로세스에서 가장 먼저 실행해야 할 액티비티를 반환한다.
 
-        Returns:
-            Optional[Activity]: The initial activity if found, None otherwise.
+        시작 지점에서 연결을 따라가며 처음 만나는 액티비티를 찾으므로,
+        시작 직후에 게이트웨이가 오는 정의도 올바르게 처리된다.
         """
-        start_event = next((event for event in self.gateways if event.type == "startEvent"), None)
-        # Find the sequence with "start_event" as the source
-        start_sequence = next((seq for seq in self.sequences if start_event.id in seq.source), None)
-        
-        if start_sequence:
-            # Find the activity that matches the target of the start sequence
-            return next((activity for activity in self.activities if activity.id == start_sequence.target), None)
-        
-        return None
-    
+        start_event_id = self.find_start_event_id()
+
+        visited: set = set()
+        queue: List[str] = [start_event_id] if start_event_id else []
+        while queue:
+            node_id = queue.pop(0)
+            if not node_id or node_id in visited:
+                continue
+            visited.add(node_id)
+            for seq in self.sequences:
+                if seq.source != node_id:
+                    continue
+                activity = self.find_activity_by_id(seq.target)
+                if activity:
+                    return activity
+                queue.append(seq.target)
+
+        targets = {seq.target for seq in self.sequences}
+        return next((a for a in self.activities if a.id not in targets), None)
+
     def find_prev_activity(self, current_activity_id: str) -> Optional[ProcessActivity]:
         for sequence in self.sequences:
             if sequence.target == current_activity_id:

@@ -57,6 +57,72 @@ def test_load_process_definition_does_not_mutate_input():
     assert gateway_counts.pop() == original_gateways + len(data["events"])
 
 
+def _minimal_def(**overrides):
+    base = {
+        "processDefinitionId": "p",
+        "processDefinitionName": "p",
+        "activities": [],
+        "sequences": [],
+        "gateways": [],
+        "events": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_start_event_detected_by_structure_not_by_id_text():
+    """시작 이벤트 id 가 'start_event' 가 아니어도 찾아야 한다.
+
+    구조 규칙: 나가는 연결은 있고 들어오는 연결이 없는 노드가 시작 지점이다.
+    (실제로 id 가 'start_event1' 인 정의에서 첫 태스크를 못 찾아 마지막 태스크가 실행됐다)
+    """
+    d = _minimal_def(
+        events=[{"id": "start_event1", "type": "startEvent"}, {"id": "end_event1", "type": "endEvent"}],
+        # activities 순서를 일부러 뒤집어 둔다 — 배열 순서에 의존하면 안 된다
+        activities=[
+            {"id": "last_task", "name": "마지막", "type": "userTask", "description": "", "role": ""},
+            {"id": "first_task", "name": "처음", "type": "userTask", "description": "", "role": ""},
+        ],
+        sequences=[
+            {"id": "seq1", "source": "start_event1", "target": "first_task"},
+            {"id": "seq2", "source": "first_task", "target": "last_task"},
+            {"id": "seq3", "source": "last_task", "target": "end_event1"},
+        ],
+    )
+    pd = load_process_definition(d)
+    assert pd.find_start_event_id() == "start_event1"
+    assert pd.find_initial_activity().id == "first_task"
+    assert pd.is_starting_activity("first_task") is True
+    assert pd.is_starting_activity("last_task") is False
+
+
+def test_start_event_followed_by_gateway():
+    """시작 직후에 게이트웨이가 오는 정의도 첫 액티비티를 찾아야 한다."""
+    d = _minimal_def(
+        events=[{"id": "Event_abc", "type": "startEvent"}],
+        gateways=[{"id": "gw1", "type": "exclusiveGateway"}],
+        activities=[{"id": "t1", "name": "T1", "type": "userTask", "description": "", "role": ""}],
+        sequences=[
+            {"id": "seq4", "source": "Event_abc", "target": "gw1"},
+            {"id": "seq5", "source": "gw1", "target": "t1"},
+        ],
+    )
+    pd = load_process_definition(d)
+    assert pd.find_start_event_id() == "Event_abc"
+    assert pd.find_initial_activity().id == "t1"
+
+
+def test_subprocess_start_event_is_not_chosen():
+    """서브프로세스 내부의 시작 이벤트를 최상위 시작점으로 착각하면 안 된다."""
+    path = Path(__file__).resolve().parent / "testSubprocess.json"
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    pd = load_process_definition(data)
+    # 최상위 시작 이벤트(Event_14j6t25)의 다음 액티비티가 나와야 한다.
+    assert pd.find_start_event_id() == "Event_14j6t25"
+    assert pd.find_initial_activity().id == "Activity_0ot7kwf"
+
+
 def test_loads_test_subprocess_definition():
     path = Path(__file__).resolve().parent / "testSubprocess.json"
     assert path.exists(), f"Test data JSON not found: {path}"
