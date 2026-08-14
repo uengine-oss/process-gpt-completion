@@ -1119,8 +1119,17 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                 workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul'))
                 user_info = fetch_assignee_info(completed_activity['completedUserEmail'])
                 if user_info:
-                    workitem.user_id = user_info.get('id')
-                    workitem.username = user_info.get('name')
+                    completed_user_id = user_info.get('id')
+                    existing_user_ids = [uid.strip() for uid in (workitem.user_id or '').split(',') if uid.strip()]
+                    if completed_user_id and completed_user_id not in existing_user_ids:
+                        existing_user_ids.append(completed_user_id)
+                        workitem.user_id = ','.join(existing_user_ids)
+
+                        existing_usernames = [name.strip() for name in (workitem.username or '').split(',') if name.strip()]
+                        completed_username = user_info.get('name')
+                        if completed_username and completed_username not in existing_usernames:
+                            existing_usernames.append(completed_username)
+                        workitem.username = ','.join(existing_usernames)
                 if workitem.assignees and len(workitem.assignees) > 0:
                     for assignee in workitem.assignees:
                         if assignee.get('endpoint') and assignee.get('endpoint') == workitem.user_id:
@@ -1524,7 +1533,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                         break
                 
                 # activity.agent媛 ?덉쑝硫?user_id??異붽? (以묐났 泥댄겕, ?곗꽑?쒖쐞 ?믪쓬)
-                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
+                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "" and is_user_in_tenant(safeget(activity, 'agent', None), tenant_id):
                     agent_id = safeget(activity, 'agent', None)
                     
                     # 湲곗〈 user_id? 議곗씤 (以묐났 泥댄겕)
@@ -1834,7 +1843,7 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                     activity_tool = 'formHandler:defaultForm'
                     
                 # activity.agent媛 ?덉쑝硫?user_id??異붽? (以묐났 泥댄겕, ?곗꽑?쒖쐞 ?믪쓬)
-                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
+                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "" and is_user_in_tenant(safeget(activity, 'agent', None), tenant_id):
                     agent_id = safeget(activity, 'agent', None)
                     
                     # 湲곗〈 user_id? 議곗씤 (以묐났 泥댄겕)
@@ -2156,6 +2165,24 @@ def upsert_chat_message(chat_room_id: str, data: Any, tenant_id: Optional[str] =
         
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+def is_user_in_tenant(user_id: str, tenant_id: str) -> bool:
+    try:
+        if not user_id or not tenant_id:
+            return False
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table("users").select("id").eq('id', user_id).eq('tenant_id', tenant_id).execute()
+        if response.data:
+            return True
+        response = supabase.table("users").select("id").eq('email', user_id).eq('tenant_id', tenant_id).execute()
+        return bool(response.data)
+    except Exception as e:
+        print(f"[ERROR] is_user_in_tenant: {str(e)}")
+        return False
+
 
 def fetch_user_info(email: str) -> Dict[str, str]:
     try:
