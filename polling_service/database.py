@@ -1117,19 +1117,32 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
             if workitem:
                 workitem.status = completed_activity['result']
                 workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul'))
-                user_info = fetch_assignee_info(completed_activity['completedUserEmail'])
-                if user_info:
+                # completedUserEmail은 담당자가 여러 명(멀티 에이전트)인 경우 쉼표로 이어진 목록으로 넘어온다.
+                # 목록 전체를 하나의 식별자로 조회하면 사용자를 찾지 못해 "a,b,c" 자체가 새 담당자로 추가되고,
+                # 결국 user_id가 "a,b,c,a,b,c"가 되어 칸반보드에 담당자가 두 배로 표기된다.
+                completed_user_keys = [
+                    key.strip()
+                    for key in (completed_activity.get('completedUserEmail') or '').split(',')
+                    if key.strip()
+                ]
+                existing_user_ids = [uid.strip() for uid in (workitem.user_id or '').split(',') if uid.strip()]
+                existing_usernames = [name.strip() for name in (workitem.username or '').split(',') if name.strip()]
+                for completed_user_key in completed_user_keys:
+                    user_info = fetch_assignee_info(completed_user_key)
+                    if not user_info:
+                        continue
                     completed_user_id = user_info.get('id')
-                    existing_user_ids = [uid.strip() for uid in (workitem.user_id or '').split(',') if uid.strip()]
-                    if completed_user_id and completed_user_id not in existing_user_ids:
-                        existing_user_ids.append(completed_user_id)
-                        workitem.user_id = ','.join(existing_user_ids)
+                    if not completed_user_id or completed_user_id in existing_user_ids:
+                        continue
+                    existing_user_ids.append(completed_user_id)
 
-                        existing_usernames = [name.strip() for name in (workitem.username or '').split(',') if name.strip()]
-                        completed_username = user_info.get('name')
-                        if completed_username and completed_username not in existing_usernames:
-                            existing_usernames.append(completed_username)
-                        workitem.username = ','.join(existing_usernames)
+                    completed_username = user_info.get('name')
+                    if completed_username and completed_username not in existing_usernames:
+                        existing_usernames.append(completed_username)
+                if existing_user_ids:
+                    workitem.user_id = ','.join(existing_user_ids)
+                if existing_usernames:
+                    workitem.username = ','.join(existing_usernames)
                 if workitem.assignees and len(workitem.assignees) > 0:
                     for assignee in workitem.assignees:
                         if assignee.get('endpoint') and assignee.get('endpoint') == workitem.user_id:
@@ -1181,9 +1194,28 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                             user_id = ','.join(role_binding['endpoint']) if isinstance(role_binding['endpoint'], list) else role_binding['endpoint']
                             assignees.append(role_binding)
                 
-                user_info = None
-                if completed_activity.get('completedUserEmail') and completed_activity['completedUserEmail'] != user_id:
-                    user_info = fetch_assignee_info(completed_activity['completedUserEmail'])
+                # 위와 마찬가지로 담당자가 여러 명이면 쉼표 목록으로 넘어오므로 하나씩 조회한다.
+                # 조회 결과가 없으면 역할 바인딩에서 구한 user_id를 그대로 사용한다.
+                completed_user_keys = [
+                    key.strip()
+                    for key in (completed_activity.get('completedUserEmail') or '').split(',')
+                    if key.strip()
+                ]
+                resolved_user_ids = []
+                resolved_usernames = []
+                for completed_user_key in completed_user_keys:
+                    user_info = fetch_assignee_info(completed_user_key)
+                    if not user_info:
+                        continue
+                    resolved_user_id = user_info.get('id')
+                    if not resolved_user_id or resolved_user_id in resolved_user_ids:
+                        continue
+                    resolved_user_ids.append(resolved_user_id)
+                    resolved_username = user_info.get('name')
+                    if resolved_username and resolved_username not in resolved_usernames:
+                        resolved_usernames.append(resolved_username)
+                completed_user_id = ','.join(resolved_user_ids) if resolved_user_ids else user_id
+                completed_username = ','.join(resolved_usernames) if resolved_usernames else None
 
                 agent_orch = safeget(activity, 'orchestration', None)
                 if agent_orch == 'none':
@@ -1212,8 +1244,8 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                     proc_def_id=process_result_data['processDefinitionId'].lower(),
                     activity_id=completed_activity['completedActivityId'],
                     activity_name= f"{safeget(activity, 'name', '')}{scope_name}",
-                    user_id=user_info.get('id'),
-                    username=user_info.get('name'),
+                    user_id=completed_user_id,
+                    username=completed_username,
                     status=completed_activity['result'],
                     tool=safeget(activity, 'tool', ''),
                     start_date=start_date,
