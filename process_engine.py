@@ -4,9 +4,10 @@ from langchain.output_parsers.json import SimpleJsonOutputParser
 from llm_factory import create_llm
 from datetime import datetime, timedelta
 
-from database import fetch_process_definition_by_version, fetch_organization_chart, upsert_workitem, fetch_workitem_by_proc_inst_and_activity, insert_process_instance, fetch_workitem_by_id, upsert_process_definition, fetch_assignee_info, upsert_process_instance_source, fetch_process_instance
+from database import fetch_process_definition_by_version, fetch_organization_chart, upsert_workitem, fetch_workitem_by_proc_inst_and_activity, insert_process_instance, fetch_workitem_by_id, upsert_process_definition, fetch_assignee_info, upsert_process_instance_source, fetch_process_instance, deactivate_mcp_python_code
 from process_definition import load_process_definition, convert_definition_to_raw_json
 from compensation_handler import generate_compensation
+from deterministic_generator import REWORK_DISTRUST_THRESHOLD
 from semantic_naming import generate_semantic_name
 
 import traceback
@@ -334,6 +335,13 @@ async def submit_workitem(input: dict):
         )
     )
     upsert_workitem(workitem_data)
+
+    # 고착화(순방향 코드 생성)는 여기서 하지 않는다. 근거는 "이 액티비티가 성공적으로
+    # 끝난 적이 몇 번인가"이고 그 판정(DONE 전환)은 폴링 서비스가 내리므로, 트리거도
+    # 거기 있다(`polling_service/database.py`의 워크아이템 저장 훅). 제출 시점에 걸면
+    # 자율 완료 모드 에이전트 액티비티는 이 경로를 지나지 않아 영영 고착화되지 않고,
+    # 사람이 제출하는 폼 액티비티에서는 부수효과 이력이 없어 매번 헛돈다.
+
     return workitem_data
 
 ############# start of role binding #############
@@ -857,6 +865,20 @@ async def handle_rework_complete(request: Request):
             new_workitem = await create_new_workitem(workitem, status)
             db_result = upsert_workitem(new_workitem)
             await generate_compensation(workitem, new_workitem)
+
+            # 재작업 1회는 대개 입력이 틀린 경우이므로 고착화된 코드를 그대로 두고
+            # 되돌린 뒤 새 파라미터로 재실행한다. 그런데도 다시 재작업되면 코드
+            # 자체를 의심해 비활성화하고 이후 실행을 에이전트에게 되돌린다.
+            next_rework_count = int(new_workitem.get('rework_count') or 0)
+            if next_rework_count >= REWORK_DISTRUST_THRESHOLD:
+                removed = deactivate_mcp_python_code(
+                    workitem.proc_def_id, workitem.activity_id, workitem.tenant_id, 'rework'
+                )
+                if removed:
+                    print(
+                        f"[INFO] Deterministic code deactivated for activity={workitem.activity_id} "
+                        f"(rework_count={next_rework_count})"
+                    )
             if db_result and hasattr(db_result, 'data') and db_result.data:
                 new_workitem_id = db_result.data[0].get('id')
                 result[new_workitem_id] = db_result.data[0]
