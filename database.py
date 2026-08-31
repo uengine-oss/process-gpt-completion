@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import HTTPException
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
 from contextvars import ContextVar
 from dotenv import load_dotenv
@@ -1774,13 +1774,74 @@ def fetch_mcp_python_code(proc_def_id: str, activity_id: str, tenant_id: str) ->
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
         
-        response = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).order('created_at', desc=True).limit(1).execute()
+        # 비활성화된 코드는 제외한다. 재작업이 반복되어 신뢰를 잃은 코드는 행으로
+        # 남되 다시 선택되지 않는다.
+        response = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).is_('deactivated_at', 'null').order('created_at', desc=True).limit(1).execute()
         if response.data and len(response.data) > 0:
             return response.data[0]
         else:
             return None
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+def fetch_last_deactivated_at(proc_def_id: str, activity_id: str, tenant_id: str) -> Optional[str]:
+    """해당 액티비티의 가장 최근 비활성 시각. 표본 재축적의 기준점이 된다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table('mcp_python_code').select('deactivated_at').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).not_.is_('deactivated_at', 'null').order('deactivated_at', desc=True).limit(1).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0].get('deactivated_at')
+        return None
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch last deactivated_at: {str(e)}")
+        return None
+
+def deactivate_mcp_python_code(proc_def_id: str, activity_id: str, tenant_id: str, reason: str) -> int:
+    """해당 액티비티의 활성 코드를 비활성화한다. 행은 이력으로 남긴다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table('mcp_python_code').update({
+            'deactivated_at': datetime.now(timezone.utc).isoformat(),
+            'deactivated_reason': reason,
+        }).eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).is_('deactivated_at', 'null').execute()
+        return len(response.data or [])
+    except Exception as e:
+        print(f"[WARNING] Failed to deactivate mcp_python_code: {str(e)}")
+        return 0
+
+def fetch_workitems_by_activity(
+    proc_def_id: str,
+    activity_id: str,
+    tenant_id: str,
+    status: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = 12
+) -> List[Dict[str, Any]]:
+    """같은 액티비티의 워크아이템을 최신순으로 조회한다. 고착화 표본 수집에 쓴다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        # query(워크아이템 지시문)까지 가져온다. 파라미터 이름표를 그 지시문에서
+        # 관측하기 때문이다 — 없으면 고착화 코드가 다음 실행에서 입력을 못 찾는다.
+        query = supabase.table('todolist').select('id, proc_inst_id, rework_count, updated_at, status, query') \
+            .eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
+        if status:
+            query = query.eq('status', status)
+        if since:
+            query = query.gt('updated_at', since)
+        response = query.order('updated_at', desc=True).limit(limit).execute()
+        return response.data or []
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch workitems by activity: {str(e)}")
+        return []
 
 def upsert_mcp_python_code(record: Dict[str, Any]):
     try:
