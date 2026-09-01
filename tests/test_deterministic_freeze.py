@@ -16,7 +16,9 @@ import pytest
 
 from deterministic_signature import (
     execution_fingerprint,
+    build_output_template,
     identify_parameters,
+    unrecoverable_parameters,
     is_readonly_sql,
     is_write_call,
     looks_like_sql,
@@ -680,3 +682,298 @@ def test_failure_in_a_context_action_does_not_disqualify_the_run(generator):
             "updated_at": f"2026-08-0{index}", "query": "",
         })
     assert generator.try_freeze(_Workitem()) is not None
+
+
+# --------------------------------------------------------------------------
+# 실행 식별자 — 지시문에서 되찾을 수 없는 자리
+# --------------------------------------------------------------------------
+
+def _ledger_sample(applicant, amount, proc_inst_id, todo_id):
+    return [
+        ("db_exec", {"sql": (
+            "INSERT INTO expense_ledger "
+            "(tenant_id, applicant, amount, proc_inst_id, todo_id) "
+            f"VALUES ('localhost', '{applicant}', {amount}, "
+            f"'{proc_inst_id}', '{todo_id}')"
+        )}),
+    ]
+
+
+_LEDGER_IDENTITIES = [
+    {"id": "todo-1", "proc_inst_id": "pi-1", "tenant_id": "localhost"},
+    {"id": "todo-2", "proc_inst_id": "pi-2", "tenant_id": "localhost"},
+    {"id": "todo-3", "proc_inst_id": "pi-3", "tenant_id": "localhost"},
+]
+
+
+def test_insert_values_take_their_column_names():
+    """VALUES 목록의 값은 앞에 이름이 없어 자리 번호로만 불렸다.
+
+    `query_7` 이라는 이름으로는 그 자리가 무엇인지 알 수 없고, 다음 실행에서 값을
+    되찾을 수도 없다. 컬럼 목록과 순서로 대응시켜 이름을 준다.
+    """
+    samples = [
+        _ledger_sample("홍길동", 50000, "pi-1", "todo-1"),
+        _ledger_sample("김철수", 30000, "pi-2", "todo-2"),
+        _ledger_sample("이영희", 45000, "pi-3", "todo-3"),
+    ]
+    plan = identify_parameters(samples, identities=_LEDGER_IDENTITIES)
+    assert {p["name"] for p in plan.parameters} == {
+        "applicant", "amount", "proc_inst_id", "todo_id",
+    }
+
+
+def test_runtime_identifiers_are_bound_to_the_workitem_row():
+    """실행 때 정해지는 값은 지시문이 아니라 워크아이템 행에서 읽는다."""
+    samples = [
+        _ledger_sample("홍길동", 50000, "pi-1", "todo-1"),
+        _ledger_sample("김철수", 30000, "pi-2", "todo-2"),
+        _ledger_sample("이영희", 45000, "pi-3", "todo-3"),
+    ]
+    plan = identify_parameters(samples, identities=_LEDGER_IDENTITIES)
+    by_name = {p["name"]: p for p in plan.parameters}
+    assert by_name["proc_inst_id"]["runtime"] == "proc_inst_id"
+    assert by_name["todo_id"]["runtime"] == "id"
+    # 업무 입력은 그대로 지시문에서 되찾는다.
+    assert "runtime" not in by_name["applicant"]
+    assert "runtime" not in by_name["amount"]
+
+
+def test_identifier_column_binds_even_when_the_agent_filled_it_wrong():
+    """에이전트가 그 자리를 잘못 채운 표본이 섞여도 자리의 뜻은 컬럼 이름이 정한다.
+
+    실제 이력에서 todo_id 자리에는 빈 문자열과 **다른 워크아이템의** id 가 섞여 있었다.
+    관측만 보면 식별자로 인정되지 않아, 위치 폴백이 엉뚱한 값을 채웠다.
+    """
+    samples = [
+        _ledger_sample("홍길동", 50000, "pi-1", "다른-워크아이템-id"),
+        _ledger_sample("김철수", 30000, "pi-2", ""),
+        _ledger_sample("이영희", 45000, "pi-3", "또-다른-id"),
+    ]
+    plan = identify_parameters(samples, identities=_LEDGER_IDENTITIES)
+    by_name = {p["name"]: p for p in plan.parameters}
+    assert by_name["todo_id"]["runtime"] == "id"
+
+
+def test_business_values_are_not_mistaken_for_identifiers():
+    """식별자와 무관한 컬럼은 그대로 지시문에서 되찾는다."""
+    samples = [
+        _ledger_sample("홍길동", 50000, "pi-1", "todo-1"),
+        _ledger_sample("김철수", 30000, "pi-2", "todo-2"),
+        _ledger_sample("이영희", 45000, "pi-3", "todo-3"),
+    ]
+    plan = identify_parameters(samples, identities=None)
+    by_name = {p["name"]: p for p in plan.parameters}
+    # identities 가 없어도 컬럼 이름만으로 식별자 자리는 가려낸다.
+    assert by_name["proc_inst_id"]["runtime"] == "proc_inst_id"
+    assert "runtime" not in by_name["applicant"]
+
+
+# --------------------------------------------------------------------------
+# 폼 산출물 템플릿
+# --------------------------------------------------------------------------
+
+_OBSERVATIONS = {"applicant": ("김철수", "이영희", "박지은"), "amount": (30000, 45000, 27000)}
+
+
+def _form(text):
+    return {"expense_form": {"ledger_result": text}}
+
+
+def test_constant_output_is_frozen_as_is():
+    outputs = [_form("등록 완료")] * 3
+    built = build_output_template(outputs, _OBSERVATIONS)
+    assert built == {
+        "form_id": "expense_form",
+        "fields": {"ledger_result": {"const": "등록 완료"}},
+    }
+
+
+def test_varying_output_folds_into_a_parameter_template():
+    """값의 차이가 파라미터로 전부 설명되면 템플릿으로 접힌다."""
+    outputs = [
+        _form("신청자 김철수, 금액 30000 등록 완료"),
+        _form("신청자 이영희, 금액 45000 등록 완료"),
+        _form("신청자 박지은, 금액 27000 등록 완료"),
+    ]
+    built = build_output_template(outputs, _OBSERVATIONS)
+    assert built["fields"]["ledger_result"] == {
+        "template": "신청자 ${applicant}, 금액 ${amount} 등록 완료"
+    }
+
+
+def test_prose_that_varies_in_wording_is_not_frozen():
+    """에이전트가 매번 다르게 쓴 문장은 굳히지 않는다.
+
+    표본 하나의 문장을 굳히면 그 표본의 사실이 다음 실행에 그대로 남는다. 실행기가
+    이번 실행의 사실로 채우도록 `None` 을 남긴다.
+    """
+    outputs = [
+        _form("INSERT 1건 완료"),
+        _form("지출 내역 1건이 등록되었습니다"),
+        _form("1건 INSERT를 실행했습니다"),
+    ]
+    assert build_output_template(outputs, _OBSERVATIONS)["fields"]["ledger_result"] is None
+
+
+def test_literal_dollar_survives_rendering():
+    """원문의 `$` 가 치환 기호로 읽히면 렌더가 통째로 깨진다."""
+    from string import Template
+
+    outputs = [
+        _form("비용 $30000 처리"),
+        _form("비용 $45000 처리"),
+        _form("비용 $27000 처리"),
+    ]
+    template = build_output_template(outputs, _OBSERVATIONS)["fields"]["ledger_result"]
+    assert Template(template["template"]).substitute({"amount": 51000}) == "비용 $51000 처리"
+
+
+def test_mismatched_forms_are_not_folded():
+    """폼 아이디나 필드 구성이 다르면 같은 산출물이 아니다."""
+    assert build_output_template(
+        [_form("a"), {"other_form": {"ledger_result": "a"}}, _form("a")], _OBSERVATIONS
+    ) is None
+    assert build_output_template(
+        [_form("a"), {"expense_form": {"different_field": "a"}}, _form("a")], _OBSERVATIONS
+    ) is None
+    # 산출물을 남기지 않은 표본이 섞여도 접지 않는다.
+    assert build_output_template([_form("a"), None, _form("a")], _OBSERVATIONS) is None
+
+
+# --------------------------------------------------------------------------
+# 되찾을 수 없는 파라미터 — 굳히기 전에 거른다
+# --------------------------------------------------------------------------
+
+def _write_sample(applicant, amount, body):
+    return [
+        ("db_exec", {"sql": f"INSERT INTO ledger (applicant, amount) "
+                            f"VALUES ('{applicant}', {amount})"}),
+        ("write_file", {"path": f"/out/{applicant}.md", "content": body}),
+    ]
+
+
+_QUERIES = [
+    '[InputData]\n{"form": {"applicant": "김철수", "amount": 30000}}',
+    '[InputData]\n{"form": {"applicant": "이영희", "amount": 45000}}',
+    '[InputData]\n{"form": {"applicant": "박지은", "amount": 27000}}',
+]
+
+
+def test_parameters_found_in_the_instruction_are_recoverable():
+    samples = [
+        _write_sample("김철수", 30000, "김철수 문서"),
+        _write_sample("이영희", 45000, "이영희 문서"),
+        _write_sample("박지은", 27000, "박지은 문서"),
+    ]
+    plan = identify_parameters(samples, _QUERIES)
+    # content 는 `{신청자} 문서` 라 신청자 파라미터로 접히고, 남는 자리는 지시문에 있다.
+    assert unrecoverable_parameters(plan, _QUERIES) == []
+
+
+def test_a_value_absent_from_every_instruction_blocks_the_freeze():
+    """문서 본문처럼 지시문에 없는 값은 다음 실행에서 되찾을 수 없다.
+
+    실행기의 위치 폴백은 지시문에서 순서대로 값을 집으므로 **언제나 성공**하고,
+    그 값으로 실제 도구를 부른다. 굳히기 전에 막아야 한다.
+    """
+    samples = [
+        _write_sample("김철수", 30000, "# 보고서\n\n지난 분기 매출은 상승했다."),
+        _write_sample("이영희", 45000, "# 보고서\n\n신규 고객이 늘었다."),
+        _write_sample("박지은", 27000, "# 보고서\n\n재고 회전율이 개선됐다."),
+    ]
+    plan = identify_parameters(samples, _QUERIES)
+    assert "content" in unrecoverable_parameters(plan, _QUERIES)
+
+
+def test_runtime_identifiers_are_exempt():
+    """실행 식별자는 지시문이 아니라 워크아이템 행에서 읽으므로 검사 대상이 아니다."""
+    samples = [
+        [("db_exec", {"sql": f"INSERT INTO t (applicant, proc_inst_id) "
+                             f"VALUES ('{who}', '{pi}')"})]
+        for who, pi in (("김철수", "pi-1"), ("이영희", "pi-2"), ("박지은", "pi-3"))
+    ]
+    identities = [{"proc_inst_id": f"pi-{i}"} for i in (1, 2, 3)]
+    plan = identify_parameters(samples, _QUERIES, identities)
+    by_name = {p["name"]: p for p in plan.parameters}
+    assert by_name["proc_inst_id"]["runtime"] == "proc_inst_id"
+    assert unrecoverable_parameters(plan, _QUERIES) == []
+
+
+def test_number_formatting_does_not_count_as_unrecoverable():
+    """`27,000` 과 `27000` 은 같은 값이다. 서식 차이로 막으면 굳을 수 있는 활동이 안 굳는다."""
+    samples = [
+        [("db_exec", {"sql": f"UPDATE t SET amount = {amount}"})]
+        for amount in (30000, 45000, 27000)
+    ]
+    formatted = [
+        '[InputData]\n{"form": {"amount": "30,000"}}',
+        '[InputData]\n{"form": {"amount": "45,000"}}',
+        '[InputData]\n{"form": {"amount": "27,000"}}',
+    ]
+    plan = identify_parameters(samples, formatted)
+    assert unrecoverable_parameters(plan, formatted) == []
+
+
+def test_no_instructions_means_no_verdict():
+    """지시문이 없으면 판정할 근거가 없다.
+
+    비어 있는 지시문에서는 실행기의 폴백이 집을 것도 없어 그냥 실패하고 에이전트로
+    넘어간다 — 안전한 쪽이다. 이 게이트는 쓸모없는 코드가 아니라 확신 있게 틀리는
+    코드를 막는다.
+    """
+    samples = [_write_sample("김철수", 30000, "a"), _write_sample("이영희", 45000, "b"),
+               _write_sample("박지은", 27000, "c")]
+    plan = identify_parameters(samples)
+    assert unrecoverable_parameters(plan, None) == []
+    assert unrecoverable_parameters(plan, ["", "  ", ""]) == []
+
+
+def test_freeze_is_withheld_when_a_parameter_cannot_be_recovered(generator):
+    """지시문에 없는 값이 파라미터로 승격되면 활동 전체를 굳히지 않는다.
+
+    이 게이트가 없으면 코드는 만들어지고, 실행기는 이름표 없는 자리를 위치 폴백으로
+    채운다. 폴백은 지시문에서 순서대로 값을 집으므로 언제나 성공하고, 그 값으로 실제
+    도구를 부른다. 실패가 아니라 확신 있는 오답이라 사람이 알아채기 어렵다.
+    """
+    for index, (todo, applicant, body) in enumerate(
+        [("u1", "김철수", "지난 분기 매출이 올랐다"),
+         ("u2", "이영희", "신규 고객이 늘었다"),
+         ("u3", "박지은", "재고 회전율이 개선됐다")], start=1
+    ):
+        generator._test_events[todo] = [
+            _event("db_exec", {"sql": f"INSERT INTO t (applicant) VALUES ('{applicant}')"},
+                   f"{todo}-1"),
+            _event("write_file", {"file_path": "/out/report.md", "content": body}, f"{todo}-2"),
+        ]
+        generator._test_workitems.append({
+            "id": todo, "proc_inst_id": f"pi-{todo}", "rework_count": 0,
+            "updated_at": f"2026-08-0{index}",
+            "query": f'[InputData]\n{{"form": {{"applicant": "{applicant}"}}}}',
+        })
+    assert generator.try_freeze(_Workitem()) is None
+    assert generator._test_saved == []
+
+
+def test_freeze_proceeds_when_every_parameter_is_recoverable(generator):
+    """같은 구조라도 변한 값이 전부 지시문에 있으면 굳는다.
+
+    위 테스트의 대조군이다 — 게이트가 지나치게 넓으면 아무것도 고착화되지 않는다.
+    """
+    for index, (todo, applicant) in enumerate(
+        [("r1", "김철수"), ("r2", "이영희"), ("r3", "박지은")], start=1
+    ):
+        generator._test_events[todo] = [
+            _event("db_exec", {"sql": f"INSERT INTO t (applicant) VALUES ('{applicant}')"},
+                   f"{todo}-1"),
+            _event("write_file", {"file_path": "/out/report.md", "content": f"{applicant} 보고서"},
+                   f"{todo}-2"),
+        ]
+        generator._test_workitems.append({
+            "id": todo, "proc_inst_id": f"pi-{todo}", "rework_count": 0,
+            "updated_at": f"2026-08-0{index}",
+            "query": f'[InputData]\n{{"form": {{"applicant": "{applicant}"}}}}',
+        })
+    record = generator.try_freeze(_Workitem())
+    assert record is not None
+    assert [p["name"] for p in record["parameters"]["parameters"]] == ["applicant"]

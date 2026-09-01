@@ -15,7 +15,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 # 인자 값이 SQL인지 판별하는 선두 키워드. 도구 이름이나 인자 키 이름에 의존하지 않는다.
@@ -182,6 +182,44 @@ def _literal_value(kind: str, raw: str) -> Any:
     return body.replace("''", "'")
 
 
+# `INSERT INTO t (컬럼들) VALUES (값들)` 을 찾는다. 값 목록 안에 함수 호출 같은
+# 괄호가 끼면 대응이 어긋나므로, 괄호가 없는 단순한 형태만 본다.
+_INSERT_COLUMNS = re.compile(
+    r"\bINSERT\s+INTO\s+[^\s(]+\s*\(([^()]*)\)\s*VALUES\s*\(", re.IGNORECASE
+)
+
+
+def _insert_column_hints(sql: str, literals: list[SqlLiteral]) -> list[SqlLiteral]:
+    """`INSERT ... VALUES` 의 값 자리에 대응하는 컬럼 이름을 붙인다.
+
+    `_IDENT_BEFORE` 는 값 **바로 앞** 의 식별자를 본다. VALUES 목록에서는 값 앞이
+    쉼표뿐이라 어떤 이름도 붙지 않고, 파라미터 이름이 `query_7` 같은 자리 번호가 된다.
+    그러면 그 자리가 무엇인지 알 길이 없어 다음 실행에서 값을 되찾지 못하고, 이름표도
+    없으니 위치 폴백으로 떨어져 **엉뚱한 값을 확신 있게** 넣는다(실제로 proc_inst_id
+    자리에 신청자 이름이 들어간 적이 있다). 컬럼 목록과 값 목록은 순서로 대응하므로
+    여기서 이어 준다.
+
+    개수가 맞지 않으면 아무것도 하지 않는다. 어긋난 대응은 없는 것만 못하다.
+    """
+    blanked = _blank_out_literals(sql)
+    match = _INSERT_COLUMNS.search(blanked)
+    if not match:
+        return literals
+    columns = [c.strip().strip('"').lower() for c in match.group(1).split(",")]
+    if not all(columns):
+        return literals
+    close = blanked.find(")", match.end())
+    if close < 0:
+        return literals
+    inside = [i for i, lit in enumerate(literals) if match.end() <= lit.start < close]
+    if len(inside) != len(columns):
+        return literals
+    hinted = list(literals)
+    for column, index in zip(columns, inside):
+        hinted[index] = replace(hinted[index], name_hint=column)
+    return hinted
+
+
 def normalize_sql(sql: str) -> SqlNormalization:
     """리터럴을 `?`로 치환한 지문과 치환된 리터럴 목록을 만든다.
 
@@ -215,7 +253,9 @@ def normalize_sql(sql: str) -> SqlNormalization:
     signature = re.sub(r"\s+", " ", "".join(parts)).strip()
     # IN (?, ?, ?) 처럼 길이만 다른 목록은 같은 구조로 본다.
     signature = re.sub(r"\(\s*\?(?:\s*,\s*\?)+\s*\)", "(?)", signature)
-    return SqlNormalization(signature=signature, literals=tuple(literals))
+    return SqlNormalization(
+        signature=signature, literals=tuple(_insert_column_hints(sql, literals))
+    )
 
 
 def _value_shape(value: Any) -> Any:
@@ -424,6 +464,9 @@ class ParameterSlot:
 class ParameterPlan:
     parameters: tuple[dict[str, Any], ...]
     slots: tuple[ParameterSlot, ...]
+    # 파라미터 이름 -> 표본별 관측값. 저장하지 않고 생성 단계에서만 쓴다. 산출물
+    # 템플릿을 접을 때 "이 표본에서 이 파라미터가 어떤 값이었는가"가 필요하다.
+    observations: dict[str, tuple[Any, ...]] = field(default_factory=dict)
 
     def as_specification(self) -> dict[str, Any]:
         return {"parameters": [dict(p) for p in self.parameters]}
@@ -611,8 +654,215 @@ def _shared_label(values: list[Any], contexts: list[str] | None) -> tuple[str, s
     return labels.pop()
 
 
+# 실행 때 정해지는 식별자. 키는 도구 인자·SQL 컬럼에 쓰이는 이름, 값은 그 값을 읽어
+# 올 워크아이템 행의 키다. 이 자리들은 워크아이템마다 달라지므로 파라미터로 승격되지만,
+# 지시문에는 적혀 있지 않아 텍스트로는 되찾을 수 없다.
+RUNTIME_IDENTITY_FIELDS: dict[str, str] = {
+    "todo_id": "id",
+    "workitem_id": "id",
+    "proc_inst_id": "proc_inst_id",
+    "root_proc_inst_id": "root_proc_inst_id",
+    "proc_def_id": "proc_def_id",
+    "activity_id": "activity_id",
+    "tenant_id": "tenant_id",
+}
+
+
+def _runtime_binding(
+    name: str, values: list[Any], identities: list[dict[str, Any]] | None
+) -> tuple[str, str] | None:
+    """이 자리가 실행 식별자인지 보고, 맞으면 (이름, 워크아이템 행의 키)를 돌려준다.
+
+    근거는 둘이다.
+
+    하나는 관측이다. 표본마다 그 자리의 값이 **그 워크아이템 자신의** 식별자와 같았다면,
+    그 자리는 사람이 적어 준 입력이 아니라 실행 때 정해지는 값이다.
+
+    다른 하나는 자리 이름이다. `INSERT ... (proc_inst_id, todo_id) VALUES (...)` 처럼
+    컬럼 이름이 식별자 그대로면 그 자리의 뜻은 분명하다. 이름까지 보는 이유는, 에이전트가
+    그 값을 잘못 채운 표본이 섞이기 때문이다 — 실제로 같은 활동의 표본 4건 중 둘은 빈
+    문자열을, 둘은 **다른 워크아이템의** id 를 넣었다. 관측만 보면 어느 것도 식별자로
+    인정되지 않고, 그러면 다음 실행에서 위치 폴백이 엉뚱한 값을 채운다.
+
+    어느 쪽으로든 식별자로 판정되면 지시문을 뒤지지 않는다. 이 자리들은 이름표가 붙지
+    않아, 되찾기에 실패하면 곧바로 위치·타입 폴백으로 떨어지는 자리다.
+    """
+    if identities and len(identities) == len(values):
+        for field_name, row_key in RUNTIME_IDENTITY_FIELDS.items():
+            expected = [str(identity.get(row_key) or "") for identity in identities]
+            if all(expected) and [str(value) for value in values] == expected:
+                return field_name, row_key
+    row_key = RUNTIME_IDENTITY_FIELDS.get(str(name or "").lower())
+    return (str(name).lower(), row_key) if row_key else None
+
+
+
+def _escape_literal(text: str) -> str:
+    """`string.Template` 이 치환 기호로 읽지 않도록 문자 그대로의 `$` 를 접는다."""
+    return text.replace("$", "$$")
+
+
+def _as_template(value: str, sample_values: list[tuple[str, str]]) -> str:
+    """관측된 문자열에서 파라미터 값이 있던 자리를 `${이름}` 으로 바꾼다.
+
+    긴 값부터 바꾼다. 짧은 값이 긴 값의 일부일 때(`3` 과 `30000`) 짧은 쪽이 먼저
+    먹으면 남은 자리가 어긋난다. 치환 자리는 먼저 표시만 해 두고, 나머지 글자를
+    이스케이프한 뒤에 기호로 되돌린다 — 그래야 원문의 `$` 와 우리가 넣은 `${...}` 가
+    섞이지 않는다.
+    """
+    marked = value
+    for name, observed in sorted(sample_values, key=lambda item: -len(item[1])):
+        if len(observed) < 2:
+            # 한 글자 값은 아무 데나 걸린다(`1` 이 `1건` 의 1 을 먹는다). 바꾸지 않으면
+            # 표본끼리 템플릿이 어긋나 산출물 고착화를 포기하게 된다 — 안전한 쪽이다.
+            continue
+        marked = marked.replace(observed, f"\x00{name}\x00")
+    parts = marked.split("\x00")
+    # 짝수 자리는 원문, 홀수 자리는 파라미터 이름이다.
+    return "".join(
+        _escape_literal(part) if index % 2 == 0 else "${" + part + "}"
+        for index, part in enumerate(parts)
+    )
+
+
+def build_output_template(
+    outputs: list[Any], observations: dict[str, tuple[Any, ...]]
+) -> dict[str, Any] | None:
+    """표본들의 폼 산출물을 파라미터 템플릿 하나로 접는다.
+
+    에이전트는 도구를 부르고 끝나지 않는다. 마지막에 워크아이템의 폼 필드 값을 내놓고,
+    다음 활동은 그 값을 입력으로 받는다. 고착화 코드가 도구 호출만 재현하면 폼이 빈 채로
+    워크아이템이 완료되어 다음 단계가 굶는다.
+
+    필드마다 셋 중 하나로 정한다.
+
+    - 표본 전체에서 값이 같았다 → 상수. 그대로 굳힌다.
+    - 값이 달랐고 그 차이가 파라미터로 **전부** 설명된다 → 템플릿. 다음 실행의 입력으로
+      렌더한다.
+    - 설명되지 않는 차이가 남는다 → 굳히지 않는다(`None`). 남은 조각은 표본 하나의
+      사실이라 그대로 굳으면 다음 실행에서 조용히 틀린다. 실행기가 이번 실행에서 실제로
+      일어난 일로 채운다.
+
+    표본들의 폼 아이디나 필드 구성이 다르면 접지 않는다 — 같은 활동의 같은 산출물이
+    아니라는 뜻이다.
+    """
+    forms = [output for output in outputs if isinstance(output, dict) and len(output) == 1]
+    if len(forms) != len(outputs) or not forms:
+        return None
+    form_ids = {next(iter(form)) for form in forms}
+    if len(form_ids) != 1:
+        return None
+    form_id = form_ids.pop()
+
+    bodies = [form[form_id] for form in forms]
+    if not all(isinstance(body, dict) for body in bodies):
+        return None
+    keys = {tuple(sorted(body)) for body in bodies}
+    if len(keys) != 1:
+        return None
+
+    per_sample = [
+        [(name, str(values[index])) for name, values in observations.items()
+         if index < len(values) and str(values[index]).strip()]
+        for index in range(len(bodies))
+    ]
+
+    fields: dict[str, Any] = {}
+    for key in keys.pop():
+        values = [body[key] for body in bodies]
+        if len({_hashable(value) for value in values}) == 1:
+            fields[key] = {"const": values[0]}
+            continue
+        if not all(isinstance(value, str) for value in values):
+            fields[key] = None
+            continue
+        templates = {
+            _as_template(value, per_sample[index]) for index, value in enumerate(values)
+        }
+        fields[key] = {"template": templates.pop()} if len(templates) == 1 else None
+
+    return {"form_id": form_id, "fields": fields}
+
+
+# 지시문에서 숫자를 찾을 때 쓰는 토막. 자릿수 구분 쉼표와 소수점을 포함해 잡는다.
+_NUMBER_TOKEN = re.compile(r"-?[\d,]*\d(?:\.\d+)?")
+
+
+def _as_number(text: str) -> float | None:
+    try:
+        return float(str(text).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _appears_in(value: Any, context: str) -> bool:
+    """값이 그 워크아이템의 지시문에 실제로 나타나는가.
+
+    숫자는 표기가 흔들린다(`27000` / `27,000` / `27000.0`). 자릿수가 같으면 같은 값으로
+    본다 — 서식 차이로 되찾을 수 없다고 잘못 판정하면, 굳을 수 있는 활동이 영영 안 굳는다.
+    """
+    raw = str(value).strip()
+    if not raw or not context:
+        return False
+    if raw in context:
+        return True
+    number = _as_number(raw)
+    if number is None:
+        return False
+    return any(_as_number(match.group()) == number for match in _NUMBER_TOKEN.finditer(context))
+
+
+def unrecoverable_parameters(
+    plan: ParameterPlan, contexts: list[str] | None
+) -> list[str]:
+    """다음 실행에서 값을 되찾을 수 없는 파라미터 이름들.
+
+    고착화된 코드는 새 워크아이템의 **지시문에서 값을 뽑아** 실행된다. 그런데 그 값이
+    표본의 지시문에도 없었다면, 다음 지시문에도 없을 것이다. 그때 실행기는 실패하지
+    않는다 — 이름표가 없는 자리는 위치·타입 폴백으로 떨어지고, 폴백은 지시문에서
+    순서대로 값을 집으므로 **언제나 무언가를 채우는 데 성공**한다. 그리고 그 값으로
+    실제 도구를 부른다. 경비 대장의 `proc_inst_id` 자리에 신청자 이름이, `todo_id`
+    자리에 계정과목이 들어간 적이 있다. 조용히 틀리는 게 아니라 확신 있게 틀린다.
+
+    그래서 지금까지 "재현할 수 없는 **행위**"만 거르던 것을(대상 경로 없는 파일 조작,
+    서버를 못 찾은 MCP 도구) "되찾을 수 없는 **입력**"까지 넓힌다. 값이 어디서 오는지
+    모르는 채로 굳히느니 에이전트에게 맡긴다.
+
+    막는 것은 "지시문에 내용이 있는데 그 값이 없는" 경우다. 지시문이 비어 있으면 폴백이
+    집을 것도 없어 실행기가 그냥 실패하고 에이전트로 넘어간다 — 안전한 쪽이라 막지 않는다.
+    이 게이트는 쓸모없는 코드가 아니라 **확신 있게 틀리는 코드**를 막는다.
+
+    내용이 있는 표본 **전부**에서 나타나야 인정한다. 한 표본에서만 우연히 맞은 것은
+    근거가 아니다. 실행 식별자로 바인딩된 파라미터는 지시문이 아니라 워크아이템 행에서
+    읽으므로 뺀다.
+    """
+    if not contexts:
+        # 지시문을 모으지 않았으면 판정할 근거가 없다. 없는 근거로 막지는 않는다.
+        return []
+    unrecoverable: list[str] = []
+    for spec in plan.parameters:
+        if spec.get("runtime"):
+            continue
+        name = str(spec.get("name") or "")
+        values = plan.observations.get(name)
+        if not values or len(values) != len(contexts):
+            continue
+        judged = [
+            (value, context)
+            for value, context in zip(values, contexts)
+            if str(context or "").strip()
+        ]
+        if not judged:
+            continue
+        if not all(_appears_in(value, context) for value, context in judged):
+            unrecoverable.append(name)
+    return unrecoverable
+
+
 def identify_parameters(
-    samples: list[list[Any]], contexts: list[str] | None = None
+    samples: list[list[Any]],
+    contexts: list[str] | None = None,
+    identities: list[dict[str, Any]] | None = None,
 ) -> ParameterPlan:
     """지문이 같은 표본들에서 값이 변한 자리를 파라미터로 승격한다.
 
@@ -625,6 +875,9 @@ def identify_parameters(
 
     ``contexts``는 표본별 워크아이템 지시문이다. 주어지면 각 파라미터가 지시문에서
     어떤 이름표 뒤에 있었는지를 함께 기록한다 — 다음 실행에서 값을 되찾는 열쇠다.
+
+    ``identities``는 표본별 워크아이템의 식별자(행)이다. 주어지면 지시문에서 되찾을 수
+    없는 실행 식별자 자리를 가려내, 이름표 대신 어느 필드에서 읽을지를 기록한다.
     """
     collected, segment_kinds, spans, quoted = _slot_values(samples)
     varying = {key: values for key, values in collected.items() if len(set(map(_hashable, values))) > 1}
@@ -648,6 +901,7 @@ def identify_parameters(
 
     parameters: list[dict[str, Any]] = []
     slots: list[ParameterSlot] = []
+    observations: dict[str, tuple[Any, ...]] = {}
     used: set[str] = set()
     for _vector, keys in sorted(groups.items(), key=lambda item: sorted(item[1])):
         keys.sort()
@@ -661,6 +915,10 @@ def identify_parameters(
         # 되찾는 열쇠로만 `label` 에 남는다.
         if label and base[-1:].isdigit() and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", label[0]):
             base = label[0].lower()
+        runtime = _runtime_binding(base, varying[keys[0]], identities)
+        if runtime and base[-1:].isdigit():
+            # `query_8` 같은 자리 번호보다 `todo_id` 가 코드를 읽을 수 있게 만든다.
+            base = runtime[0]
         name = base
         suffix = 2
         while name in used:
@@ -669,6 +927,7 @@ def identify_parameters(
         used.add(name)
 
         values = varying[keys[0]]
+        observations[name] = tuple(values)
         example = values[0]
         # 텍스트 토큰은 늘 문자열로 잡히지만 실제로는 수량인 경우가 많다. 타입을
         # 숫자로 알려 두어야 다음 실행에서 입력을 숫자로 뽑아낼 수 있다.
@@ -676,7 +935,11 @@ def identify_parameters(
             example = _coerce_scalar(example)
         ptype = _python_type_name(example)
         spec: dict[str, Any] = {"name": name, "type": ptype, "example": example}
-        if label:
+        if runtime:
+            # 실행 식별자는 워크아이템 행에서 읽는다. 이름표를 함께 남기면 실행기가
+            # 지시문을 먼저 뒤져 엉뚱한 값을 집을 여지가 생긴다.
+            spec["runtime"] = runtime[1]
+        elif label:
             spec["label"], spec["label_position"] = label
         parameters.append(spec)
         for key in keys:
@@ -705,7 +968,9 @@ def identify_parameters(
             spec.pop("label", None)
             spec.pop("label_position", None)
 
-    return ParameterPlan(parameters=tuple(parameters), slots=tuple(slots))
+    return ParameterPlan(
+        parameters=tuple(parameters), slots=tuple(slots), observations=observations
+    )
 
 
 def _hashable(value: Any) -> Any:

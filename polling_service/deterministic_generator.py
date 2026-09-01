@@ -52,9 +52,11 @@ from deterministic_template import TEMPLATE
 from mcp_tool_index import build_tool_index_from_tenant
 from deterministic_signature import (
     ParameterPlan,
+    build_output_template,
     execution_fingerprint,
     identify_parameters,
     render_template,
+    unrecoverable_parameters,
 )
 from work_history import (
     FILE_WRITE,
@@ -81,9 +83,37 @@ def _trace_of(todo_id: str) -> List[Action]:
     return normalize_events(fetch_events_by_todo_id(todo_id))
 
 
+def _form_output_of(events: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    """에이전트가 마지막에 내놓은 폼 산출물을 읽는다.
+
+    실행기는 도구 호출이 끝난 뒤 `최종 결과 반환` 작업을 하나 더 띄우고, 그 완료
+    이벤트에 `{폼아이디: {필드: 값}}` 을 싣는다. 워크아이템의 산출물이 되는 값이고,
+    다음 활동이 입력으로 받는 값이기도 하다.
+
+    이벤트 타입 이름만으로 고르지 않는다. 러너마다 이름이 다르므로, **모양**으로
+    고른다 — 키가 하나뿐인 dict 이고 그 값이 다시 dict 인 완료 이벤트.
+    """
+    for event in sorted(events or [], key=lambda e: str(e.get("timestamp") or ""), reverse=True):
+        if str(event.get("crew_type") or "") != "result":
+            continue
+        data = event.get("data")
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except ValueError:
+                continue
+        if (
+            isinstance(data, dict)
+            and len(data) == 1
+            and isinstance(next(iter(data.values())), dict)
+        ):
+            return data
+    return None
+
+
 def collect_samples(
     proc_def_id: str, activity_id: str, tenant_id: str, since: Optional[str]
-) -> List[Tuple[List[Action], str]]:
+) -> List[Tuple[List[Action], str, Optional[Dict[str, Any]], Dict[str, Any]]]:
     """고착화 표본을 모은다.
 
     자격은 "완료(DONE)되었고 이후 재작업되지 않은 워크아이템"이다. DONE은 사람의
@@ -93,13 +123,17 @@ def collect_samples(
     ``since``(직전 비활성 시각) 이후에 완료된 것만 센다. 이전 표본을 다시 세면
     비활성화한 코드와 동일한 코드를 곧바로 재생성해 무한 반복에 빠진다.
 
-    각 표본은 **작업 이력 전체**(맥락 행위 포함)와 그 워크아이템의 지시문 한 쌍이다.
-    부수효과만 남기는 일은 지문 계산과 코드 컴파일 직전에 한다 — 어떤 스킬을 읽고 그
-    절차를 따랐는지는 생성된 코드의 출처로 함께 기록해야 하기 때문이다.
+    각 표본은 **작업 이력 전체**(맥락 행위 포함)와 그 워크아이템의 지시문, 그리고 그
+    워크아이템의 식별자다. 부수효과만 남기는 일은 지문 계산과 코드 컴파일 직전에 한다 —
+    어떤 스킬을 읽고 그 절차를 따랐는지는 생성된 코드의 출처로 함께 기록해야 하기 때문이다.
 
     지시문을 함께 모으는 이유는 파라미터 이름표 때문이다. 값이 관측될 때 지시문에서
     그 앞에 무엇이 적혀 있었는지를 알아야, 다음 실행의 지시문에서 같은 값을 되찾을 수
     있다.
+
+    식별자를 함께 모으는 이유는 그 반대다. `proc_inst_id`·`todo_id` 처럼 실행 때 정해지는
+    값은 지시문에 적혀 있지 않아 아무리 뒤져도 되찾을 수 없다. 그런 자리를 가려내려면
+    관측된 값을 그 워크아이템 자신의 식별자와 대조해야 한다.
     """
     candidates = fetch_workitems_by_activity(
         proc_def_id, activity_id, tenant_id, status="DONE", since=since, limit=REQUIRED_SAMPLES * 4
@@ -111,12 +145,13 @@ def collect_samples(
         key = str(item.get("proc_inst_id") or item.get("id"))
         highest_rework[key] = max(highest_rework.get(key, 0), int(item.get("rework_count") or 0))
 
-    samples: List[Tuple[List[Action], str]] = []
+    samples: List[Tuple[List[Action], str, Optional[Dict[str, Any]], Dict[str, Any]]] = []
     for item in candidates:
         key = str(item.get("proc_inst_id") or item.get("id"))
         if int(item.get("rework_count") or 0) < highest_rework.get(key, 0):
             continue
-        trace = _trace_of(item.get("id"))
+        events = fetch_events_by_todo_id(item.get("id"))
+        trace = normalize_events(events)
         effects = effect_actions(trace)
         if not effects:
             continue
@@ -129,7 +164,19 @@ def collect_samples(
                 activity_id, item.get("id"),
             )
             continue
-        samples.append((trace, str(item.get("query") or "")))
+        samples.append((
+            trace,
+            str(item.get("query") or ""),
+            _form_output_of(events),
+            {
+                "id": item.get("id"),
+                "proc_inst_id": item.get("proc_inst_id"),
+                "root_proc_inst_id": item.get("root_proc_inst_id"),
+                "proc_def_id": proc_def_id,
+                "activity_id": activity_id,
+                "tenant_id": tenant_id,
+            },
+        ))
         if len(samples) >= REQUIRED_SAMPLES:
             break
     return samples
@@ -295,8 +342,10 @@ def try_freeze(workitem) -> Optional[Dict[str, Any]]:
     collected = collect_samples(proc_def_id, activity_id, tenant_id, since)
     if len(collected) < REQUIRED_SAMPLES:
         return None
-    samples = [trace for trace, _query in collected]
-    queries = [query for _trace, query in collected]
+    samples = [trace for trace, _query, _output, _identity in collected]
+    queries = [query for _trace, query, _output, _identity in collected]
+    outputs = [output for _trace, _query, output, _identity in collected]
+    identities = [identity for _trace, _query, _output, identity in collected]
 
     # 지문은 부수효과 행위로만 잰다. 맥락 행위(스킬·파일 읽기, 조회)는 같은 일을
     # 하면서도 실행마다 횟수가 달라지기 마련이라, 그것까지 일치를 요구하면 어떤
@@ -309,7 +358,19 @@ def try_freeze(workitem) -> Optional[Dict[str, Any]]:
         )
         return None
 
-    plan = identify_parameters(effects, queries)
+    plan = identify_parameters(effects, queries, identities)
+
+    # 값이 어디서 오는지 모르는 파라미터가 하나라도 있으면 굳히지 않는다. 실행기의
+    # 위치·타입 폴백은 언제나 무언가를 채우는 데 성공하므로, 여기서 막지 않으면
+    # 엉뚱한 값으로 실제 도구를 부르는 코드가 남는다.
+    unrecoverable = unrecoverable_parameters(plan, queries)
+    if unrecoverable:
+        logger.info(
+            "고착화 보류 | activity=%s 지시문에서 되찾을 수 없는 파라미터: %s",
+            activity_id, ", ".join(unrecoverable),
+        )
+        return None
+
     tool_to_server = build_tool_index_from_tenant(tenant_id)
 
     provenance = summarize(samples[0])
@@ -326,6 +387,15 @@ def try_freeze(workitem) -> Optional[Dict[str, Any]]:
         logger.info("고착화 보류 | activity=%s %s", activity_id, exc)
         return None
 
+    # 폼 산출물까지 굳힌다. 도구 호출만 재현하면 워크아이템이 산출물 없이 완료되어
+    # 다음 활동이 입력을 못 받는다 — 에이전트가 하던 일의 절반만 하는 셈이다.
+    output_template = build_output_template(outputs, plan.observations)
+    if output_template is None:
+        logger.info(
+            "산출물 템플릿 없음 | activity=%s 표본의 폼 산출물 구성이 서로 다름 "
+            "— 실행 요약으로 폼을 채운다", activity_id,
+        )
+
     record = {
         "proc_def_id": proc_def_id,
         "activity_id": activity_id,
@@ -333,14 +403,22 @@ def try_freeze(workitem) -> Optional[Dict[str, Any]]:
         "code": code,
         "parameters": plan.as_specification(),
         "work_history": provenance,
+        "output_template": output_template,
     }
     upsert_mcp_python_code(record)
+    unresolved = [
+        key for key, spec in ((output_template or {}).get("fields") or {}).items()
+        if spec is None
+    ]
     logger.info(
-        "고착화 완료 | activity=%s 표본=%d 행위=%s 파라미터=%s",
+        "고착화 완료 | activity=%s 표본=%d 행위=%s 파라미터=%s 산출물=%s",
         activity_id,
         len(samples),
         json.dumps(provenance.get("by_kind") or {}, ensure_ascii=False),
         [p["name"] for p in plan.parameters],
+        "없음" if output_template is None
+        else f"{(output_template.get('form_id') or '')}"
+             f"{' (미해결: ' + ', '.join(unresolved) + ')' if unresolved else ''}",
     )
     return record
 

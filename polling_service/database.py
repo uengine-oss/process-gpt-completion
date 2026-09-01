@@ -2840,7 +2840,7 @@ def fetch_workitems_by_activity(
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
 
-        query = supabase.table('todolist').select('id, proc_inst_id, rework_count, updated_at, status, query') \
+        query = supabase.table('todolist').select('id, proc_inst_id, root_proc_inst_id, rework_count, updated_at, status, query') \
             .eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
         if status:
             query = query.eq('status', status)

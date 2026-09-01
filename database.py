@@ -1831,7 +1831,7 @@ def fetch_workitems_by_activity(
 
         # query(워크아이템 지시문)까지 가져온다. 파라미터 이름표를 그 지시문에서
         # 관측하기 때문이다 — 없으면 고착화 코드가 다음 실행에서 입력을 못 찾는다.
-        query = supabase.table('todolist').select('id, proc_inst_id, rework_count, updated_at, status, query') \
+        query = supabase.table('todolist').select('id, proc_inst_id, root_proc_inst_id, rework_count, updated_at, status, query') \
             .eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
         if status:
             query = query.eq('status', status)
