@@ -47,9 +47,9 @@ def test_json_string_payload_is_parsed():
 def test_nested_payload_is_unwrapped():
     """페이로드를 한 겹 더 감싸는 러너를 흡수한다."""
     actions = wh.normalize_events([
-        _event("tool_end", {"payload": {"name": "execute", "input": {"command": "ls -al"}}})
+        _event("tool_end", {"payload": {"name": "execute", "input": {"command": "rm -rf /tmp/x"}}})
     ])
-    assert [(a.kind, a.args["command"]) for a in actions] == [(wh.SHELL, "ls -al")]
+    assert [(a.kind, a.args["command"]) for a in actions] == [(wh.SHELL, "rm -rf /tmp/x")]
 
 
 def test_unknown_finished_event_type_is_still_read():
@@ -80,7 +80,9 @@ def test_actions_are_ordered_by_timestamp():
 
 @pytest.mark.parametrize("tool,args,expected", [
     ("execute", {"command": "python3 import.py"}, wh.SHELL),
-    ("bash", {"command": "ls"}, wh.SHELL),
+    ("bash", {"command": "rm -rf /tmp/x"}, wh.SHELL),
+    # 세상을 바꾸지 않는 셸은 맥락이다 — SQL의 SELECT와 같은 기준.
+    ("bash", {"command": "ls"}, wh.INSPECT),
     # 이름을 몰라도 "명령 문자열 하나"만 받으면 셸로 본다.
     ("run_it", {"command": "make build", "cwd": "/workspace"}, wh.SHELL),
     ("write_file", {"file_path": "/workspace/out.csv", "content": "a,b"}, wh.FILE_WRITE),
@@ -102,7 +104,7 @@ def test_action_kinds(tool, args, expected):
 def test_mcp_prefixed_tool_names_are_recognized():
     """`mcp__pg__execute_sql` 처럼 접두어가 붙어도 끝 마디로 판정한다."""
     assert wh.classify("mcp__fs__read_file", {"path": "/skills/x/SKILL.md"}) == wh.SKILL_READ
-    assert wh.classify("sandbox.execute", {"command": "echo hi"}) == wh.SHELL
+    assert wh.classify("sandbox.execute", {"command": "rm -rf /tmp/x"}) == wh.SHELL
 
 
 def test_command_named_arg_on_a_real_tool_is_not_shell():
@@ -136,13 +138,3 @@ def test_summary_records_skills_shell_and_files():
     assert summary["files_written"] == ["/workspace/out.json"]
     assert summary["shell_commands"] == ["python3 load.py --file in.csv"]
     assert summary["subagents"] == ["checker"]
-
-
-def test_log_entries_carry_args_for_effects_and_summaries_for_context():
-    trace = wh.normalize_events([
-        _event("tool_usage_finished", {"tool_name": "read_file", "args": {"file_path": "/skills/inv/SKILL.md"}}, "t1"),
-        _event("tool_usage_finished", {"tool_name": "db_exec", "args": {"sql": "UPDATE t SET a = 1"}}, "t2"),
-    ])
-    context, effect = wh.to_log_entries(trace)
-    assert context["kind"] == wh.SKILL_READ and "args" not in context
-    assert effect["kind"] == wh.MCP_CALL and effect["log_data"]["args"]["sql"] == "UPDATE t SET a = 1"

@@ -23,6 +23,9 @@ from deterministic_signature import (
     is_write_call,
     looks_like_sql,
     normalize_sql,
+    procedure_pins,
+    same_value,
+    structured_fields,
 )
 
 
@@ -144,6 +147,7 @@ def generator(monkeypatch):
     events: dict = {}
     workitems: list = []
     saved: list = []
+    upstream: dict = {}
 
     db = types.ModuleType("database")
     db.fetch_mcp_python_code = lambda *a, **k: None
@@ -151,6 +155,9 @@ def generator(monkeypatch):
     db.fetch_last_deactivated_at = lambda *a, **k: None
     db.fetch_workitems_by_activity = lambda *a, **k: workitems
     db.fetch_events_by_todo_id = lambda todo_id: events.get(todo_id, [])
+    db.fetch_related_workitem_outputs = lambda tenant, root, inst, **k: upstream.get(
+        str(k.get("exclude_id") or ""), []
+    )
     monkeypatch.setitem(sys.modules, "database", db)
 
     index = types.ModuleType("mcp_tool_index")
@@ -165,6 +172,7 @@ def generator(monkeypatch):
     module._test_events = events
     module._test_workitems = workitems
     module._test_saved = saved
+    module._test_upstream = upstream
     return module
 
 
@@ -977,3 +985,460 @@ def test_freeze_proceeds_when_every_parameter_is_recoverable(generator):
     record = generator.try_freeze(_Workitem())
     assert record is not None
     assert [p["name"] for p in record["parameters"]["parameters"]] == ["applicant"]
+
+
+# --------------------------------------------------------------------------
+# 단계 간 데이터 흐름 — 앞 단계의 결과가 뒤 단계의 인자로 흐른다
+# --------------------------------------------------------------------------
+#
+# 지금까지 인자는 둘 중 하나였다. 표본 전부에서 같았던 상수이거나, 다음 실행의
+# 지시문에서 되찾는 파라미터이거나. 그래서 "시각을 찍어 문서에 적는" 활동은 굳지
+# 않았다 — 그 시각은 지시문 어디에도 없고 표본마다 다르니 상수도 아니다.
+
+def _event_with_result(tool, args, result, timestamp):
+    return {"event_type": "tool_usage_finished", "timestamp": timestamp,
+            "data": {"tool_name": tool, "args": args, "result": result}}
+
+
+def _shell_result(stamp):
+    """실제 러너가 남기는 셸 결과 모양. 표준출력 뒤에 어댑터의 문구가 붙는다."""
+    return f"{stamp}\n\n[Command succeeded with exit code 0]"
+
+
+_RESOLUTION_SAMPLES = [
+    ("s1", "김철수", 30000, "2026-09-01T02:46:44Z"),
+    ("s2", "이영희", 45000, "2026-09-01T03:02:24Z"),
+    ("s3", "박지은", 27000, "2026-09-01T03:17:21Z"),
+]
+
+
+def _document_run(generator, todo, index, applicant, amount, stamp, written_stamp=None):
+    """시각을 찍고(셸) → 그 시각을 담은 문서를 쓴 실행 한 건."""
+    generator._test_events[todo] = [
+        _event("ls", {"path": "/workspace/out"}, f"{todo}-1"),
+        _event_with_result(
+            "execute", {"command": "mkdir -p /out && date -Iseconds"},
+            _shell_result(stamp), f"{todo}-2",
+        ),
+        _event("write_file", {
+            "file_path": f"/out/{applicant}.md",
+            "content": f"# 지출결의서\n| 신청자 | {applicant} |\n| 금액 | {amount} |\n"
+                       f"| 등록 시각 | {written_stamp or stamp} |\n",
+        }, f"{todo}-3"),
+    ]
+    generator._test_workitems.append({
+        "id": todo, "proc_inst_id": f"pi-{todo}", "rework_count": 0,
+        "updated_at": f"2026-08-0{index}",
+        "query": f'[InputData]\n{{"form": {{"applicant": "{applicant}", "amount": {amount}}}}}',
+    })
+
+
+def _freeze_document(generator, samples=None):
+    for index, (todo, applicant, amount, stamp) in enumerate(samples or _RESOLUTION_SAMPLES, start=1):
+        _document_run(generator, todo, index, applicant, amount, stamp)
+    return generator.try_freeze(_Workitem())
+
+
+def test_a_value_produced_by_an_earlier_step_is_not_a_parameter(generator):
+    """앞 단계가 만들어 낸 값은 밖에서 받을 것이 아니라 이어받을 것이다."""
+    record = _freeze_document(generator)
+    assert record is not None
+    names = {p["name"] for p in record["parameters"]["parameters"]}
+    assert names == {"applicant", "amount"}  # 시각은 파라미터가 아니다
+    assert "from_step(results, 0, \"output\", [], 0)" in record["code"]
+
+
+def test_step_binding_lets_the_document_activity_freeze(generator):
+    """이어받기가 없으면 이 활동은 "되찾을 수 없는 입력"으로 영영 보류된다.
+
+    시각은 지시문에 없다. 파라미터로 승격되는 한 게이트에 걸리고, 게이트를 열면
+    실행기의 위치 폴백이 엉뚱한 값을 시각 자리에 넣는다. 세 번째 갈래가 필요한 이유다.
+    """
+    assert _freeze_document(generator) is not None
+    assert generator._test_saved != []
+
+
+def test_step_binding_is_recorded_as_provenance(generator):
+    """무엇을 어디서 이어받았는지 남는다 — 앞 단계가 달라졌을 때 의심할 근거다."""
+    record = _freeze_document(generator)
+    bindings = record["work_history"]["step_bindings"]
+    assert len(bindings) == 1
+    assert bindings[0]["from"] == 0
+    assert bindings[0]["path"] == ["output", "line 0"]
+
+
+def test_bound_value_comes_from_this_run_not_from_the_sample(generator):
+    """재실행하면 문서의 시각이 **이번 실행**의 시각으로 채워진다.
+
+    표본 하나의 시각을 굳히면 그 표본의 사실이 다음 실행에 그대로 남아 조용히 틀린다.
+    """
+    record = _freeze_document(generator)
+    namespace: dict = {}
+    exec(compile(record["code"], "generated.py", "exec"), namespace)
+
+    written: list = []
+
+    async def fake_run_shell(command, cwd="", timeout_s=300):
+        return {"kind": "shell", "command": command, "output": "2026-12-25T09:00:00Z\n"}
+
+    async def fake_write_file(path, content):
+        written.append((path, content))
+        return {"path": path}
+
+    namespace["run_shell"] = fake_run_shell
+    namespace["write_file"] = fake_write_file
+    asyncio.run(namespace["run"]({"applicant": "최수정", "amount": 12000}))
+
+    path, content = written[0]
+    assert path == "/out/최수정.md"
+    assert "| 등록 시각 | 2026-12-25T09:00:00Z |" in content   # 이번 실행의 시각
+    assert "2026-09-01" not in content                          # 표본의 시각이 아니다
+    assert "| 신청자 | 최수정 |" in content
+
+
+def test_a_broken_step_binding_fails_instead_of_guessing(generator):
+    """이어받을 자리가 비면 값을 지어내지 않고 실패한다 — 실행기가 에이전트로 넘긴다."""
+    record = _freeze_document(generator)
+    namespace: dict = {}
+    exec(compile(record["code"], "generated.py", "exec"), namespace)
+
+    async def empty_shell(command, cwd="", timeout_s=300):
+        return {"kind": "shell", "command": command, "output": ""}
+
+    async def fake_write_file(path, content):
+        raise AssertionError("이어받을 값이 없는데 문서를 썼습니다")
+
+    namespace["run_shell"] = empty_shell
+    namespace["write_file"] = fake_write_file
+    with pytest.raises(RuntimeError):
+        asyncio.run(namespace["run"]({"applicant": "최수정", "amount": 12000}))
+
+
+def test_binding_requires_every_sample_to_agree(generator):
+    """한 표본에서만 맞아떨어진 자리를 믿으면 다음 실행에서 엉뚱한 값을 이어받는다.
+
+    한 실행에서 에이전트가 찍은 시각 대신 제 손으로 지어낸 시각을 적었다면, 그 자리는
+    앞 단계의 결과가 아니다. 이어받지 않고 파라미터로 두면 되찾을 수 없어 보류된다.
+    """
+    samples = list(_RESOLUTION_SAMPLES)
+    for index, (todo, applicant, amount, stamp) in enumerate(samples, start=1):
+        written = "2026-01-01T00:00:00Z" if todo == "s2" else stamp
+        _document_run(generator, todo, index, applicant, amount, stamp, written_stamp=written)
+    assert generator.try_freeze(_Workitem()) is None
+
+
+def test_number_formatting_does_not_split_a_bound_value(generator):
+    """금액 표기가 실행마다 흔들려도 자리 대조는 성립한다."""
+    for index, (todo, applicant, amount, stamp) in enumerate(_RESOLUTION_SAMPLES, start=1):
+        formatted = f"{amount:,}원" if index % 2 else str(amount)
+        _document_run(generator, todo, index, applicant, formatted, stamp)
+    record = generator.try_freeze(_Workitem())
+    assert record is not None
+    assert {p["name"] for p in record["parameters"]["parameters"]} == {"applicant", "amount"}
+
+
+# --------------------------------------------------------------------------
+# 액티비티를 건너뛰는 데이터 흐름 — 앞 워크아이템의 산출물
+# --------------------------------------------------------------------------
+
+_LEDGER_FORM = "expense_resolution_process_register_expense_ledger_form"
+
+
+def _upstream_run(generator, todo, index, applicant, stamp):
+    """앞 액티비티의 산출물(완료 시각)을 문서에 옮겨 적은 실행 한 건."""
+    generator._test_events[todo] = [
+        _event("write_file", {
+            "file_path": f"/out/{applicant}.md",
+            "content": f"| 신청자 | {applicant} |\n| 대장 등록 시각 | {stamp} |\n",
+        }, f"{todo}-1"),
+    ]
+    generator._test_workitems.append({
+        "id": todo, "proc_inst_id": f"pi-{todo}", "rework_count": 0,
+        "updated_at": f"2026-08-0{index}",
+        "query": f'[InputData]\n{{"form": {{"applicant": "{applicant}"}}}}',
+    })
+    generator._test_upstream[todo] = [{
+        "workitemId": f"w-{todo}",
+        "procInstId": f"pi-{todo}",
+        "activityId": "register_expense_ledger",
+        "activityName": "경비 대장 등록",
+        "endDate": stamp,
+        "output": {_LEDGER_FORM: {"ledger_result": f"{applicant} 1건 등록"}},
+    }]
+
+
+def test_a_value_from_the_previous_activity_is_bound_to_its_output(generator):
+    """지시문에 없어도 앞 워크아이템의 산출물에 있으면 되찾을 수 있다."""
+    for index, (todo, applicant, stamp) in enumerate(
+        [("u1", "김철수", "2026-09-01T11:55:47.027549"),
+         ("u2", "이영희", "2026-09-01T12:02:18.949265"),
+         ("u3", "박지은", "2026-09-01T12:20:55.413880")], start=1
+    ):
+        _upstream_run(generator, todo, index, applicant, stamp)
+    record = generator.try_freeze(_Workitem())
+    assert record is not None
+    bound = [p for p in record["parameters"]["parameters"] if p.get("upstream")]
+    assert len(bound) == 1
+    assert bound[0]["upstream"] == {
+        "activity_id": "register_expense_ledger", "path": ["endDate"],
+    }
+    # 이름표를 함께 남기면 실행기가 지시문을 먼저 뒤져 엉뚱한 값을 집는다.
+    assert "label" not in bound[0]
+
+
+def test_upstream_binding_needs_every_sample_to_agree(generator):
+    """한 표본에서만 앞 산출물과 맞았다면 근거가 아니다 — 굳히지 않는다."""
+    for index, (todo, applicant, stamp) in enumerate(
+        [("u1", "김철수", "2026-09-01T11:55:47.027549"),
+         ("u2", "이영희", "2026-09-01T12:02:18.949265"),
+         ("u3", "박지은", "2026-09-01T12:20:55.413880")], start=1
+    ):
+        _upstream_run(generator, todo, index, applicant, stamp)
+    # 한 실행만 앞 산출물에 없는 시각을 적었다.
+    generator._test_upstream["u2"][0]["endDate"] = "2026-09-01T00:00:00.000000"
+    assert generator.try_freeze(_Workitem()) is None
+
+
+# --------------------------------------------------------------------------
+# 값 표기 정규화
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("left,right,expected", [
+    ("29,000원", "29000", True),
+    ("₩27000", "27000.0", True),
+    ("2026-09-01T02:46:44Z", "2026-09-01 02:46:44", True),
+    ("2026-09-09", "2026년 9월 9일", True),
+    ("2026-09-01T02:46:44Z", "2026-09-01T02:46:45Z", False),
+    ("1건", "1개", False),          # 단위가 다르면 다른 값이다
+    ("29000", "29001", False),
+    ("노트북", "마우스", False),
+])
+def test_formatting_differences_do_not_make_different_values(left, right, expected):
+    assert same_value(left, right) is expected
+
+
+# --------------------------------------------------------------------------
+# 합성 자리 — 이미 아는 값들의 조합으로 다시 적는다
+# --------------------------------------------------------------------------
+
+_DOC_QUERY = (
+    "[Instruction]\n출력 파일 경로를 expense/{{used_at}}_{{applicant}}.md 로 고정한다.\n\n"
+    '[InputData]\n{{"form": {{"applicant": "{applicant}", "used_at": "{used_at}", '
+    '"purpose": "{purpose}"}}}}'
+)
+
+_COMPOSED = [
+    ("c1", "김철수", "2026-09-02", "협력사 미팅 택시비", "pi-aaaa1111"),
+    ("c2", "이영희", "2026-09-03", "세미나 참석 택시비", "pi-bbbb2222"),
+    ("c3", "박지은", "2026-09-04", "지사 출장 택시비", "pi-cccc3333"),
+]
+
+
+def _composed_run(generator, todo, index, applicant, used_at, purpose, instance):
+    """워크스페이스 경로에 실행 식별자가, 문서 본문에 여러 낱말짜리 입력이 들어간 실행."""
+    generator._test_events[todo] = [
+        _event("write_file", {
+            "file_path": f"/workspace/.bpmn/{instance}/expense/{used_at}_{applicant}.md",
+            "content": f"| 신청자 | {applicant} |\n| 사유 | {purpose} |\n",
+        }, f"{todo}-1"),
+    ]
+    generator._test_workitems.append({
+        "id": todo, "proc_inst_id": instance, "rework_count": 0,
+        "updated_at": f"2026-08-0{index}",
+        "query": _DOC_QUERY.format(applicant=applicant, used_at=used_at, purpose=purpose),
+    })
+
+
+def _freeze_composed(generator):
+    for index, args in enumerate(_COMPOSED, start=1):
+        _composed_run(generator, args[0], index, *args[1:])
+    return generator.try_freeze(_Workitem())
+
+
+def test_a_path_holding_the_run_identity_is_composed_not_guessed(generator):
+    """`/workspace/.bpmn/{proc_inst_id}/…` 는 한 낱말이라 조각으로 쪼개면 토막이 남는다.
+
+    토막은 지시문에 없어 되찾을 수 없다. 그런데 그 토막을 이루는 값은 하나하나 알고
+    있으므로, 자리 대조 대신 아는 값들의 조합으로 다시 적는다.
+    """
+    record = _freeze_composed(generator)
+    assert record is not None
+    assert "/workspace/.bpmn/${proc_inst_id}/expense/${used_at}_${applicant}.md" in record["code"]
+    identity = [p for p in record["parameters"]["parameters"] if p.get("runtime")]
+    assert [p["name"] for p in identity] == ["proc_inst_id"]
+
+
+def test_a_fragment_of_one_input_field_is_replaced_by_the_whole_field(generator):
+    """`사유: 지사 출장 택시비` 는 실행기가 칸 하나로 읽는다. 낱말로 쪼개면 못 집는다.
+
+    쪼갠 토막은 지시문 어딘가에 있지만, 이름표도 없어 위치 폴백으로 떨어진다 — 사유
+    칸에 신청자 이름이 들어간 문서가 만들어진다. 칸 값 전체로 다시 적어야 한다.
+    """
+    record = _freeze_composed(generator)
+    assert "| 사유 | ${purpose} |" in record["code"]
+    purpose = next(p for p in record["parameters"]["parameters"] if p["name"] == "purpose")
+    assert purpose["example"] == "협력사 미팅 택시비"   # 토막이 아니라 칸 값 전체
+
+
+def test_composition_is_recorded_as_provenance(generator):
+    record = _freeze_composed(generator)
+    composed = {c["into"]: set(c["from"]) for c in record["work_history"]["composed_args"]}
+    assert composed["0:path"] == {"proc_inst_id", "used_at", "applicant"}
+    assert composed["0:content"] == {"applicant", "purpose"}
+
+
+def test_composed_code_runs_with_a_new_workitems_values(generator):
+    record = _freeze_composed(generator)
+    namespace: dict = {}
+    exec(compile(record["code"], "generated.py", "exec"), namespace)
+    written: list = []
+
+    async def fake_write_file(path, content):
+        written.append((path, content))
+        return {"path": path}
+
+    namespace["write_file"] = fake_write_file
+    asyncio.run(namespace["run"]({
+        "applicant": "최수정", "used_at": "2026-10-11", "purpose": "본사 회의 참석 택시비",
+        "proc_inst_id": "pi-dddd4444",
+    }))
+    path, content = written[0]
+    assert path == "/workspace/.bpmn/pi-dddd4444/expense/2026-10-11_최수정.md"
+    assert "| 사유 | 본사 회의 참석 택시비 |" in content
+
+
+def test_composition_is_refused_when_leftovers_disagree(generator):
+    """아는 값으로 설명되지 않는 글자가 남으면 표본마다 템플릿이 갈린다 — 굳히지 않는다."""
+    for index, (todo, applicant, used_at, purpose, instance) in enumerate(_COMPOSED, start=1):
+        _composed_run(generator, todo, index, applicant, used_at, purpose, instance)
+        # 파일 이름에 지시문 어디에도 없는 일련번호가 붙는다.
+        events = generator._test_events[todo]
+        args = events[0]["data"]["args"]
+        args["file_path"] = args["file_path"].replace(".md", f"-{index * 37}.md")
+    assert generator.try_freeze(_Workitem()) is None
+
+
+def test_instruction_placeholders_do_not_hide_the_structured_input():
+    """`expense/{used_at}_{applicant}.md` 같은 자리표시자가 지시문에 흔히 들어 있다.
+
+    첫 `{` 부터 마지막 `}` 까지를 한 덩어리로 집으면 JSON 파싱이 통째로 실패해 구조화
+    입력이 빈 것으로 보인다. 그러면 실행기는 지시문의 따옴표를 순서대로 긁어 **칸
+    이름**을 값으로 집는다.
+    """
+    query = _DOC_QUERY.format(applicant="김철수", used_at="2026-09-02", purpose="협력사 미팅 택시비")
+    assert "expense/{used_at}_{applicant}.md" in query   # 자리표시자는 그대로 남는다
+    assert structured_fields(query) == {
+        "applicant": "김철수", "used_at": "2026-09-02", "purpose": "협력사 미팅 택시비",
+    }
+
+
+# --------------------------------------------------------------------------
+# 절차와 내용을 가른다 — 되찾을 수 없는 자리 중 무엇을 굳혀도 되는가
+# --------------------------------------------------------------------------
+#
+# 되찾을 수 없다는 것은 그 값이 이 워크아이템이 준 것이 아니라는 뜻이다. 에이전트가
+# 스스로 정한 값인데, 거기에는 두 갈래가 있다 — "어떻게 할지"를 정하는 절차(시각 서식)와
+# 에이전트가 지어낸 내용(메일 본문)이다. 앞의 것은 굳혀도 되고, 뒤의 것은 굳히면 그
+# 표본의 사실이 모든 실행에 남는다.
+
+def _plan_with(observations, contexts):
+    """관측값만 있는 최소 계획. 절차/내용 판정만 시험한다."""
+    from deterministic_signature import ParameterPlan
+    return ParameterPlan(
+        parameters=tuple({"name": name} for name in observations),
+        slots=(),
+        observations={name: tuple(values) for name, values in observations.items()},
+    )
+
+
+_MAIL_QUERIES = [
+    '[InputData]\n{"form": {"recipient": "김철수", "product": "노트북"}}',
+    '[InputData]\n{"form": {"recipient": "이영희", "product": "마우스"}}',
+    '[InputData]\n{"form": {"recipient": "박지은", "product": "키보드"}}',
+]
+
+
+def test_a_value_the_agent_reuses_is_procedure_not_input():
+    """시각 서식처럼 에이전트가 즐겨 쓰는 방식은 과반으로 굳힌다.
+
+    어느 서식을 골라도 다음 실행이 제대로 돌아간다. 이 자리 하나 때문에 나머지가 전부
+    멀쩡한 활동을 영영 보류하면, 반복되는 작업이 매번 에이전트를 거친다.
+    """
+    plan = _plan_with(
+        {"command_7": ["'+%Y-%m-%d %H:%M:%S'", "'+%Y-%m-%d %H:%M:%S'", "-Iseconds"]},
+        _MAIL_QUERIES,
+    )
+    assert procedure_pins(plan, ["command_7"], _MAIL_QUERIES) == {
+        "command_7": "'+%Y-%m-%d %H:%M:%S'"
+    }
+
+
+def test_agent_written_content_is_never_pinned():
+    """에이전트가 쓴 메일 본문은 굳히면 안 된다.
+
+    표본마다 다르고, 그 워크아이템의 사실을 담고 있다. 하나를 굳히면 김철수에게 보낼
+    문장이 모든 수신자에게 나간다 — 실제로 그렇게 굳은 코드를 지운 적이 있다.
+    """
+    plan = _plan_with(
+        {"body": ["김철수님, 노트북 발송했습니다.",
+                  "이영희님, 마우스 발송했습니다.",
+                  "박지은님, 키보드 발송했습니다."]},
+        _MAIL_QUERIES,
+    )
+    assert procedure_pins(plan, ["body"], _MAIL_QUERIES) == {}
+
+
+def test_a_repeated_value_carrying_workitem_data_is_not_pinned():
+    """과반으로 반복돼도 이 활동의 값을 품고 있으면 내용이다.
+
+    반복은 우연일 수 있다. 값이 워크아이템의 입력을 담고 있다면 그것은 절차가 아니다.
+    """
+    plan = _plan_with(
+        {"body": ["김철수님께 발송", "김철수님께 발송", "박지은님께 발송"]},
+        _MAIL_QUERIES,
+    )
+    assert procedure_pins(plan, ["body"], _MAIL_QUERIES) == {}
+
+
+def test_all_distinct_values_are_never_pinned():
+    """표본마다 다르면 '에이전트가 즐겨 쓰는 방식'이라고 볼 근거가 없다."""
+    plan = _plan_with(
+        {"stamp": ["2026-09-01 00:00", "2026-09-02 11:00", "2026-09-03 09:30"]},
+        _MAIL_QUERIES,
+    )
+    assert procedure_pins(plan, ["stamp"], _MAIL_QUERIES) == {}
+
+
+def test_recoverable_parameters_are_never_pinned():
+    """되찾을 수 있는 자리는 애초에 판정 대상이 아니다 — 굳히지 말고 되찾아야 한다."""
+    plan = _plan_with({"recipient": ["김철수", "김철수", "박지은"]}, _MAIL_QUERIES)
+    assert procedure_pins(plan, [], _MAIL_QUERIES) == {}
+
+
+def test_a_procedure_option_does_not_block_the_whole_activity(generator):
+    """서식 하나가 다르다고 활동 전체를 보류하지 않는다 — 나머지는 전부 되찾을 수 있다."""
+    formats = ["'+%Y-%m-%d'", "'+%Y-%m-%d'", "-Iseconds"]
+    for index, (todo, applicant, stamp) in enumerate(
+        [("f1", "김철수", "2026-09-02"), ("f2", "이영희", "2026-09-03"),
+         ("f3", "박지은", "2026-09-04")], start=1
+    ):
+        generator._test_events[todo] = [
+            _event_with_result(
+                "execute", {"command": f"mkdir -p /out && date {formats[index - 1]}"},
+                _shell_result(stamp), f"{todo}-1",
+            ),
+            _event("write_file", {
+                "file_path": f"/out/{applicant}.md",
+                "content": f"| 신청자 | {applicant} |\n| 시각 | {stamp} |\n",
+            }, f"{todo}-2"),
+        ]
+        generator._test_workitems.append({
+            "id": todo, "proc_inst_id": f"pi-{todo}", "rework_count": 0,
+            "updated_at": f"2026-08-0{index}",
+            "query": f'[InputData]\n{{"form": {{"applicant": "{applicant}"}}}}',
+        })
+    record = generator.try_freeze(_Workitem())
+    assert record is not None
+    # 과반 서식이 상수로 굳는다.
+    assert "date '+%Y-%m-%d'" in record["code"]
+    assert "-Iseconds" not in record["code"]

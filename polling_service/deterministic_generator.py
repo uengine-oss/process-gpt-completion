@@ -36,6 +36,8 @@
 LLM 호출이 없다.
 """
 
+from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 
 import json
@@ -44,6 +46,7 @@ import logging
 from database import (
     fetch_mcp_python_code,
     upsert_mcp_python_code,
+    fetch_related_workitem_outputs,
     fetch_workitems_by_activity,
     fetch_events_by_todo_id,
     fetch_last_deactivated_at,
@@ -52,6 +55,9 @@ from deterministic_template import TEMPLATE
 from mcp_tool_index import build_tool_index_from_tenant
 from deterministic_signature import (
     ParameterPlan,
+    bind_upstream,
+    compose_from_known,
+    procedure_pins,
     build_output_template,
     execution_fingerprint,
     identify_parameters,
@@ -62,6 +68,7 @@ from work_history import (
     FILE_WRITE,
     SHELL,
     Action,
+    canonicalize,
     effect_actions,
     normalize_events,
     summarize,
@@ -72,6 +79,26 @@ logger = logging.getLogger(__name__)
 # 고착화에 필요한 표본 수. 표본이 여러 건이어야 무엇이 파라미터이고 무엇이 상수인지
 # 추측이 아니라 관측으로 가려낼 수 있다.
 REQUIRED_SAMPLES = 3
+
+# 표본을 몇 건까지 거슬러 볼 것인가. 최근 N건만 보면 그 안에 다른 방식으로 일한 실행이
+# 하나만 섞여도 굳지 않는다 — 에이전트는 같은 활동도 매번 조금씩 다르게 푼다(문서 하나를
+# 두고 `mkdir && date` · `python 힙스크립트` · `write_file` 단독이 번갈아 나왔다).
+# 넓게 훑어 **같은 구조끼리 모으고**, 그중 가장 많은 무리로 굳힌다. 판정 기준은 그대로다 —
+# 지문이 같은 표본이 REQUIRED_SAMPLES 건 있어야 한다. 무리 짓는 자리만 옮긴 것이다.
+#
+# 무한정 넓히지는 않는다. DONE 마다 이 건수만큼 이벤트를 읽으므로 비용이 그만큼 든다.
+SAMPLE_SCAN_LIMIT = REQUIRED_SAMPLES * 4
+
+# 한 활동에서 시험해 볼 표본 조합의 상한.
+#
+# 표본 3건을 "전부 통과해야 하는 관문"으로 쓰면, 그중 한 건에서만 값의 출처를 못 찾아도
+# 활동 전체를 포기한다. 실제로 같은 문서 생성 활동이 12번을 도는 동안 매번 다른 자리가
+# 걸렸다 — 4~8회차는 셸 경로, 9~11회차는 사유의 낱말과 시각. 어느 회차에도 "굳을 수 있는
+# 3건"은 이미 있었는데 뽑기를 한 번만 해서 놓친 것이다.
+#
+# 그래서 뽑기를 탐색으로 바꾼다. 같은 무리 안에서 조합을 바꿔 가며, 값의 출처가 모두
+# 정해지는 3건을 찾는다. 조합 수만큼 판정 비용이 드니 상한을 둔다.
+MAX_SAMPLE_COMBINATIONS = 24
 
 # 고착화된 코드를 쓰고도 이 횟수 이상 재작업되면 코드 자체를 의심해 비활성화한다.
 # 1회 재작업은 대개 입력이 틀린 경우이므로 되돌린 뒤 새 파라미터로 재실행한다.
@@ -111,9 +138,25 @@ def _form_output_of(events: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str
     return None
 
 
+@dataclass(frozen=True)
+class Sample:
+    """고착화 표본 한 건. 값이 어디서 왔는지를 가려내는 데 필요한 것들을 함께 든다."""
+
+    # 작업 이력 전체(맥락 행위 포함). 부수효과만 남기는 일은 지문 계산 직전에 한다.
+    trace: List[Action]
+    # 그 워크아이템의 지시문. 파라미터 이름표를 여기서 관측한다.
+    query: str
+    # 에이전트가 마지막에 내놓은 폼 산출물.
+    output: Optional[Dict[str, Any]]
+    # 그 워크아이템의 식별자들. 실행 때 정해지는 자리를 가려내는 근거다.
+    identity: Dict[str, Any]
+    # 그 실행 시점에 이미 끝나 있던 앞 워크아이템들의 산출물.
+    upstream: List[Dict[str, Any]] = field(default_factory=list)
+
+
 def collect_samples(
     proc_def_id: str, activity_id: str, tenant_id: str, since: Optional[str]
-) -> List[Tuple[List[Action], str, Optional[Dict[str, Any]], Dict[str, Any]]]:
+) -> List[Sample]:
     """고착화 표본을 모은다.
 
     자격은 "완료(DONE)되었고 이후 재작업되지 않은 워크아이템"이다. DONE은 사람의
@@ -122,6 +165,10 @@ def collect_samples(
 
     ``since``(직전 비활성 시각) 이후에 완료된 것만 센다. 이전 표본을 다시 세면
     비활성화한 코드와 동일한 코드를 곧바로 재생성해 무한 반복에 빠진다.
+
+    최신순으로 ``SAMPLE_SCAN_LIMIT`` 건까지 모은다. 여기서 3건으로 자르지 않는 이유는
+    실행 방식이 흔들리기 때문이다 — 자르고 나면 그 안에 다른 방식이 하나만 섞여도
+    굳지 않는다. 같은 구조끼리 묶는 일은 호출자가 지문을 보고 한다.
 
     각 표본은 **작업 이력 전체**(맥락 행위 포함)와 그 워크아이템의 지시문, 그리고 그
     워크아이템의 식별자다. 부수효과만 남기는 일은 지문 계산과 코드 컴파일 직전에 한다 —
@@ -134,9 +181,14 @@ def collect_samples(
     식별자를 함께 모으는 이유는 그 반대다. `proc_inst_id`·`todo_id` 처럼 실행 때 정해지는
     값은 지시문에 적혀 있지 않아 아무리 뒤져도 되찾을 수 없다. 그런 자리를 가려내려면
     관측된 값을 그 워크아이템 자신의 식별자와 대조해야 한다.
+
+    앞 워크아이템의 산출물도 함께 모은다. 값은 액티비티 경계를 넘어서도 흐른다 —
+    에이전트가 `get_related_workitem_outputs` 로 읽어 쓴 값은 지시문에 없어서, 그것만
+    보면 "되찾을 수 없는 입력"으로 판정되어 고착화가 통째로 막힌다.
     """
     candidates = fetch_workitems_by_activity(
-        proc_def_id, activity_id, tenant_id, status="DONE", since=since, limit=REQUIRED_SAMPLES * 4
+        proc_def_id, activity_id, tenant_id, status="DONE", since=since,
+        limit=SAMPLE_SCAN_LIMIT * 2,
     ) or []
 
     # 같은 프로세스 인스턴스에서 재작업이 이어진 실행은 되돌려진 것으로 보고 제외한다.
@@ -145,14 +197,16 @@ def collect_samples(
         key = str(item.get("proc_inst_id") or item.get("id"))
         highest_rework[key] = max(highest_rework.get(key, 0), int(item.get("rework_count") or 0))
 
-    samples: List[Tuple[List[Action], str, Optional[Dict[str, Any]], Dict[str, Any]]] = []
+    samples: List[Sample] = []
     for item in candidates:
         key = str(item.get("proc_inst_id") or item.get("id"))
         if int(item.get("rework_count") or 0) < highest_rework.get(key, 0):
             continue
         events = fetch_events_by_todo_id(item.get("id"))
         trace = normalize_events(events)
-        effects = effect_actions(trace)
+        # 자격도 결과 기준으로 본다. 곁가지(미리 만든 디렉터리, 덮어쓰인 중간 파일)는
+        # 재현 대상이 아니므로 그것이 실패했다고 표본을 버리지 않는다.
+        effects = canonicalize(trace)
         if not effects:
             continue
         if any(action.failed for action in effects):
@@ -164,11 +218,11 @@ def collect_samples(
                 activity_id, item.get("id"),
             )
             continue
-        samples.append((
-            trace,
-            str(item.get("query") or ""),
-            _form_output_of(events),
-            {
+        samples.append(Sample(
+            trace=trace,
+            query=str(item.get("query") or ""),
+            output=_form_output_of(events),
+            identity={
                 "id": item.get("id"),
                 "proc_inst_id": item.get("proc_inst_id"),
                 "root_proc_inst_id": item.get("root_proc_inst_id"),
@@ -176,20 +230,41 @@ def collect_samples(
                 "activity_id": activity_id,
                 "tenant_id": tenant_id,
             },
+            upstream=fetch_related_workitem_outputs(
+                tenant_id,
+                item.get("root_proc_inst_id"),
+                item.get("proc_inst_id"),
+                exclude_id=item.get("id"),
+                before=item.get("start_date"),
+            ),
         ))
-        if len(samples) >= REQUIRED_SAMPLES:
+        if len(samples) >= SAMPLE_SCAN_LIMIT:
             break
     return samples
+
+
+def _from_step_call(binding) -> str:
+    """이어받기 한 건을 골격의 `from_step` 호출로 적는다."""
+    path = json.dumps(list(binding.path), ensure_ascii=False)
+    line = "None" if binding.line is None else str(binding.line)
+    return (
+        f"from_step(results, {binding.source_index}, "
+        f"{json.dumps(binding.root)}, {path}, {line})"
+    )
 
 
 def _argument_expressions(
     action: Action,
     call_index: int,
     plan: ParameterPlan,
-) -> Dict[str, str]:
+) -> Tuple[Dict[str, str], Dict[str, str]]:
     """행위 하나의 인자를 파이썬 표현식 문자열로 만든다.
 
-    파라미터 자리는 `${name}` 템플릿으로, 나머지는 관측된 리터럴 그대로 굳는다.
+    자리는 셋 중 하나다. 파라미터 자리는 `${name}` 템플릿으로 굳고, 앞 단계에서
+    이어받는 자리는 `from_step(...)` 으로 굳고, 나머지는 관측된 리터럴 그대로 굳는다.
+
+    이어받는 값들은 `linked` 로 따로 돌려준다. 실행 시점에 계산해야 하므로 문자열
+    템플릿에 미리 박을 수 없고, 그 단계 바로 앞에서 한 번 구해 쓴다.
     """
     segment_slots: Dict[str, List[Tuple[int, int, str, bool]]] = {}
     whole_slots: Dict[str, str] = {}
@@ -204,18 +279,54 @@ def _argument_expressions(
                 (start, end, slot.name, slot.quoted)
             )
 
+    # 값 전체를 다시 적은 인자. 자리 대조가 아니라 이미 아는 값들의 조합으로 굳는다.
+    composites = {
+        composite.arg_key: composite
+        for composite in plan.composites
+        if composite.call_index == call_index
+    }
+
+    linked: Dict[str, str] = {}
+    whole_links: Dict[str, str] = {}
+    for binding in plan.bindings:
+        if binding.call_index != call_index:
+            continue
+        if binding.arg_key in composites:
+            # 합성 템플릿이 이름으로 참조한다. 자리를 따로 치환하지 않는다.
+            linked[binding.name] = _from_step_call(binding)
+        elif binding.segment_index is None or binding.span is None:
+            # 값 전체를 이어받는 자리는 render()를 거치지 않아 원래 타입을 보존한다.
+            whole_links[binding.arg_key] = _from_step_call(binding)
+        else:
+            linked[binding.name] = _from_step_call(binding)
+            start, end = binding.span
+            segment_slots.setdefault(binding.arg_key, []).append(
+                (start, end, binding.name, binding.quoted)
+            )
+
     rendered: Dict[str, str] = {}
     for arg_key in sorted(action.args):
         value = action.args[arg_key]
-        if arg_key in segment_slots:
+        if arg_key in composites:
+            arguments = "inputs, linked" if linked else "inputs"
+            rendered[arg_key] = (
+                f"render({json.dumps(composites[arg_key].template, ensure_ascii=False)}, "
+                f"{arguments})"
+            )
+        elif arg_key in segment_slots:
             template = render_template(value, segment_slots[arg_key])
-            rendered[arg_key] = f"render({json.dumps(template, ensure_ascii=False)}, inputs)"
+            arguments = "inputs, linked" if linked else "inputs"
+            rendered[arg_key] = (
+                f"render({json.dumps(template, ensure_ascii=False)}, {arguments})"
+            )
+        elif arg_key in whole_links:
+            rendered[arg_key] = whole_links[arg_key]
         elif arg_key in whole_slots:
             # 값 전체가 파라미터인 경우 render()를 거치지 않아 원래 타입을 보존한다.
             rendered[arg_key] = f"inputs[{json.dumps(whole_slots[arg_key])}]"
         else:
             rendered[arg_key] = json.dumps(value, ensure_ascii=False)
-    return rendered
+    return rendered, linked
 
 
 def _file_call(action: Action, expressions: Dict[str, str]) -> str:
@@ -254,21 +365,36 @@ def _file_call(action: Action, expressions: Dict[str, str]) -> str:
     return f"write_file({path}, {expressions.get('content', '\"\"')})"
 
 
-def _step_line(action: Action, expressions: Dict[str, str], tool_to_server: Dict[str, str]) -> str:
-    """행위 종류에 맞는 실행 한 줄. 종류마다 골격의 다른 원시 동작을 쓴다."""
+def _step_line(
+    action: Action,
+    expressions: Dict[str, str],
+    tool_to_server: Dict[str, str],
+    linked: Optional[Dict[str, str]] = None,
+) -> str:
+    """행위 종류에 맞는 실행 한 줄. 종류마다 골격의 다른 원시 동작을 쓴다.
+
+    앞 단계에서 이어받는 값이 있으면 그 단계 바로 앞에 한 줄을 더 둔다. 인자 안에
+    펼쳐 넣으면 같은 값을 여러 번 꺼내게 되고, 코드를 읽을 때 무엇을 이어받았는지도
+    보이지 않는다.
+    """
+    prefix = ""
+    if linked:
+        items = ", ".join(f"{json.dumps(name)}: {expr}" for name, expr in sorted(linked.items()))
+        prefix = "    linked = {" + items + "}\n"
+
     if action.kind == SHELL:
         command = expressions.get("command", '""')
         cwd = expressions.get("cwd", '""')
-        return f"    results.append(await run_shell({command}, {cwd}))"
+        return prefix + f"    results.append(await run_shell({command}, {cwd}))"
 
     if action.kind == FILE_WRITE:
-        return f"    results.append(await {_file_call(action, expressions)})"
+        return prefix + f"    results.append(await {_file_call(action, expressions)})"
 
     server_key = tool_to_server.get(action.tool)
     if not server_key:
         raise ValueError(f"도구 '{action.tool}'를 제공하는 MCP 서버를 찾지 못했습니다.")
     arg_expr = "{" + ", ".join(f'"{k}": {v}' for k, v in expressions.items()) + "}"
-    return (
+    return prefix + (
         f'    results.append(await call_tool("{server_key}", "{action.tool}", '
         f"{arg_expr}, timeout_s=timeout_s))"
     )
@@ -306,10 +432,10 @@ def compile_code(
     provenance: Optional[Dict[str, Any]] = None,
 ) -> str:
     """대표 표본의 행위 목록과 파라미터 배치로 실행 코드를 만든다."""
-    lines = [
-        _step_line(action, _argument_expressions(action, index, plan), tool_to_server)
-        for index, action in enumerate(actions)
-    ]
+    lines = []
+    for index, action in enumerate(actions):
+        expressions, linked = _argument_expressions(action, index, plan)
+        lines.append(_step_line(action, expressions, tool_to_server, linked))
 
     docs = [
         f'        - {p["name"]} ({p["type"]}): example={json.dumps(p.get("example"), ensure_ascii=False)}'
@@ -320,6 +446,71 @@ def compile_code(
         steps="\n".join(lines) if lines else "    pass",
         param_docs="\n".join(docs) if docs else "        None",
     )
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """값의 출처가 모두 정해진 표본 묶음 하나."""
+
+    samples: Tuple[Sample, ...]
+    plan: ParameterPlan
+    effects: Tuple[List[Action], ...]
+
+
+def _resolve(samples: List[Sample]) -> Tuple[Optional[Resolution], List[str]]:
+    """이 표본 묶음으로 값의 출처가 모두 정해지는지 본다.
+
+    정해지면 계획을, 아니면 끝내 되찾지 못한 파라미터 이름들을 돌려준다. 출처를 찾는
+    순서는 좁은 쪽에서 넓은 쪽이다 — 지시문에서 되찾기, 앞 액티비티의 산출물, 그리고
+    이미 아는 값들의 조합으로 다시 적기.
+    """
+    effects = [canonicalize(sample.trace) for sample in samples]
+    queries = [sample.query for sample in samples]
+    identities = [sample.identity for sample in samples]
+
+    plan = identify_parameters(effects, queries, identities)
+
+    # 값이 어디서 오는지 모르는 파라미터가 하나라도 있으면 굳히지 않는다. 실행기의
+    # 위치·타입 폴백은 언제나 무언가를 채우는 데 성공하므로, 여기서 막지 않으면
+    # 엉뚱한 값으로 실제 도구를 부르는 코드가 남는다.
+    unrecoverable = unrecoverable_parameters(plan, queries)
+    if unrecoverable:
+        # 지시문에 없다고 끝이 아니다. 값은 액티비티 경계를 넘어서도 흐른다 — 앞
+        # 워크아이템의 산출물에서 같은 자리를 표본 전부에서 찾을 수 있으면, 다음
+        # 실행에서도 거기서 읽으면 된다.
+        plan = bind_upstream(plan, unrecoverable, [s.upstream for s in samples])
+        unrecoverable = unrecoverable_parameters(plan, queries)
+    if unrecoverable:
+        # 되찾을 수 없는 것이 값 전체가 아니라 **합성된 문자열의 일부**일 수 있다.
+        # 워크스페이스 경로가 그렇다 — 조각으로 쪼개면 토막이 남지만, 그 토막을 이루는
+        # 값들은 이미 알고 있다. 아는 값들의 조합으로 다시 적을 수 있으면 굳힌다.
+        #
+        # 그중에는 애초에 입력이 아닌 자리도 섞여 있다. 시각 서식처럼 에이전트가 스스로
+        # 정하는 자리는 되찾을 대상이 아니라 절차의 일부다 — 과반 값으로 굳힌다.
+        pins = procedure_pins(plan, unrecoverable, queries)
+        plan = compose_from_known(
+            plan, effects, identities, unrecoverable, queries, pins
+        )
+        unrecoverable = unrecoverable_parameters(plan, queries)
+    if unrecoverable:
+        return None, unrecoverable
+    return Resolution(tuple(samples), plan, tuple(effects)), []
+
+
+def _search(group: List[Sample]) -> Tuple[Optional[Resolution], List[str]]:
+    """한 무리 안에서 굳힐 수 있는 표본 조합을 찾는다.
+
+    최신 표본이 든 조합부터 본다 — 최근의 방식일수록 다음 실행과 닮았을 가능성이 크다.
+    """
+    last_blocked: List[str] = []
+    for tried, picked in enumerate(combinations(range(len(group)), REQUIRED_SAMPLES)):
+        if tried >= MAX_SAMPLE_COMBINATIONS:
+            break
+        resolution, blocked = _resolve([group[index] for index in picked])
+        if resolution is not None:
+            return resolution, []
+        last_blocked = blocked or last_blocked
+    return None, last_blocked
 
 
 def try_freeze(workitem) -> Optional[Dict[str, Any]]:
@@ -342,34 +533,49 @@ def try_freeze(workitem) -> Optional[Dict[str, Any]]:
     collected = collect_samples(proc_def_id, activity_id, tenant_id, since)
     if len(collected) < REQUIRED_SAMPLES:
         return None
-    samples = [trace for trace, _query, _output, _identity in collected]
-    queries = [query for _trace, query, _output, _identity in collected]
-    outputs = [output for _trace, _query, output, _identity in collected]
-    identities = [identity for _trace, _query, _output, identity in collected]
 
-    # 지문은 부수효과 행위로만 잰다. 맥락 행위(스킬·파일 읽기, 조회)는 같은 일을
-    # 하면서도 실행마다 횟수가 달라지기 마련이라, 그것까지 일치를 요구하면 어떤
-    # 활동도 고착화되지 않는다. 대신 맥락은 출처로 기록해 남긴다.
-    effects = [effect_actions(sample) for sample in samples]
-    if len({execution_fingerprint(sample) for sample in effects}) != 1:
+    # 같은 구조로 일한 실행끼리 모은다. 지문은 부수효과 행위로만 잰다 — 맥락 행위(스킬·
+    # 파일 읽기, 조회)는 같은 일을 하면서도 실행마다 횟수가 달라지기 마련이라, 그것까지
+    # 일치를 요구하면 어떤 활동도 고착화되지 않는다. 대신 맥락은 출처로 기록해 남긴다.
+    groups: Dict[str, List[Sample]] = {}
+    for sample in collected:
+        groups.setdefault(
+            execution_fingerprint(canonicalize(sample.trace)), []
+        ).append(sample)
+
+    # 큰 무리부터 본다. 같은 크기면 최신 실행이 속한 무리가 앞선다.
+    ordered = sorted(groups.values(), key=lambda group: -len(group))
+    if len(ordered[0]) < REQUIRED_SAMPLES:
         logger.info(
-            "고착화 보류 | activity=%s 표본 %d건의 실행 지문이 일치하지 않음",
-            activity_id, len(samples),
+            "고착화 보류 | activity=%s 같은 지문의 표본이 %d건뿐 (훑은 표본 %d건, 지문 %d종)",
+            activity_id, len(ordered[0]), len(collected), len(groups),
         )
         return None
 
-    plan = identify_parameters(effects, queries, identities)
-
-    # 값이 어디서 오는지 모르는 파라미터가 하나라도 있으면 굳히지 않는다. 실행기의
-    # 위치·타입 폴백은 언제나 무언가를 채우는 데 성공하므로, 여기서 막지 않으면
-    # 엉뚱한 값으로 실제 도구를 부르는 코드가 남는다.
-    unrecoverable = unrecoverable_parameters(plan, queries)
-    if unrecoverable:
+    resolution, blocked = None, []
+    for group in ordered:
+        if len(group) < REQUIRED_SAMPLES:
+            break
+        resolution, failed = _search(group)
+        if resolution is not None:
+            break
+        # 사유는 가장 유력한 무리(가장 크고 최신인 쪽)의 것을 남긴다. 마지막에 시도한
+        # 무리의 사유를 남기면 엉뚱한 자리를 가리켜 진단을 헷갈리게 한다.
+        blocked = blocked or failed
+    if resolution is None:
         logger.info(
-            "고착화 보류 | activity=%s 지시문에서 되찾을 수 없는 파라미터: %s",
-            activity_id, ", ".join(unrecoverable),
+            "고착화 보류 | activity=%s 어느 표본 조합으로도 값의 출처를 정하지 못함 — "
+            "되찾을 수 없는 파라미터: %s",
+            activity_id, ", ".join(blocked) or "(없음)",
         )
         return None
+
+    collected = list(resolution.samples)
+    plan = resolution.plan
+    effects = list(resolution.effects)
+    samples = [sample.trace for sample in collected]
+    queries = [sample.query for sample in collected]
+    outputs = [sample.output for sample in collected]
 
     tool_to_server = build_tool_index_from_tenant(tenant_id)
 
@@ -377,6 +583,17 @@ def try_freeze(workitem) -> Optional[Dict[str, Any]]:
     provenance["sample_count"] = len(samples)
     provenance["effect_count"] = len(effects[0])
     provenance["fingerprint"] = execution_fingerprint(effects[0])
+    # 어떤 자리가 앞 단계의 결과를 이어받는지 남긴다. 나중에 그 단계가 다른 것을 내기
+    # 시작했을 때 이 코드를 의심할 근거가 된다.
+    provenance["step_bindings"] = [binding.as_record() for binding in plan.bindings]
+    provenance["upstream_bindings"] = [
+        {"name": spec["name"], **spec["upstream"]}
+        for spec in plan.parameters if spec.get("upstream")
+    ]
+    provenance["composed_args"] = [
+        {"into": f"{composite.call_index}:{composite.arg_key}", "from": list(composite.names)}
+        for composite in plan.composites
+    ]
 
     # 재현할 수 없는 행위가 하나라도 있으면 고착화하지 않는다. 이력에 대상 경로가
     # 없는 파일 쓰기, 서버를 못 찾은 MCP 호출 등이 그렇다. 그 단계만 빼고 나머지를
@@ -411,11 +628,17 @@ def try_freeze(workitem) -> Optional[Dict[str, Any]]:
         if spec is None
     ]
     logger.info(
-        "고착화 완료 | activity=%s 표본=%d 행위=%s 파라미터=%s 산출물=%s",
+        "고착화 완료 | activity=%s 표본=%d 행위=%s 파라미터=%s 이어받기=%s 산출물=%s",
         activity_id,
         len(samples),
         json.dumps(provenance.get("by_kind") or {}, ensure_ascii=False),
         [p["name"] for p in plan.parameters],
+        json.dumps(
+            provenance["step_bindings"]
+            + provenance["upstream_bindings"]
+            + provenance["composed_args"],
+            ensure_ascii=False, default=str,
+        ),
         "없음" if output_template is None
         else f"{(output_template.get('form_id') or '')}"
              f"{' (미해결: ' + ', '.join(unresolved) + ')' if unresolved else ''}",
@@ -426,6 +649,7 @@ def try_freeze(workitem) -> Optional[Dict[str, Any]]:
 __all__ = [
     "REQUIRED_SAMPLES",
     "REWORK_DISTRUST_THRESHOLD",
+    "Sample",
     "collect_samples",
     "compile_code",
     "freeze_on_done",

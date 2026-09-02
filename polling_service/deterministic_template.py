@@ -12,6 +12,11 @@
 - ``remove_file`` 파일 삭제
 - ``move_file`` / ``copy_file`` / ``make_dir`` 파일 이동·복사·디렉터리 생성
 - ``read_file``  파일 읽기(보상 코드가 되돌릴 내용을 확인할 때 쓴다)
+- ``from_step``  앞 단계의 결과에서 값 이어받기
+
+인자가 늘 밖에서 오는 것은 아니다. 앞 단계가 만들어 낸 값(찍은 시각, 조회 결과)이
+뒤 단계의 인자로 흐르는 활동이 있다. 그런 자리는 ``from_step`` 으로 잇는다 — 값이
+실행마다 달라도 **이번 실행의** 값으로 채워진다.
 
 파일 조작을 ``write_file`` 하나로 뭉뚱그리면 삭제가 "빈 파일 만들기"로 재현된다.
 관측된 조작마다 대응하는 동작이 있어야 한다.
@@ -33,8 +38,65 @@ from string import Template
 WORKDIR = os.environ.get("DETERMINISTIC_WORKDIR") or os.getcwd()
 
 
-def render(tpl: str, inputs: Dict[str, Any]) -> str:
-    return Template(tpl).substitute(inputs)
+def render(tpl: str, inputs: Dict[str, Any], linked: Dict[str, Any] = None) -> str:
+    """템플릿을 이번 실행의 값으로 채운다.
+
+    ``linked`` 는 앞 단계에서 이어받은 값이다. 밖에서 받은 입력과 섞어 쓰되, 같은
+    이름이 겹치지 않도록 생성 단계에서 이름을 갈라 둔다.
+    """
+    values = dict(inputs)
+    values.update(linked or {{}})
+    return Template(tpl).substitute(values)
+
+
+def _descend(node, key):
+    """앞 단계 결과 한 겹을 들어간다. 자리를 못 찾으면 실패한다.
+
+    JSON 문자열로 온 결과는 풀어서 들어간다 — 러너와 도구에 따라 구조 그대로 오기도,
+    문자열로 오기도 한다.
+
+    비슷한 자리를 뒤져 대신 채우지 않는다. 이어받을 자리를 못 찾았다는 것은 앞 단계가
+    지난번과 다른 것을 냈다는 뜻이고, 그때는 엉뚱한 값으로 도구를 부르느니 실패해서
+    에이전트에게 넘기는 편이 낫다.
+    """
+    if isinstance(node, str):
+        try:
+            node = json.loads(node)
+        except ValueError:
+            raise RuntimeError("앞 단계 결과를 구조로 읽을 수 없습니다: {{0}}".format(key))
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+    elif isinstance(node, list) and isinstance(key, int) and -len(node) <= key < len(node):
+        return node[key]
+    raise RuntimeError("앞 단계 결과에서 '{{0}}' 자리를 찾지 못했습니다.".format(key))
+
+
+def from_step(results: List[Dict[str, Any]], index: int, root: str, path=(), line=None):
+    """앞 단계의 결과에서 값 하나를 이어받는다.
+
+    ``index`` 는 이 실행 안에서의 단계 번호이고, ``root`` 는 그 단계 결과에서 본문이
+    실린 키다(셸은 ``output``, MCP 도구는 ``data``). ``line`` 은 본문이 여러 줄일 때
+    고를 줄이다.
+
+    자리는 생성 단계에서 표본 전부를 대조해 정한 것이다. 그 자리가 비어 있으면 값을
+    지어내지 않고 실패한다.
+    """
+    if index < 0 or index >= len(results):
+        raise RuntimeError("앞 단계 결과가 없습니다: results[{{0}}]".format(index))
+    node = results[index]
+    if root:
+        node = _descend(node, root)
+    for key in path:
+        node = _descend(node, key)
+    if line is not None:
+        lines = str(node).splitlines()
+        if line >= len(lines):
+            raise RuntimeError("앞 단계 결과에 {{0}}번째 줄이 없습니다.".format(line))
+        node = lines[line]
+    if node is None or (isinstance(node, str) and not node.strip()):
+        raise RuntimeError("앞 단계 결과에서 이어받을 값이 비어 있습니다.")
+    return node.strip() if isinstance(node, str) else node
 
 
 def load_mcp_config() -> dict:
@@ -180,6 +242,49 @@ if __name__ == "__main__":
 def empty_script(header: str = "generated (no steps)") -> str:
     """단계가 없는 골격. 생성 실패 시의 안전한 폴백."""
     return TEMPLATE.format(header=header, param_docs="        None", steps="    pass")
+
+
+# 되돌리기 실행기의 본문. 활동마다 다른 코드를 짓지 않는다 — 무엇을 되돌릴지는 관측에서
+# 이미 정해져(`compensation.invert`) 단계 목록으로 넘어오므로, 저장되는 코드는 그 단계를
+# 그대로 수행하는 한 벌이면 된다. 활동마다 코드를 지어내던 옛 방식은 그 지어내기가
+# 곧 추측이었다.
+_UNDO_BODY = """    servers = {servers}
+    for step in inputs.get("undo_steps") or []:
+        kind = str(step.get("kind") or "")
+        if kind == "mcp_call":
+            tool = str(step.get("tool") or "")
+            server = servers.get(tool)
+            if not server:
+                raise RuntimeError("되돌릴 도구의 서버를 찾지 못했습니다: " + tool)
+            outcome = await call_tool(server, tool, step.get("args") or {{}}, timeout_s=timeout_s)
+        elif kind == "file_delete":
+            outcome = await remove_file(step.get("path") or "")
+        elif kind == "file_restore":
+            outcome = await write_file(step.get("path") or "", step.get("content") or "")
+        else:
+            raise RuntimeError("알 수 없는 되돌리기 단계입니다: " + kind)
+        # 무엇을 되돌렸는지 결과에 남긴다. 재작업 결과 카드에서 사람이 확인한다.
+        outcome["undone"] = step.get("describes") or ""
+        results.append(outcome)"""
+
+
+def undo_script(tool_to_server: dict) -> str:
+    """되돌리기 단계 목록을 수행하는 코드.
+
+    `inputs["undo_steps"]` 로 단계를 받는다. 활동마다 내용이 다른 것은 단계 목록이지
+    코드가 아니다.
+    """
+    import json as _json
+
+    header = "compensation.py (auto-created from observed work history)"
+    body = _UNDO_BODY.format(
+        servers=_json.dumps(dict(tool_to_server or {}), ensure_ascii=False)
+    )
+    return TEMPLATE.format(
+        header=header,
+        param_docs='        - undo_steps (list): 되돌릴 단계 목록. 관측된 이력에서 만들어진다.',
+        steps=body,
+    )
 
 
 def skeleton() -> str:

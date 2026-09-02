@@ -61,6 +61,7 @@ def test_polling_database_has_the_helpers_the_generator_needs():
         "fetch_workitems_by_activity",
         "fetch_events_by_todo_id",
         "fetch_last_deactivated_at",
+        "fetch_related_workitem_outputs",
         "fetch_tenant_mcp_config",
     ):
         assert f"def {helper}(" in source, f"polling_service/database.py에 {helper}가 없습니다"

@@ -1831,7 +1831,7 @@ def fetch_workitems_by_activity(
 
         # query(워크아이템 지시문)까지 가져온다. 파라미터 이름표를 그 지시문에서
         # 관측하기 때문이다 — 없으면 고착화 코드가 다음 실행에서 입력을 못 찾는다.
-        query = supabase.table('todolist').select('id, proc_inst_id, root_proc_inst_id, rework_count, updated_at, status, query') \
+        query = supabase.table('todolist').select('id, proc_inst_id, root_proc_inst_id, rework_count, start_date, updated_at, status, query') \
             .eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
         if status:
             query = query.eq('status', status)
@@ -1841,6 +1841,58 @@ def fetch_workitems_by_activity(
         return response.data or []
     except Exception as e:
         print(f"[WARNING] Failed to fetch workitems by activity: {str(e)}")
+        return []
+
+def fetch_related_workitem_outputs(
+    tenant_id: str,
+    root_proc_inst_id: Optional[str],
+    proc_inst_id: Optional[str],
+    exclude_id: Optional[str] = None,
+    before: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """같은 루트 프로세스에서 이미 완료된 다른 워크아이템의 산출물.
+
+    에이전트가 `get_related_workitem_outputs` 도구로 읽던 것과 **같은 자료를 같은
+    모양으로** 돌려준다. 고착화 생성기는 이것으로 "이 값이 앞 액티비티의 산출물에서
+    왔는가"를 관측하고, 실행 런타임은 같은 조회로 그 값을 다시 채운다. 모양이 갈리면
+    관측한 자리와 읽는 자리가 달라져 조용히 틀린다.
+
+    `before`(그 워크아이템의 시작 시각)를 주면 그때 이미 끝나 있던 것만 남긴다. 지금
+    조회하면 **뒤에** 끝난 액티비티의 산출물까지 딸려 와, 그 실행에서는 알 수 없었던
+    값을 근거로 삼게 된다.
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        query = supabase.table('todolist').select(
+            'id, proc_inst_id, activity_id, activity_name, end_date, output'
+        ).eq('tenant_id', tenant_id).not_.is_('output', 'null')
+        if root_proc_inst_id:
+            query = query.eq('root_proc_inst_id', root_proc_inst_id)
+        elif proc_inst_id:
+            query = query.eq('proc_inst_id', proc_inst_id)
+        else:
+            return []
+        if exclude_id:
+            query = query.neq('id', exclude_id)
+        if before:
+            query = query.lt('end_date', before)
+        response = query.order('end_date', desc=True).execute()
+        return [
+            {
+                "workitemId": row.get("id"),
+                "procInstId": row.get("proc_inst_id"),
+                "activityId": row.get("activity_id"),
+                "activityName": row.get("activity_name"),
+                "endDate": row.get("end_date"),
+                "output": row.get("output"),
+            }
+            for row in (response.data or [])
+        ]
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch related workitem outputs: {str(e)}")
         return []
 
 def upsert_mcp_python_code(record: Dict[str, Any]):

@@ -36,19 +36,24 @@ from typing import Any, Iterable
 
 from deterministic_signature import (
     EXCLUDED_TOOLS,
+    FILE_WRITE_KIND,
+    MCP_CALL_KIND,
     SHELL_KIND,
+    is_readonly_shell,
     is_readonly_sql,
     looks_like_sql,
+    shell_made_dirs,
 )
 
 # ---------------------------------------------------------------------------
 # 행위 종류
 # ---------------------------------------------------------------------------
 
-MCP_CALL = "mcp_call"
-# 실행 지문이 셸 명령을 특별 취급하므로 종류 이름의 정의는 지문 모듈에 둔다.
+# 종류 이름의 정의는 지문 모듈에 둔다. 실행 지문이 셸 명령을 특별 취급하고, 단계 간
+# 이어받기가 종류별로 결과의 어느 키를 볼지 정하기 때문이다.
+MCP_CALL = MCP_CALL_KIND
 SHELL = SHELL_KIND
-FILE_WRITE = "file_write"
+FILE_WRITE = FILE_WRITE_KIND
 FILE_READ = "file_read"
 SKILL_READ = "skill_read"
 DELEGATE = "delegate"
@@ -315,6 +320,13 @@ def classify(tool: str, args: dict[str, Any]) -> str:
     if names & _DELEGATE_TOOLS:
         return DELEGATE
     if names & _SHELL_TOOLS or _looks_like_shell_args(args):
+        # 셸도 SQL과 같은 기준으로 본다 — 이름이 아니라 하는 일로. `date`·`ls`·`printf`
+        # 처럼 세상을 바꾸지 않는 명령은 맥락이지 재현 대상이 아니다. 이걸 부수효과로
+        # 세면 결과에 아무 기여도 없는 행위가 실행 지문에 들어가, 같은 결과를 낸 실행이
+        # 서로 다른 방식으로 갈린다.
+        found = _text_arg(args, _SHELL_ARG_KEYS)
+        if found and is_readonly_shell(found[1]):
+            return INSPECT
         return SHELL
     if names & _WRITE_TOOLS and (
         _text_arg(args, _PATH_ARG_KEYS)
@@ -514,6 +526,91 @@ def effect_actions(actions: Iterable[Action]) -> list[Action]:
     return [a for a in actions if a.has_effect]
 
 
+def canonicalize(actions: Iterable[Action]) -> list[Action]:
+    """결과에 남는 것만 남긴 최소 행위 목록.
+
+    고착화의 자격은 "같은 발자국을 밟았는가"가 아니라 **"같은 것을 남겼는가"** 여야 한다.
+    에이전트는 같은 산출물을 두고도 매번 조금씩 다르게 움직인다 — 폴더를 미리 만들기도
+    하고, 내용을 한 번 찍어 보기도 하고, 곧바로 파일을 쓰기도 한다. 그 곁가지까지 방식의
+    일부로 세면 같은 결과를 낸 실행이 서로 다른 방식으로 갈려, 반복되는 작업인데도 영영
+    굳지 않는다.
+
+    그래서 지문을 재기 전에 이력을 결과 기준으로 접는다.
+
+    - 세상을 바꾸지 않는 행위는 이미 맥락으로 빠진다(`classify`).
+    - 뒤따르는 파일 쓰기가 어차피 만들 디렉터리를 미리 만드는 행위는 뺀다. 골격의
+      `write_file` 이 부모 디렉터리를 만들므로 재현해도 남는 것이 같다.
+    - 같은 경로에 여러 번 덮어썼으면 마지막 것만 남긴다. 최종 상태가 곧 결과다.
+
+    부분 수정(`edit`)은 접지 않는다. 앞의 내용에 기대어 고치는 것이라 마지막 하나만
+    재현하면 다른 결과가 나온다.
+
+    남긴 것이 없어도 **결과가 뒤 단계로 흘러갔으면** 접지 않는다. `mkdir -p x && date`
+    는 디렉터리 하나 만드는 것이 전부지만, 찍은 시각이 다음 단계의 문서에 들어갔다면
+    그 행위는 결과의 일부다. 접어 버리면 다음 실행에서 그 값을 만들 방법이 사라진다.
+    """
+    effects = [action for action in actions if action.has_effect]
+
+    def _result_feeds_later(action: Action, rest: list[Action]) -> bool:
+        """이 행위가 낸 값이 뒤 단계의 인자로 흘러갔는가."""
+        if action.result is None:
+            return False
+        text = (
+            action.result if isinstance(action.result, str)
+            else json.dumps(action.result, ensure_ascii=False, default=str)
+        )
+        # 짧은 토막은 아무 데나 우연히 걸린다(`ok` 가 `okay` 에 걸리는 식).
+        produced = {line.strip() for line in str(text).splitlines() if len(line.strip()) >= 4}
+        if not produced:
+            return False
+        for later in rest:
+            blob = json.dumps(later.args, ensure_ascii=False, default=str)
+            if any(value in blob for value in produced):
+                return True
+        return False
+
+    def _dirs_made(action: Action) -> tuple[str, ...]:
+        if action.kind == FILE_WRITE and str(action.args.get("op") or "") == "mkdir":
+            path = str(action.args.get("path") or "")
+            return (path,) if path else ()
+        if action.kind == SHELL:
+            return shell_made_dirs(str(action.args.get("command") or "")) or ()
+        return ()
+
+    def _written_paths(rest: list[Action]) -> list[str]:
+        return [
+            str(a.args.get("path") or "")
+            for a in rest
+            if a.kind == FILE_WRITE and str(a.args.get("op") or "write") in ("write", "edit")
+        ]
+
+    kept: list[Action] = []
+    for index, action in enumerate(effects):
+        rest = effects[index + 1:]
+
+        made = _dirs_made(action)
+        if made and not _result_feeds_later(action, rest):
+            covered = _written_paths(rest)
+            if covered and all(
+                any(written.startswith(directory.rstrip("/") + "/") for written in covered)
+                for directory in made
+            ):
+                continue
+
+        if action.kind == FILE_WRITE and str(action.args.get("op") or "write") == "write":
+            path = str(action.args.get("path") or "")
+            if path and any(
+                a.kind == FILE_WRITE
+                and str(a.args.get("op") or "write") == "write"
+                and str(a.args.get("path") or "") == path
+                for a in rest
+            ):
+                continue
+
+        kept.append(action)
+    return kept
+
+
 def summarize(actions: Iterable[Action]) -> dict[str, Any]:
     """작업 이력 요약. 생성된 코드의 출처를 사람이 읽을 수 있게 남긴다.
 
@@ -552,24 +649,3 @@ def summarize(actions: Iterable[Action]) -> dict[str, Any]:
     }
 
 
-def to_log_entries(actions: Iterable[Action]) -> list[dict[str, Any]]:
-    """보상 코드 생성기(LLM)에 넘길 이력 표현.
-
-    부수효과 행위는 되돌릴 대상이므로 인자를 온전히 싣고, 맥락 행위(스킬·파일 읽기,
-    조회)는 "무엇을 근거로 그렇게 했는지"를 알려주기 위해 요약만 싣는다.
-    """
-    entries: list[dict[str, Any]] = []
-    for action in actions:
-        entry: dict[str, Any] = {
-            "timestamp": action.timestamp,
-            "kind": action.kind,
-            "tool_name": action.tool,
-        }
-        if action.has_effect:
-            entry["args"] = action.raw_args
-            entry["canonical_args"] = action.args
-            entry["log_data"] = {"tool_name": action.tool, "args": action.raw_args}
-        else:
-            entry["summary"] = {k: v for k, v in action.args.items() if isinstance(v, str)}
-        entries.append(entry)
-    return entries
