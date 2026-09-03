@@ -47,6 +47,7 @@ from database import (
     fetch_mcp_python_code,
     upsert_mcp_python_code,
     fetch_related_workitem_outputs,
+    fetch_workitem_by_proc_inst_and_activity,
     fetch_workitems_by_activity,
     fetch_events_by_todo_id,
     fetch_last_deactivated_at,
@@ -103,6 +104,60 @@ MAX_SAMPLE_COMBINATIONS = 24
 # 고착화된 코드를 쓰고도 이 횟수 이상 재작업되면 코드 자체를 의심해 비활성화한다.
 # 1회 재작업은 대개 입력이 틀린 경우이므로 되돌린 뒤 새 파라미터로 재실행한다.
 REWORK_DISTRUST_THRESHOLD = 2
+
+
+# 고착화된 코드를 **실제로 쓴** 실행이 남기는 실행 방식. 되돌리기만 하고 재실행은
+# 에이전트가 맡은 회차(`deterministic-undo-only`), 되돌리기가 막혀 재작업이 통째로
+# 에이전트에게 넘어간 회차(`deterministic-skipped` / `deterministic-undo-pending`),
+# 카드가 아예 없는 회차는 코드를 쓴 것이 아니다.
+CODE_EXECUTION_MODES = ("deterministic", "deterministic-undo")
+
+
+def _event_payload(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    data = (event or {}).get("data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (ValueError, TypeError):
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def ran_deterministic_code(events: Optional[List[Dict[str, Any]]]) -> bool:
+    """이 회차가 고착화된 코드로 돌았는가. 실행 카드의 실행 방식으로 판정한다."""
+    for event in events or []:
+        payload = _event_payload(event)
+        if payload and str(payload.get("execution_mode") or "") in CODE_EXECUTION_MODES:
+            return True
+    return False
+
+
+def count_reworked_code_runs(proc_inst_id: str, activity_id: str, tenant_id: str) -> int:
+    """고착화된 코드를 쓰고도 재작업된 회차 수.
+
+    재작업 횟수를 그대로 세면 안 된다. 되돌리기가 실패해 재작업 전체가 에이전트에게
+    넘어간 회차까지 "코드가 틀렸다"는 증거로 세면, 코드는 한 번도 의심받을 짓을 하지
+    않았는데 비활성화된다. 실제로 그렇게 됐다 — 되돌리기 인프라가 깨져 재작업이 세 번
+    반복되는 동안 코드가 돈 것은 첫 회차뿐이었는데, 그 활동은 비활성화되어 새 인스턴스
+    까지 전부 에이전트가 맡게 됐다.
+
+    코드가 실제로 돈 회차만 센다. 그 회차들이 재작업됐다는 것이 곧 코드를 의심할 근거다.
+    """
+    items = fetch_workitem_by_proc_inst_and_activity(
+        proc_inst_id, activity_id, tenant_id, recent_only=False
+    )
+    if items is None:
+        return 0
+    if not isinstance(items, list):
+        items = [items]
+    used = 0
+    for item in items:
+        todo_id = getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else None)
+        if not todo_id:
+            continue
+        if ran_deterministic_code(fetch_events_by_todo_id(str(todo_id))):
+            used += 1
+    return used
 
 
 def _trace_of(todo_id: str) -> List[Action]:

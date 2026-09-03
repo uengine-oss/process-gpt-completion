@@ -154,6 +154,7 @@ def generator(monkeypatch):
     db.upsert_mcp_python_code = saved.append
     db.fetch_last_deactivated_at = lambda *a, **k: None
     db.fetch_workitems_by_activity = lambda *a, **k: workitems
+    db.fetch_workitem_by_proc_inst_and_activity = lambda *a, **k: workitems
     db.fetch_events_by_todo_id = lambda todo_id: events.get(todo_id, [])
     db.fetch_related_workitem_outputs = lambda tenant, root, inst, **k: upstream.get(
         str(k.get("exclude_id") or ""), []

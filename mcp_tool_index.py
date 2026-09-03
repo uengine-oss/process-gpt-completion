@@ -23,6 +23,36 @@ logger = logging.getLogger(__name__)
 LIST_TOOLS_TIMEOUT_SECONDS = 15
 
 
+def _remote_transport(server_cfg):
+    """원격 MCP 서버의 전송 객체. 설정에 적힌 URL을 **글자 그대로** 쓴다.
+
+    fastmcp 2.x 는 "자동 리다이렉트를 피한다"며 경로 끝에 슬래시를 붙인다
+    (`client/transports.py`: `path + "/"`). 그런데 슬래시에 엄격한 서버가 있다 —
+    `mcp.supabase.com` 은 `/mcp` 에 200, `/mcp/` 에 **404** 를 낸다. 404는 MCP SDK를
+    거치며 `Session terminated` 로 바뀌어 올라오므로, 원인이 URL이라는 사실이 어디에도
+    남지 않는다. 그 서버의 도구가 통째로 인덱스에서 빠지고, 그 도구를 되돌리는
+    보상 코드는 "서버를 찾지 못했다"로 실패한다.
+
+    fastmcp 3.x 는 이 동작을 없앴다("Some servers are strict about trailing slashes").
+    폴링 서비스는 3.4.4 라 멀쩡하고 completion 은 2.9.0 이라 막혔다 — 같은 파일이
+    두 서비스에 사본으로 놓이므로, 버전에 기대지 않고 여기서 URL을 고정한다.
+    """
+    config = dict(server_cfg or {})
+    url = config.get("url")
+    if not url:
+        return None
+    kind = str(config.get("transport") or config.get("type") or "http").lower()
+    headers = config.get("headers") or {}
+    from fastmcp.client.transports import SSETransport, StreamableHttpTransport
+
+    transport_cls = SSETransport if kind == "sse" else StreamableHttpTransport
+    transport = transport_cls(url=url, headers=headers)
+    # 생성자가 경로를 바꿨으면 되돌린다. 3.x 에서는 애초에 바꾸지 않아 무해하다.
+    if getattr(transport, "url", None) != url:
+        transport.url = url
+    return transport
+
+
 def _client_config(server_key: str, server_cfg):
     """저장된 서버 설정을 fastmcp 가 읽는 모양으로 맞춘다.
 
@@ -69,12 +99,21 @@ def build_tool_index_from_tenant(
                 통째로 사라진다(테넌트에 stdio 서버가 하나만 섞여 있어도 매핑이
                 늘 비게 된다). 각자 자기 상한 안에서 성공하거나 자기만 실패한다.
                 """
-                config = _client_config(server_k, server_cfg)
+                # 원격 서버는 전송 객체를 직접 만들어 URL을 보존한다. stdio 서버는
+                # URL이 없으므로 기존대로 설정을 그대로 넘긴다.
+                target = _remote_transport(server_cfg) or _client_config(server_k, server_cfg)
                 try:
                     async with _a.timeout(deadline):
-                        client = McpClient(config)
+                        client = McpClient(target)
                         async with client:
-                            await client.ping()
+                            # ping 은 MCP 스펙의 선택 기능이다. 구현하지 않은 서버는
+                            # "Method not found" 를 돌려주는데, 그것을 연결 실패로 읽으면
+                            # 멀쩡히 도구를 제공하는 서버가 색인에서 통째로 빠진다.
+                            # 살아 있는지는 바로 다음 줄의 list_tools 가 말해 준다.
+                            try:
+                                await client.ping()
+                            except Exception:
+                                pass
                             tools = await client.list_tools()
                             for t in tools:
                                 tool_to_server[t.name] = server_k

@@ -11,13 +11,14 @@
 """
 
 import ast
+import json as _json
 
 import pytest
 
 from compensation import UNDO_DELETE_FILE, UNDO_RESTORE_FILE, UNDO_TOOL, invert, undo_plan
 from deterministic_signature import invert_sql
 from deterministic_template import undo_script
-from work_history import to_action
+from work_history import normalize_events, to_action
 
 
 def _trace(*calls):
@@ -181,3 +182,96 @@ def test_an_unknown_tool_fails_instead_of_skipping():
     plan = undo_plan(_trace(("db_exec", {"sql": "INSERT INTO a (x) VALUES (1)"}, "ok")))
     with pytest.raises(RuntimeError):
         asyncio.run(namespace["run"](plan))
+
+
+# ---------------------------------------------------------------------------
+# 고착화 실행이 남긴 이력 — 두 사본이 같은 결론을 내야 한다
+# ---------------------------------------------------------------------------
+
+# 굳은 활동을 재작업할 때의 표본. 실행 골격이 단계마다 돌려준 결과가 완료 이벤트 하나에
+# 통째로 실린다. 이것을 못 읽으면 "되돌릴 것이 없다"로 읽혀 순방향 코드가 덧씌워진다.
+_FROZEN_RUN = {
+    "event_type": "task_completed",
+    "timestamp": "2026-09-03T00:00:01",
+    "data": _json.dumps({
+        "ok": True, "execution_mode": "deterministic", "llm_calls": 0, "undo_results": [],
+        "results": [
+            {"kind": "shell", "command": "date '+%Y-%m-%d'", "cwd": "/w", "output": "2026-09-03"},
+            {"kind": "mcp_call", "tool": "db_exec", "server": "pg",
+             "args": {"sql": "INSERT INTO ledger (applicant, amount) VALUES ('한지민', 29000)"},
+             "data": None},
+            {"kind": "file_write", "op": "write", "path": "/w/a.md", "bytes": 3},
+        ],
+    }, ensure_ascii=False),
+}
+
+
+def test_a_frozen_runs_history_undoes_to_the_same_plan_on_both_sides():
+    """두 사본이 갈리면 굳힐 때 "되돌릴 수 있다"고 저장한 것을 실행기가 못 되돌린다."""
+    steps, reasons = invert(normalize_events([_FROZEN_RUN]))
+    assert reasons == []
+    # 되돌리기는 역순. 값을 찍기만 한 셸은 되돌릴 대상이 아니다.
+    assert [step.kind for step in steps] == [UNDO_DELETE_FILE, UNDO_TOOL]
+    assert steps[0].path == "/w/a.md"
+    assert steps[1].args["sql"] == (
+        "DELETE FROM ledger WHERE applicant = '한지민' AND amount = 29000"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 한 바퀴 — 굳은 코드가 남긴 것을 그 이력만 보고 되돌린다
+# ---------------------------------------------------------------------------
+
+def test_a_frozen_run_is_undone_from_nothing_but_its_own_output(tmp_path):
+    """실제 코드를 돌려 나온 결과만으로 되돌리기까지 간다.
+
+    재작업이 중복 반영되던 자리는 이 한 바퀴의 첫 칸이었다 — 고착화 실행의 결과를
+    이력으로 읽지 못해 "되돌릴 것이 없다"가 되고, 되돌리기를 건너뛴 채 순방향 코드가
+    덧씌워졌다. 사람이 브라우저에서 확인하던 것을 여기서 못박는다.
+    """
+    import json
+    import subprocess
+    import sys
+
+    from deterministic_template import TEMPLATE
+
+    target = tmp_path / "ledger" / "a.md"
+    forward = tmp_path / "forward.py"
+    forward.write_text(
+        TEMPLATE.format(
+            header="forward (test)",
+            param_docs="        - path (string)",
+            steps='    results.append(await write_file(render("${path}", inputs), "장부\\n"))',
+        ),
+        encoding="utf-8",
+    )
+    done = subprocess.run(
+        [sys.executable, str(forward), json.dumps({"path": str(target)})],
+        capture_output=True, text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    assert target.exists()
+
+    # 워크아이템에 남는 것은 이 봉투 하나뿐이다. 도구 이벤트는 남지 않는다.
+    envelope = {
+        "event_type": "task_completed",
+        "timestamp": "2026-09-03T00:00:01",
+        "data": _json.dumps(
+            {"ok": True, "execution_mode": "deterministic", "llm_calls": 0,
+             "undo_results": [], **json.loads(done.stdout.strip().splitlines()[-1])},
+            ensure_ascii=False,
+        ),
+    }
+    plan = undo_plan(normalize_events([envelope]))
+    assert plan is not None, "굳은 실행의 이력을 읽지 못하면 재작업이 덧씌운다"
+
+    undo = tmp_path / "compensation.py"
+    undo.write_text(undo_script({}), encoding="utf-8")
+    undone = subprocess.run(
+        [sys.executable, str(undo), json.dumps(plan)], capture_output=True, text=True,
+    )
+    assert undone.returncode == 0, undone.stderr
+    assert not target.exists()
+    # 무엇을 되돌렸는지가 결과에 남는다.
+    results = json.loads(undone.stdout.strip().splitlines()[-1])["results"]
+    assert results[0]["undone"].startswith("파일 삭제")

@@ -138,3 +138,69 @@ def test_summary_records_skills_shell_and_files():
     assert summary["files_written"] == ["/workspace/out.json"]
     assert summary["shell_commands"] == ["python3 load.py --file in.csv"]
     assert summary["subagents"] == ["checker"]
+
+# --------------------------------------------------------------------------
+# 고착화 실행이 남긴 이력 — 도구 이벤트가 아니라 결과 봉투 하나
+# --------------------------------------------------------------------------
+
+def _frozen(results, timestamp="2026-09-02T00:00:01", mode="deterministic"):
+    import json
+    return _event("task_completed", json.dumps(
+        {"ok": True, "execution_mode": mode, "llm_calls": 0,
+         "undo_results": [], "results": results}, ensure_ascii=False), timestamp)
+
+
+def test_a_frozen_runs_results_are_read_back_as_actions():
+    """굳은 활동은 `tool_usage_finished` 를 남기지 않는다. 결과 봉투를 못 읽으면
+    이후 모든 실행이 "아무 일도 하지 않은 것"으로 읽혀 보상이 만들어지지 않는다."""
+    actions = wh.normalize_events([_frozen([
+        {"kind": "shell", "command": "mkdir -p /w && date", "cwd": "/w", "output": "2026-09-02"},
+        {"kind": "file_read", "path": "/w/a.md", "content": "예전 내용"},
+        {"kind": "file_write", "op": "write", "path": "/w/a.md", "bytes": 12},
+        {"kind": "mcp_call", "tool": "db_exec", "args": {"sql": "INSERT INTO t (a) VALUES (1)"}, "data": None},
+    ])])
+    assert [a.kind for a in actions] == [wh.SHELL, wh.FILE_READ, wh.FILE_WRITE, wh.MCP_CALL]
+    assert actions[2].args["op"] == "write"
+    assert actions[3].args["sql"] == "INSERT INTO t (a) VALUES (1)"
+
+
+def test_a_frozen_runs_readonly_work_is_context_just_like_the_agents():
+    """같은 일을 에이전트가 했을 때와 같은 결론이어야 한다."""
+    actions = wh.normalize_events([_frozen([
+        {"kind": "shell", "command": "date '+%Y'", "cwd": "/w", "output": "2026"},
+        {"kind": "mcp_call", "tool": "db_exec", "args": {"sql": "SELECT 1"}, "data": []},
+    ])])
+    assert [a.kind for a in actions] == [wh.INSPECT, wh.INSPECT]
+    assert not any(a.has_effect for a in actions)
+
+
+def test_a_deleted_file_is_not_read_as_a_write():
+    """삭제를 쓰기로 뭉뚱그리면 되돌리기가 지워진 파일을 또 지우려 든다."""
+    action, = wh.normalize_events([_frozen([
+        {"kind": "file_write", "op": "delete", "path": "/w/a.md", "existed": True},
+    ])])
+    assert action.kind == wh.FILE_WRITE and action.args["op"] == "delete"
+
+
+def test_a_call_without_recorded_arguments_stays_an_effect():
+    """인자를 남기지 않은 옛 골격의 결과. 버리면 "되돌릴 것이 없다"로 읽힌다."""
+    action, = wh.normalize_events([_frozen([{"kind": "mcp_call", "tool": "db_exec", "data": None}])])
+    assert action.kind == wh.MCP_CALL and action.has_effect and action.args == {}
+
+
+def test_the_started_card_is_not_mistaken_for_a_result_envelope():
+    """시작 카드에도 `execution_mode` 가 실린다. 결과 목록이 있어야 봉투다."""
+    assert wh.normalize_events([
+        _event("task_started", '{"role": "결정론적 코드 실행 결과", "execution_mode": "deterministic"}')
+    ]) == []
+
+
+def test_the_agents_own_events_are_still_read_alongside_a_card():
+    """되돌리기만 하고 넘긴 회차에는 카드와 에이전트 이력이 함께 남는다."""
+    actions = wh.normalize_events([
+        _frozen([], "2026-09-02T00:00:01", mode="deterministic-undo-only"),
+        _event("tool_usage_finished",
+               {"tool_name": "write_file", "args": {"file_path": "/w/a.md", "content": "x"}},
+               "2026-09-02T00:00:02"),
+    ])
+    assert [a.kind for a in actions] == [wh.FILE_WRITE]

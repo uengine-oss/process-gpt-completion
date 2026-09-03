@@ -1768,15 +1768,28 @@ def fetch_tenant_mcp_config(tenant_id: str) -> Optional[Dict[str, Any]]:
         print(f"[ERROR] Failed to fetch tenant MCP config: {str(e)}")
         return None
 
-def fetch_mcp_python_code(proc_def_id: str, activity_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+def fetch_mcp_python_code(
+    proc_def_id: str, activity_id: str, tenant_id: str, include_deactivated: bool = False
+) -> Optional[Dict[str, Any]]:
+    """해당 액티비티의 최신 코드 행.
+
+    `include_deactivated` 는 보상(undo) 생성 전용이다. 비활성화는 "이 순방향 코드를 더는
+    믿지 않는다"는 뜻이지 "되돌리지 않아도 된다"는 뜻이 아니다. 그런데 이 조회가 늘
+    활성 행만 보면, 코드가 한 번 비활성화된 뒤로는 보상을 **영영 저장할 곳이 없어진다**
+    (행이 없다고 보고 새 행을 만들려다 유일 제약에 걸린다). 실행 런타임도 되돌리기를
+    위해서는 비활성 여부와 무관하게 최신 행을 읽는다 — 양쪽이 같은 행을 봐야 한다.
+    """
     try:
         supabase = supabase_client_var.get()
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
-        
-        # 비활성화된 코드는 제외한다. 재작업이 반복되어 신뢰를 잃은 코드는 행으로
-        # 남되 다시 선택되지 않는다.
-        response = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).is_('deactivated_at', 'null').order('created_at', desc=True).limit(1).execute()
+
+        query = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
+        if not include_deactivated:
+            # 비활성화된 코드는 제외한다. 재작업이 반복되어 신뢰를 잃은 코드는 행으로
+            # 남되 다시 선택되지 않는다.
+            query = query.is_('deactivated_at', 'null')
+        response = query.order('created_at', desc=True).limit(1).execute()
         if response.data and len(response.data) > 0:
             return response.data[0]
         else:

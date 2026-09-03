@@ -39,7 +39,13 @@ async def generate_compensation(workitem, new_workitem):
         if workitem is None:
             raise Exception("Workitem is None")
         
-        deterministic_code = fetch_mcp_python_code(workitem.proc_def_id, workitem.activity_id, workitem.tenant_id)
+        # 비활성 여부와 무관하게 최신 행을 가져온다. 코드가 비활성화된 뒤에도 되돌리기는
+        # 필요하고, 저장할 자리도 그 행이다. 활성 행만 보면 비활성화된 활동은 보상을
+        # 영영 갖지 못한 채 재작업마다 에이전트에게 통째로 넘어간다.
+        deterministic_code = fetch_mcp_python_code(
+            workitem.proc_def_id, workitem.activity_id, workitem.tenant_id,
+            include_deactivated=True,
+        )
         if deterministic_code and deterministic_code.get("compensation") is not None:
             return
         
@@ -106,7 +112,11 @@ async def generate_compensation(workitem, new_workitem):
 
         upsert_workitem({
             "id": new_workitem.get('id'),
-            "status": "IN_PROGRESS",
+            # 재작업 범위가 정한 상태를 그대로 둔다. 여기서 IN_PROGRESS로 못박으면
+            # 재작업 시작 액티비티가 아닌 뒤 단계까지 곧바로 실행 대상이 되어, 앞
+            # 단계가 다시 끝나기도 전에 옛 입력으로 돌아간다. 되돌릴 수 있는 활동만
+            # 그렇게 되므로 순서가 보상 유무에 따라 달라지기까지 한다.
+            "status": new_workitem.get('status') or "IN_PROGRESS",
             "user_id": user_id,
             "username": user_name,
             # 실행 런타임을 바꾸지 않는다. 퇴역한 crewai-action으로 찍으면 어떤

@@ -10,6 +10,7 @@
 
 import ast
 import asyncio
+import json
 import sys
 import types
 
@@ -85,6 +86,17 @@ def test_the_reworked_workitem_keeps_its_runtime(handler):
     assert captured["workitem"]["status"] == "IN_PROGRESS"
 
 
+def test_the_rework_scope_decides_which_activity_starts(handler):
+    """재작업 범위가 뒤 단계를 TODO로 만들었으면 그대로 둬야 한다.
+
+    여기서 IN_PROGRESS로 못박으면 앞 단계가 다시 끝나기도 전에 뒤 단계가 옛 입력으로
+    돌아간다. 되돌릴 수 있는 활동만 그렇게 되므로 순서가 보상 유무에 따라 갈린다.
+    """
+    handler._captured["events"] = [_event("db_exec", {"sql": "INSERT INTO t (a) VALUES (1)"}, "t1")]
+    asyncio.run(handler.generate_compensation(_Workitem(), {"id": "next", "status": "TODO"}))
+    assert handler._captured["workitem"]["status"] == "TODO"
+
+
 @pytest.mark.parametrize("events,why", [
     ([_event("execute", {"command": "python3 scripts/load.py --qty 20"}, "t1")],
      "셸 실행은 되돌릴 방법이 이력에 없다"),
@@ -100,6 +112,42 @@ def test_an_irreversible_history_is_not_stored(handler, events, why):
     captured = _run(handler, events)
     assert "saved" not in captured, why
     assert "workitem" not in captured, "되돌리지도 못하면서 재작업을 시작시키면 안 된다"
+
+
+def _frozen_run_event(results, timestamp="t1"):
+    """고착화 실행이 남기는 완료 이벤트. 도구 이벤트가 아니라 결과 봉투 하나다."""
+    return {
+        "event_type": "task_completed",
+        "timestamp": timestamp,
+        "data": json.dumps(
+            {"ok": True, "execution_mode": "deterministic", "llm_calls": 0,
+             "undo_results": [], "results": results},
+            ensure_ascii=False,
+        ),
+    }
+
+
+def test_a_frozen_activity_can_still_get_a_compensation(handler):
+    """한 번 굳으면 이후 모든 실행이 결과 봉투만 남긴다.
+
+    그 봉투를 못 읽으면 "되돌릴 부수효과가 없는 활동"으로 보여 보상이 영영 만들어지지
+    않는다. 그러면 재작업 때 되돌리기가 조용히 건너뛰어지고 같은 행이 두 번 들어간다.
+    """
+    captured = _run(handler, [_frozen_run_event([
+        {"kind": "mcp_call", "tool": "db_exec", "server": "pg",
+         "args": {"sql": "INSERT INTO ledger (applicant) VALUES ('김철수')"}, "data": None},
+    ])])
+    assert captured.get("saved") is not None
+    ast.parse(captured["saved"]["compensation"])
+
+
+def test_a_frozen_run_without_recorded_arguments_is_not_read_as_harmless(handler):
+    """무엇을 넣었는지 모르는 호출은 되돌릴 수 없다 — 없었던 일로 읽으면 안 된다."""
+    captured = _run(handler, [_frozen_run_event([
+        {"kind": "mcp_call", "tool": "db_exec", "data": None},
+    ])])
+    assert "saved" not in captured
+    assert "workitem" not in captured
 
 
 def test_an_activity_without_effects_is_skipped(handler):

@@ -117,10 +117,23 @@ async def _client_from_server_key(server_key: str):
 async def call_tool(server_key: str, tool_name: str, args: Dict[str, Any], timeout_s: int = 60):
     client = await _client_from_server_key(server_key)
     async with client:
-        await client.ping()
+        try:
+            await client.ping()
+        except Exception:
+            # ping 은 MCP 스펙의 선택 기능이다. 구현하지 않은 서버는 "Method not found" 를
+            # 돌려주는데, 그것을 연결 실패로 읽으면 도구를 불러 보지도 못하고 실행이 통째로
+            # 죽는다. 같은 서버를 에이전트는 잘 쓴다 — 에이전트 쪽 클라이언트는 ping 을
+            # 하지 않기 때문이다. 살아 있는지는 바로 다음 줄의 실제 호출이 말해 준다.
+            pass
         res = await asyncio.wait_for(client.call_tool(tool_name, args), timeout=timeout_s)
         safe = json.loads(json.dumps(res.data, ensure_ascii=False, default=str))
-        return {{"kind": "mcp_call", "tool": tool_name, "data": safe, "server": server_key}}
+        # 인자를 함께 남긴다. 이 결과가 다음 재작업의 **이력**이 된다 — 무엇을 넣었는지가
+        # 없으면 되돌릴 방법도 없어 재작업 전체가 에이전트에게 넘어간다.
+        sent = json.loads(json.dumps(args, ensure_ascii=False, default=str))
+        return {{
+            "kind": "mcp_call", "tool": tool_name, "args": sent,
+            "data": safe, "server": server_key,
+        }}
 
 
 def _resolve(path: str) -> str:
@@ -150,7 +163,10 @@ async def write_file(path: str, content: str):
     os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
     with open(target, "w", encoding="utf-8") as handle:
         handle.write(content)
-    return {{"kind": "file_write", "path": target, "bytes": len(content.encode("utf-8"))}}
+    return {{
+        "kind": "file_write", "op": "write", "path": target,
+        "bytes": len(content.encode("utf-8")),
+    }}
 
 
 async def edit_file(path: str, old_string: str, new_string: str):
@@ -161,7 +177,7 @@ async def edit_file(path: str, old_string: str, new_string: str):
         raise RuntimeError("치환 대상을 찾지 못했습니다: {{0}}".format(target))
     with open(target, "w", encoding="utf-8") as handle:
         handle.write(body.replace(old_string, new_string, 1))
-    return {{"kind": "file_write", "path": target, "mode": "edit"}}
+    return {{"kind": "file_write", "op": "edit", "path": target}}
 
 
 async def remove_file(path: str):

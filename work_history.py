@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -478,8 +479,205 @@ def to_action(tool: str, args: dict[str, Any], *, result: Any = None, timestamp:
 
 
 # ---------------------------------------------------------------------------
+# 고착화 실행이 남긴 이력
+# ---------------------------------------------------------------------------
+# 고착화된 코드로 돈 실행은 도구 이벤트(`tool_usage_finished`)를 남기지 않는다. 실행
+# 골격이 단계마다 돌려준 결과가 완료 이벤트 하나에 통째로 실린다. 그 이벤트를 읽지
+# 못하면 **한 번 굳은 활동은 이후 모든 실행이 "아무 일도 하지 않은 것"으로 읽힌다** —
+# 재작업 때 되돌릴 것이 없다고 판정되고, 순방향 코드가 그 위에 덧씌워져 같은 값이 두
+# 번 반영된다. 보상이 만들어지기 전에 굳은 활동은 영영 보상을 갖지 못한다.
+
+# 실행 결과의 `kind` → 그 모양을 남긴 골격 원시 동작의 이름. 되읽을 때 이름으로 종류를
+# 다시 판정하므로(`to_action`), 에이전트가 같은 일을 했을 때와 같은 결론이 나온다.
+_RESULT_FILE_OP_TOOLS = {
+    "write": "write_file",
+    "edit": "edit_file",
+    "delete": "delete_file",
+    "move": "move_file",
+    "copy": "copy_file",
+    "mkdir": "mkdir",
+}
+
+
+def execution_results(event: dict[str, Any]) -> list[Any] | None:
+    """이 이벤트가 고착화 실행의 결과 봉투인가. 아니면 None.
+
+    타입 이름으로 고르지 않는다 — 결과 봉투는 `task_completed` 로 남고, 그 이름은
+    에이전트 경로의 다른 카드도 함께 쓴다. 대신 **모양**으로 고른다: 실행 방식과
+    단계별 결과 목록을 함께 싣는 것은 이 봉투뿐이다.
+    """
+    data = _loads(event.get("data"))
+    if not isinstance(data, dict):
+        return None
+    results = data.get("results")
+    if not isinstance(results, list):
+        return None
+    if "execution_mode" not in data and "llm_calls" not in data:
+        return None
+    return results
+
+
+def action_from_execution_result(entry: Any, timestamp: str = "") -> Action | None:
+    """실행 골격이 돌려준 결과 한 건을 행위로 되읽는다.
+
+    골격의 원시 동작이 남기는 모양을 그대로 뒤집어 **도구 호출이었던 모습**으로
+    되돌린 뒤, 에이전트 이력과 같은 분류기에 넣는다. 판정을 따로 짜면 같은 일을
+    에이전트가 했을 때와 고착화 코드가 했을 때의 결론이 갈린다.
+
+    되읽을 수 없는 것은 버리지 않는다. 버리면 "되돌릴 것이 없다"로 읽혀 조용히
+    덧씌워지지만, 인자를 모르는 도구 호출로 남기면 "되돌릴 수 없다"가 되어 재작업
+    전체가 에이전트에게 넘어간다 — 실패 방향을 안전한 쪽에 둔다.
+    """
+    if not isinstance(entry, dict):
+        return None
+    kind = str(entry.get("kind") or "").strip()
+    if not kind:
+        return None
+    if kind == SHELL:
+        return to_action(
+            "run_shell",
+            {"command": str(entry.get("command") or ""), "cwd": str(entry.get("cwd") or "")},
+            result=entry.get("output"),
+            timestamp=timestamp,
+        )
+    if kind == FILE_WRITE:
+        # 조작 종류를 이름으로 옮긴다. 삭제·이동을 "쓰기"로 뭉뚱그리면 되돌리기가
+        # 지워진 파일을 **또 지우려** 든다.
+        operation = str(entry.get("op") or entry.get("mode") or "write")
+        args: dict[str, Any] = {
+            "file_path": str(entry.get("path") or entry.get("source") or ""),
+        }
+        if isinstance(entry.get("content"), str):
+            args["content"] = entry["content"]
+        return to_action(
+            _RESULT_FILE_OP_TOOLS.get(operation, "write_file"),
+            args,
+            timestamp=timestamp,
+        )
+    if kind == FILE_READ:
+        return to_action(
+            "read_file",
+            {"file_path": str(entry.get("path") or "")},
+            result={"content": entry.get("content")},
+            timestamp=timestamp,
+        )
+    arguments = entry.get("args")
+    if isinstance(arguments, dict) and arguments:
+        return to_action(
+            str(entry.get("tool") or kind),
+            arguments,
+            result=entry.get("data"),
+            timestamp=timestamp,
+        )
+    # 인자를 남기지 않은 옛 골격의 결과. 무엇을 했는지 모르므로 되돌릴 수도 없다.
+    return Action(
+        kind=MCP_CALL,
+        tool=str(entry.get("tool") or kind),
+        raw_args=dict(entry),
+        result=entry.get("data"),
+        timestamp=timestamp,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 이벤트 → 행위 목록
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 되돌리기로 넘긴 행위 — 그 회차의 "작업"이 아니다
+# ---------------------------------------------------------------------------
+# 재작업 회차의 이력에는 두 가지가 섞여 남는다. 직전 회차를 **되돌린 일**과 이번 회차가
+# **새로 한 일**이다. 되돌리기까지 그 회차의 작업으로 읽으면, 다음 재작업은 그 되돌리기
+# 마저 되돌리려 든다. 그런데 INSERT 를 되돌린 것은 DELETE 이고 DELETE 는 되돌릴 수 없다
+# — 그 순간부터 이 활동은 영영 "되돌리기 불가"가 되어 재작업이 통째로 에이전트에게
+# 넘어가고, 다시는 결정론적 경로로 돌아오지 못한다.
+#
+# 무엇을 되돌리라고 넘겼는지는 그 회차의 실행 카드에 단계 그대로 실려 있다. 짐작하지
+# 않고 그것과 대조해서 일치하는 행위만 뺀다.
+
+UNDO_STEP_TOOL = "mcp_call"
+UNDO_STEP_DELETE_FILE = "file_delete"
+UNDO_STEP_RESTORE_FILE = "file_restore"
+
+
+def _sql_signature(value: Any) -> str:
+    """같은 SQL인지 비교할 때 쓰는 모양. 공백·끝 세미콜론·대소문자는 무시한다."""
+    return " ".join(str(value or "").split()).rstrip(";").casefold()
+
+
+def _content_signature(value: Any) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _args_signature(args: Any) -> str:
+    return json.dumps(args or {}, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def handed_undo_steps(events: Iterable[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """이 회차에 "먼저 되돌려라"라고 넘긴 단계들. 실행 카드에 남아 있다."""
+    steps: list[dict[str, Any]] = []
+    for event in events or []:
+        data = _loads((event or {}).get("data"))
+        if not isinstance(data, dict):
+            continue
+        found = data.get("undo_steps")
+        if isinstance(found, list):
+            steps.extend(step for step in found if isinstance(step, dict))
+    return steps
+
+
+def _undo_signatures(steps: Iterable[dict[str, Any]] | None) -> set[tuple]:
+    signatures: set[tuple] = set()
+    for step in steps or []:
+        kind = str(step.get("kind") or "")
+        if kind == UNDO_STEP_TOOL:
+            args = step.get("args") if isinstance(step.get("args"), dict) else {}
+            for value in args.values():
+                if looks_like_sql(value):
+                    signatures.add(("sql", _sql_signature(value)))
+            signatures.add(("tool", str(step.get("tool") or ""), _args_signature(args)))
+        elif kind == UNDO_STEP_DELETE_FILE:
+            signatures.add(("file", "delete", str(step.get("path") or "")))
+        elif kind == UNDO_STEP_RESTORE_FILE:
+            # 되돌려 쓴 **내용**까지 같아야 한다. 경로만 보고 빼면 같은 파일에 대한 이번
+            # 회차의 새 작업까지 함께 사라져, 다음 재작업이 그것을 되돌리지 못한다.
+            signatures.add(
+                ("file", "write", str(step.get("path") or ""),
+                 _content_signature(step.get("content")))
+            )
+    return signatures
+
+
+def _action_signatures(action: Action) -> set[tuple]:
+    signatures: set[tuple] = set()
+    if action.kind == MCP_CALL:
+        args = action.raw_args or {}
+        for value in args.values():
+            if looks_like_sql(value):
+                signatures.add(("sql", _sql_signature(value)))
+        signatures.add(("tool", action.tool, _args_signature(args)))
+    elif action.kind == FILE_WRITE:
+        canonical = action.args or {}
+        path = str(canonical.get("path") or "")
+        operation = str(canonical.get("op") or "write")
+        if operation == "delete":
+            signatures.add(("file", "delete", path))
+        elif operation == "write":
+            signatures.add(
+                ("file", "write", path, _content_signature(canonical.get("content")))
+            )
+    return signatures
+
+
+def strip_undo_actions(
+    actions: Iterable[Action], steps: Iterable[dict[str, Any]] | None
+) -> list[Action]:
+    """넘겨받은 되돌리기 단계와 일치하는 행위를 뺀다. 나머지가 그 회차의 작업이다."""
+    undo = _undo_signatures(steps)
+    if not undo:
+        return list(actions)
+    return [action for action in actions if not (_action_signatures(action) & undo)]
+
 
 def normalize_events(events: Iterable[dict[str, Any]] | None) -> list[Action]:
     """events 행 목록을 시간 오름차순 행위 목록으로 바꾼다.
@@ -493,6 +691,17 @@ def normalize_events(events: Iterable[dict[str, Any]] | None) -> list[Action]:
     started: list[Action] = []
 
     for event in rows:
+        results = execution_results(event)
+        if results is not None:
+            # 고착화 실행. 결과 봉투 하나에 그 실행이 한 일이 전부 들어 있다.
+            for entry in results:
+                action = action_from_execution_result(
+                    entry, str(event.get("timestamp") or "")
+                )
+                if action is not None:
+                    finished.append(action)
+            continue
+
         event_type = str(event.get("event_type") or "").strip().lower()
         is_finished = event_type in _FINISHED_TYPES or (
             "tool" in event_type and event_type.endswith(("finished", "end", "completed"))
@@ -518,7 +727,9 @@ def normalize_events(events: Iterable[dict[str, Any]] | None) -> list[Action]:
         )
         (finished if is_finished else started).append(action)
 
-    return finished or started
+    # 되돌리기로 넘긴 단계는 이 회차의 작업이 아니다. 함께 읽으면 다음 재작업이
+    # 되돌리기마저 되돌리려 들고, 그 시점부터 이 활동은 영영 "되돌리기 불가"가 된다.
+    return strip_undo_actions(finished or started, handed_undo_steps(rows))
 
 
 def effect_actions(actions: Iterable[Action]) -> list[Action]:

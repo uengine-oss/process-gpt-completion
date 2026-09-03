@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from database import fetch_process_definition_by_version, fetch_organization_chart, upsert_workitem, fetch_workitem_by_proc_inst_and_activity, insert_process_instance, fetch_workitem_by_id, upsert_process_definition, fetch_assignee_info, upsert_process_instance_source, fetch_process_instance, deactivate_mcp_python_code
 from process_definition import load_process_definition, convert_definition_to_raw_json
 from compensation_handler import generate_compensation
-from deterministic_generator import REWORK_DISTRUST_THRESHOLD
+from deterministic_generator import REWORK_DISTRUST_THRESHOLD, count_reworked_code_runs
 from semantic_naming import generate_semantic_name
 
 import traceback
@@ -869,16 +869,31 @@ async def handle_rework_complete(request: Request):
             # 재작업 1회는 대개 입력이 틀린 경우이므로 고착화된 코드를 그대로 두고
             # 되돌린 뒤 새 파라미터로 재실행한다. 그런데도 다시 재작업되면 코드
             # 자체를 의심해 비활성화하고 이후 실행을 에이전트에게 되돌린다.
+            #
+            # 세는 것은 재작업 횟수가 아니라 **코드가 실제로 돈 회차**다. 되돌리기가
+            # 실패해 재작업이 통째로 에이전트에게 넘어간 회차까지 세면, 코드는 한 번도
+            # 의심받을 짓을 하지 않았는데 비활성화된다 — 그러면 그 액티비티는 새
+            # 인스턴스까지 전부 에이전트가 맡게 되고, 다시 굳으려면 표본 3건을 새로
+            # 쌓아야 한다.
+            code_runs = count_reworked_code_runs(
+                workitem.proc_inst_id, workitem.activity_id, workitem.tenant_id
+            )
             next_rework_count = int(new_workitem.get('rework_count') or 0)
-            if next_rework_count >= REWORK_DISTRUST_THRESHOLD:
+            if code_runs >= REWORK_DISTRUST_THRESHOLD:
                 removed = deactivate_mcp_python_code(
                     workitem.proc_def_id, workitem.activity_id, workitem.tenant_id, 'rework'
                 )
                 if removed:
                     print(
                         f"[INFO] Deterministic code deactivated for activity={workitem.activity_id} "
-                        f"(rework_count={next_rework_count})"
+                        f"(코드 실행 회차={code_runs}, rework_count={next_rework_count})"
                     )
+            else:
+                print(
+                    f"[INFO] Deterministic code kept for activity={workitem.activity_id} "
+                    f"(코드 실행 회차={code_runs} < {REWORK_DISTRUST_THRESHOLD}, "
+                    f"rework_count={next_rework_count})"
+                )
             if db_result and hasattr(db_result, 'data') and db_result.data:
                 new_workitem_id = db_result.data[0].get('id')
                 result[new_workitem_id] = db_result.data[0]
