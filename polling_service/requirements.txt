@@ -19,3 +19,4 @@ pytest-asyncio==0.25.3
 httpx==0.28.1
 nest-asyncio==1.6.0
 fastmcp==2.9.0
+fastapi==0.115.12
