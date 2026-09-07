@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fcm_service"))
 from recipients import (  # noqa: E402
     ACTIVE_WINDOW_SECONDS,
     looks_like_uuid,
+    notification_text,
     resolve_user_emails,
     split_recipients,
     target_devices,
@@ -273,3 +274,55 @@ def test_같은_토큰이_두_줄에_있어도_한_번만():
     devices = [_device("same", 10), _device("same", 20, "android")]
 
     assert tokens_of(target_devices(devices, now=NOW)) == ["same"]
+
+
+# =============================================================================
+# 알림에 실을 글
+#
+# 알림은 두 줄이 전부다. 그 두 줄이 기계어면 무슨 일로 온 것인지 알 수 없다.
+# =============================================================================
+
+
+def test_되묻는_JSON은_물음만_보여_준다():
+    """
+    실제로 잠금 화면에 이렇게 떴다:
+      Process GPT Agent 우리 회사 조직도 {"user_r...
+    """
+    raw = (
+        '{"user_request_type": "ask_user", '
+        '"question": "어떤 목록을 보여드릴까요? 대상이 필요합니다.", '
+        '"waiting_for_user_input": true, '
+        '"context": "\'list\'만으로는 범위를 알 수 없어요.", '
+        '"suggestions": ["프로세스 정의 목록"]}'
+    )
+
+    head, _ = notification_text(raw, "대화방")
+
+    assert head == "어떤 목록을 보여드릴까요? 대상이 필요합니다."
+
+
+def test_보통_글은_그대로_둔다():
+    head, body = notification_text("출장 계획 등록", "출장계획 9/7")
+
+    assert head == "출장 계획 등록"
+    assert body == "출장계획 9/7"
+
+
+def test_중괄호로_시작하지만_JSON_이_아니면_원문():
+    head, _ = notification_text("{이건 그냥 글입니다}", "")
+
+    assert head == "{이건 그냥 글입니다}"
+
+
+def test_모르는_모양의_JSON_은_기계어를_보여_주지_않는다():
+    """부르는 쪽이 '새 알림' 같은 기본 문구로 채운다."""
+    head, _ = notification_text('{"foo": "bar"}', "")
+
+    assert head == ""
+
+
+def test_본문이_제목과_같으면_두_번_쓰지_않는다():
+    head, body = notification_text("휴가 신청", "휴가 신청")
+
+    assert head == "휴가 신청"
+    assert body == ""

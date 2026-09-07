@@ -120,14 +120,50 @@ def readable_instance_name(name: Optional[str]) -> str:
     return INSTANCE_SUFFIX.sub('', value).rstrip(' _.-') or value
 
 
+def readable_message(content: Optional[str]) -> str:
+    """
+    대화 알림에 쓸 한 줄.
+
+    에이전트가 되물을 때는 본문이 JSON 으로 온다.
+
+        {"user_request_type": "ask_user", "question": "어떤 목록을 ...", ...}
+
+    그것을 그대로 알림에 실으면 잠금 화면에 중괄호와 따옴표 덩어리가 뜬다 —
+    실제로 그렇게 보였다. 두 줄이 전부인 알림에서 그 두 줄이 기계어면
+    무슨 일로 온 것인지 알 수 없다. 물음만 꺼내 쓴다.
+    """
+    value = (content or '').strip()
+    if not value.startswith('{'):
+        return value
+
+    try:
+        import json
+
+        parsed = json.loads(value)
+    except Exception:  # noqa: BLE001 - JSON 이 아니면 원문이 맞다
+        return value
+
+    if not isinstance(parsed, dict):
+        return value
+
+    for key in ('question', 'message', 'text', 'content'):
+        picked = parsed.get(key)
+        if isinstance(picked, str) and picked.strip():
+            return picked.strip()
+
+    # 아는 모양이 아니다. 기계어를 보여 주느니 아무 말도 하지 않는다 —
+    # 부르는 쪽이 기본 문구로 채운다.
+    return ''
+
+
 def notification_text(title: Optional[str], description: Optional[str]) -> tuple:
     """
     알림의 제목과 본문.
 
-    제목은 무슨 일인지(활동 이름), 본문은 어느 건인지(프로세스 이름)다.
-    본문이 비거나 제목과 같으면 같은 말을 두 번 쓰지 않는다.
+    제목은 무슨 일인지(활동 이름 · 보낸 말), 본문은 어느 건인지(프로세스 이름 ·
+    대화방 이름)다. 본문이 비거나 제목과 같으면 같은 말을 두 번 쓰지 않는다.
     """
-    head = (title or '').strip()
+    head = readable_message(title)
     body = readable_instance_name(description)
     if body == head:
         body = ''
