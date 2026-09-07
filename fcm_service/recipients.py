@@ -1,0 +1,134 @@
+"""
+알림을 누구에게 보낼 것인가.
+
+`notifications.user_id` 에는 두 가지가 섞여 들어온다.
+  - 채팅 알림 : 이메일        (예: someone@company.com)
+  - 업무 알림 : 사용자 UUID   (예: efddd554-4e2a-...)
+
+업무 알림은 `todolist.user_id` 를 그대로 옮겨 담기 때문이다. 그런데
+`user_devices` 의 키는 이메일(`user_email`)이라, UUID 로는 절대 찾지 못한다.
+그래서 **업무 알림 푸시는 한 번도 나간 적이 없었다.** 화면(포털)은 이메일과
+UUID 를 모두 조회해 왔기 때문에 알림 목록에서는 정상으로 보였고, 안 오는 것은
+푸시뿐이라 눈에 띄지 않았다.
+
+또 한 업무에 담당자가 여럿이면 콤마로 이어 붙는다(`"uuid-a,uuid-b"`).
+그 경우 모두에게 보내야 한다.
+
+이 모듈은 데이터베이스도 Firebase 도 알지 못한다 — 조회 함수를 받아서 쓴다.
+그래야 이 규칙만 따로 시험할 수 있다.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+UUID_PATTERN = re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+)
+
+
+def looks_like_uuid(value: Optional[str]) -> bool:
+    return bool(UUID_PATTERN.match((value or '').strip()))
+
+
+def split_recipients(user_id: Optional[str]) -> List[str]:
+    """담당자가 여럿이면 콤마로 이어 붙는다. 하나씩 떼어 낸다."""
+    return [part.strip() for part in (user_id or '').split(',') if part.strip()]
+
+
+def resolve_user_emails(
+    user_id: Optional[str],
+    lookup_emails: Callable[[List[str]], Iterable[Dict[str, str]]],
+    on_error: Optional[Callable[[Exception], None]] = None,
+) -> List[str]:
+    """
+    수신자 칸을 실제 이메일 목록으로 바꾼다.
+
+    Args:
+        user_id: 알림의 수신자 칸. 이메일 · UUID · 콤마로 이은 여럿.
+        lookup_emails: UUID 목록을 받아 `{id, email}` 들을 돌려주는 함수.
+        on_error: 조회가 실패했을 때 알릴 곳(선택).
+
+    Returns:
+        중복을 없앤 이메일 목록. 못 찾은 값은 조용히 버린다 —
+        하나 때문에 나머지 수신자까지 잃으면 안 된다.
+    """
+    emails: List[str] = []
+    uuids: List[str] = []
+
+    for value in split_recipients(user_id):
+        if looks_like_uuid(value):
+            uuids.append(value)
+        else:
+            # 이메일이거나, 봇 이름 같은 그 밖의 식별자. 그대로 시도한다.
+            emails.append(value)
+
+    if uuids:
+        try:
+            for row in (lookup_emails(uuids) or []):
+                email = (row.get('email') or '').strip()
+                if email:
+                    emails.append(email)
+        except Exception as e:  # noqa: BLE001 - 나머지 수신자에게는 보내야 한다
+            if on_error:
+                on_error(e)
+
+    return dedupe(emails)
+
+
+def dedupe(values: Iterable[str]) -> List[str]:
+    """순서를 지키면서 중복만 없앤다."""
+    seen = set()
+    out = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def usable_tokens(rows: Iterable[Dict[str, str]]) -> List[str]:
+    """
+    실제로 보낼 수 있는 토큰만 남긴다.
+
+    `user_devices` 에는 토큰 칸이 비어 있는 행이 실제로 있다(등록만 되고 토큰을
+    받지 못한 경우). 빈 값으로 발송을 시도하면 Firebase 가 거절한다.
+    """
+    return dedupe((row.get('device_token') or '').strip() for row in (rows or []))
+
+
+INSTANCE_SUFFIX = re.compile(
+    r'[._][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+)
+
+
+def readable_instance_name(name: Optional[str]) -> str:
+    """
+    알림 본문에 쓸 건 이름을 사람이 읽을 수 있게 다듬는다.
+
+    엔진이 만드는 인스턴스 이름은 `휴가 신청 프로세스_d0933d4d-ba58-...` 처럼
+    끝에 인스턴스 식별자가 붙는다. 화면에서는 옆에 다른 정보가 있어 견딜 만하지만,
+    알림은 두 줄이 전부다. 그 두 줄의 절반을 사람이 읽을 수 없는 문자열이
+    차지하면 무슨 일로 온 알림인지 알 수 없다.
+
+    꼬리의 식별자만 떼고 나머지는 그대로 둔다 — 이름 안에 뜻이 있을 수 있다.
+    """
+    value = (name or '').strip()
+    if not value:
+        return ''
+    return INSTANCE_SUFFIX.sub('', value).rstrip(' _.-') or value
+
+
+def notification_text(title: Optional[str], description: Optional[str]) -> tuple:
+    """
+    알림의 제목과 본문.
+
+    제목은 무슨 일인지(활동 이름), 본문은 어느 건인지(프로세스 이름)다.
+    본문이 비거나 제목과 같으면 같은 말을 두 번 쓰지 않는다.
+    """
+    head = (title or '').strip()
+    body = readable_instance_name(description)
+    if body == head:
+        body = ''
+    return head, body

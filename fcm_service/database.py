@@ -16,6 +16,12 @@ import firebase_admin
 import logging
 import asyncio
 
+from recipients import (
+    notification_text,
+    resolve_user_emails as _resolve_user_emails,
+    usable_tokens,
+)
+
 supabase_client_var = ContextVar('supabase', default=None)
 subdomain_var = ContextVar('subdomain', default='localhost')
 
@@ -53,32 +59,56 @@ async def update_tenant_id(subdomain):
     except Exception as e:
         print(f"An error occurred: {e}")
 
-def fetch_device_token(user_id: str) -> Optional[str]:
+def _lookup_emails_by_uuid(uuids: List[str]) -> List[Dict[str, Any]]:
+    """UUID 로 사용자 이메일을 찾는다. 규칙은 recipients 모듈에 있다."""
+    supabase = supabase_client_var.get()
+    if supabase is None:
+        raise Exception("Supabase client is not configured for this request")
+    response = supabase.table('users').select('id, email').in_('id', uuids).execute()
+    return response.data or []
+
+
+def resolve_user_emails(user_id: str) -> List[str]:
+    """알림의 수신자 칸(이메일 · UUID · 콤마로 이은 여럿)을 이메일 목록으로 바꾼다."""
+    return _resolve_user_emails(
+        user_id,
+        _lookup_emails_by_uuid,
+        on_error=lambda e: realtime_logger.warning(f"사용자 UUID -> 이메일 변환 실패: {e}"),
+    )
+
+
+def fetch_device_tokens(user_id: str) -> List[str]:
     """
-    특정 사용자의 FCM 디바이스 토큰을 조회합니다.
-    
-    Args:
-        user_id (str): 사용자 ID (이메일)
-        
-    Returns:
-        Optional[str]: 디바이스 토큰
+    수신자의 기기 토큰들을 조회한다.
+
+    user_id 는 이메일일 수도, 사용자 UUID 일 수도, 콤마로 이어진 여럿일 수도
+    있다 — 업무 알림은 UUID 로 오기 때문에 이 변환이 없으면 아무것도 못 찾는다.
     """
     try:
         supabase = supabase_client_var.get()
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
-        
-        response = supabase.table('user_devices').select('device_token').eq('user_email', user_id).execute()
-        
-        if response.data:
-            device_token = response.data[0].get('device_token')
-            if device_token and device_token.strip():  # None이 아니고 빈 문자열이 아닌 경우
-                return device_token
-        
-        return None
-    
+
+        emails = resolve_user_emails(user_id)
+        if not emails:
+            return []
+
+        response = supabase.table('user_devices').select('device_token').in_('user_email', emails).execute()
+        return usable_tokens(response.data or [])
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def fetch_device_token(user_id: str) -> Optional[str]:
+    """
+    첫 번째 기기 토큰. 기존 호출부(REST /device-token/{user_id})와의 호환을 위해 남깁니다.
+    실제 발송은 fetch_device_tokens 로 전원에게 보냅니다.
+    """
+    tokens = fetch_device_tokens(user_id)
+    return tokens[0] if tokens else None
 
 
 def send_fcm_message(user_id: str, notification_data: dict) -> dict:
@@ -98,9 +128,10 @@ def send_fcm_message(user_id: str, notification_data: dict) -> dict:
     """
     try:
         global firebase_app
-        # 디바이스 토큰 조회
-        device_token = fetch_device_token(user_id)
-        if not device_token:
+        # 기기 토큰 조회. 수신자가 여럿(콤마)일 수 있고, 이메일이 아니라
+        # 사용자 UUID 로 올 수도 있다 — resolve_user_emails 가 둘 다 처리한다.
+        device_tokens = fetch_device_tokens(user_id)
+        if not device_tokens:
             return {"success": False, "message": "No device token found for the user"}
         
         # FCM 메시지 발송
@@ -142,35 +173,39 @@ def send_fcm_message(user_id: str, notification_data: dict) -> dict:
         data['title'] = noti_title
         data['body'] = noti_body
 
-        message = messaging.Message(
-            token=device_token,
-            notification=messaging.Notification(
-                title=noti_title,
-                body=noti_body
-            ),
-            data=data,
-            android=messaging.AndroidConfig(
-                priority='high',
-            ),
-            apns=messaging.APNSConfig(
-                payload=messaging.APNSPayload(
-                    aps=messaging.Aps(
-                        badge=1,
-                        sound='default'
+        # 담당자가 여럿인 업무는 기기도 여럿이다. 하나가 실패해도 나머지는 보낸다.
+        for device_token in device_tokens:
+            message = messaging.Message(
+                token=device_token,
+                notification=messaging.Notification(
+                    title=noti_title,
+                    body=noti_body
+                ),
+                data=data,
+                android=messaging.AndroidConfig(
+                    priority='high',
+                ),
+                apns=messaging.APNSConfig(
+                    payload=messaging.APNSPayload(
+                        aps=messaging.Aps(
+                            badge=1,
+                            sound='default'
+                        )
                     )
                 )
             )
-        )
-        
-        try:
-            response = messaging.send(message)
-            success_count = 1
-        except Exception as e:
-            print(f"FCM 메시지 전송 오류: {e}")
-            failed = True
-        
+
+            try:
+                messaging.send(message)
+                success_count += 1
+            except Exception as e:
+                print(f"FCM 메시지 전송 오류: {e}")
+                failed = True
+
         return {
             "success": success_count > 0,
+            "sent": success_count,
+            "total": len(device_tokens),
             "message": "Message sent successfully" if success_count > 0 else "Failed to send message",
         }
     
@@ -202,9 +237,16 @@ def handle_new_notification(notification_record):
 
         print(f"url: {url}")
         
+        # 본문에 인스턴스 식별자가 그대로 붙어 오는 것을 다듬는다.
+        # 알림은 두 줄이 전부라, 절반이 UUID 면 무슨 일인지 알 수 없다.
+        title, body = notification_text(
+            notification_record.get('title'),
+            notification_record.get('description'),
+        )
+
         notification_data = {
-            'title': notification_record.get('title', '새 알림'),
-            'body': notification_record.get('description', '새로운 알림이 도착했습니다.'),
+            'title': title or '새 알림',
+            'body': body or '새로운 알림이 도착했습니다.',
             'type': notification_record.get('type', 'general'),
             'url': url,
             'from_user_id': notification_record.get('from_user_id', ''),

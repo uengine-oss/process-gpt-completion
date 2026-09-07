@@ -18,6 +18,7 @@ from agent_chat import add_routes_to_app as add_agent_chat_routes_to_app
 from callbot_api import add_routes_to_app as add_callbot_routes_to_app
 from test_mode import add_routes_to_app as add_test_mode_routes_to_app
 from process_start_api import add_routes_to_app as add_process_start_routes_to_app
+from audio_transcribe import add_routes_to_app as add_audio_routes_to_app
 from validate_improve import add_routes_to_app as add_validate_improve_routes_to_app
 
 from dotenv import load_dotenv
@@ -83,6 +84,8 @@ add_callbot_routes_to_app(app)
 add_test_mode_routes_to_app(app)
 add_validate_improve_routes_to_app(app)
 add_process_start_routes_to_app(app)
+# 음성 입력(/completion/upload). 화면은 예전부터 이 경로를 불렀는데 서버에 없었다.
+add_audio_routes_to_app(app)
 
 import asyncio
 
