@@ -78,7 +78,15 @@ jobs:
       - name: Update image tag in GitOps repository
         run: |
           cd gitops-repo
-          yq eval '(.spec.template.spec.containers[] | select(.name == "fcm-service")).image = "'$IMAGE_NAME'"' -i deployments/fcm-service-deployment.yaml
+          # Deployment 문서에만 쓴다.
+          #
+          # 이 파일에는 Deployment 와 Service 가 함께 있다. 문서 선택자 없이
+          # 돌리면 yq 가 Service 에도 spec.template.spec.containers 를 만들어
+          # 낸다. ServiceSpec 에 없는 필드라 kubectl 패치가 거부되고, 그러면
+          # 이 앱의 ArgoCD sync 가 통째로 실패해 다른 서비스 배포까지 멈춘다.
+          yq eval -i \
+            '(select(.kind == "Deployment") | .spec.template.spec.containers[] | select(.name == "fcm-service")).image = strenv(IMAGE_NAME)' \
+            deployments/fcm-service-deployment.yaml
           echo "Updated image to: $IMAGE_NAME"
 
       - name: Commit and push changes
