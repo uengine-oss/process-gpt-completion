@@ -225,11 +225,8 @@ def test_기준_시간_경계():
     assert tokens_of(target_devices(just_over, now=NOW)) == ["pc", "phone"]
 
 
-def test_마지막_사용_시각을_모르는_기기():
-    """
-    옛날에 등록만 되고 활동 기록이 없는 기기. 활동 중으로 치지는 않지만,
-    아무도 활동 중이 아니면 함께 받는다 — 그 기기가 유일한 통로일 수 있다.
-    """
+def test_활동_기록이_없는_기기도_아무도_안_쓰면_받는다():
+    """그 기기가 유일한 통로일 수 있다."""
     only_unknown = [_device("old", None)]
     assert tokens_of(target_devices(only_unknown, now=NOW)) == ["old"]
 
@@ -237,9 +234,45 @@ def test_마지막_사용_시각을_모르는_기기():
     assert tokens_of(target_devices(with_active, now=NOW)) == ["pc"]
 
 
-def test_토큰_없는_줄은_보내지_않는다():
-    """포털이 로그인마다 만드는 빈 줄. 빈 값으로 보내면 Firebase 가 거절한다."""
-    devices = [_device("", 10), _device(None, 10), _device("phone", 4000, "android")]
+def test_토큰_없는_줄에는_보내지_않는다():
+    """빈 값으로 보내면 Firebase 가 거절한다."""
+    devices = [_device("", 99999), _device(None, 99999), _device("phone", 4000, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["phone"]
+
+
+# ---------------------------------------------------------------------------
+# 푸시를 받을 수 없는 기기도 "쓰고 있는가" 판단에는 넣는다
+#
+# 포털은 브라우저용 푸시 토큰을 만들지 않는다 — 화면 위쪽 종 모양에 실시간으로
+# 띄운다. 그래서 PC 앞에 앉아 있는 사람에게는 이미 보이고 있다.
+# ---------------------------------------------------------------------------
+
+
+def test_PC_웹을_보고_있으면_휴대폰을_울리지_않는다():
+    """PC 화면에 이미 떠 있는데 주머니 속 휴대폰까지 울리면 방해다."""
+    devices = [_device(None, 30, "web"), _device("phone", 4000, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == []
+
+
+def test_PC_를_떠나면_휴대폰으로_간다():
+    """PC 가 꺼져 있는지 우리는 알 수 없다. 어느 것을 집어 들든 보이게 한다."""
+    devices = [_device(None, 4000, "web"), _device("phone", 5000, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["phone"]
+
+
+def test_PC_와_휴대폰을_둘_다_쓰고_있으면_휴대폰으로도_간다():
+    """휴대폰을 손에 들고 있다면 거기서 보는 것이 자연스럽다."""
+    devices = [_device(None, 30, "web"), _device("phone", 30, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["phone"]
+
+
+def test_마지막_사용_시각을_모르는_줄은_발송을_막지_않는다():
+    """모르는 것을 '쓰고 있다' 로 세면 엉뚱하게 알림이 끊긴다."""
+    devices = [_device(None, None, "web"), _device("phone", 4000, "android")]
 
     assert tokens_of(target_devices(devices, now=NOW)) == ["phone"]
 

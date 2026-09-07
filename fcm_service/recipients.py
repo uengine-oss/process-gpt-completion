@@ -214,23 +214,38 @@ def target_devices(rows, now=None, window_seconds: int = ACTIVE_WINDOW_SECONDS) 
         노트북을 덮어 두었는지, 꺼 두었는지 우리는 알 수 없다. 어느 것을 집어
         들든 보이게 하는 편이 안전하다 — 못 받는 것이 가장 나쁘다.
 
+    푸시를 받을 수 없는 기기도 "쓰고 있는가" 는 센다
+      웹 브라우저는 푸시 토큰이 없다(포털은 토큰을 받지 않는다). 그렇다고
+      토큰 있는 기기만 놓고 판단하면, PC 앞에 앉아 화면을 보고 있는데도
+      휴대폰이 울린다.
+
+      대신 그 사람은 이미 보고 있는 화면에서 알림을 본다. 그래서 쓰고 있는
+      기기가 있는데 그중 보낼 수 있는 곳이 없으면 **아무 데도 보내지 않는다.**
+      이것이 카카오톡·슬랙이 하는 일이다.
+
     `last_active_at` 이 없는 기기(옛날에 등록만 된 것)는 "쓰고 있지 않다" 로 본다.
-    그래도 아무도 활동 중이 아니면 함께 받는다.
     """
-    usable = [row for row in (rows or []) if (row.get('device_token') or '').strip()]
-    if not usable:
+    all_rows = list(rows or [])
+    if not all_rows:
         return []
 
     import time
 
     current = float(now if now is not None else time.time())
-    active = []
-    for row in usable:
-        seen = _as_epoch(row.get('last_active_at'))
-        if seen is not None and (current - seen) <= window_seconds:
-            active.append(row)
 
-    return active or usable
+    def is_active(row):
+        seen = _as_epoch(row.get('last_active_at'))
+        return seen is not None and (current - seen) <= window_seconds
+
+    active = [row for row in all_rows if is_active(row)]
+
+    # 쓰고 있는 기기가 있으면 그쪽만 본다. 보낼 수 있는 곳이 없으면 보내지
+    # 않는다 — 그 사람은 지금 보고 있는 화면에서 이미 알림을 본다.
+    if active:
+        return [row for row in active if (row.get('device_token') or '').strip()]
+
+    # 아무 데도 안 쓰고 있다. 보낼 수 있는 곳 전부로.
+    return [row for row in all_rows if (row.get('device_token') or '').strip()]
 
 
 def tokens_of(rows) -> List[str]:
