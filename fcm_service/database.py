@@ -17,7 +17,8 @@ import logging
 import asyncio
 
 supabase_client_var = ContextVar('supabase', default=None)
-subdomain_var = ContextVar('subdomain', default='localhost')
+DEFAULT_TENANT_ID = (os.getenv("DEFAULT_TENANT_ID") or "skt").strip()
+subdomain_var = ContextVar('subdomain', default=DEFAULT_TENANT_ID)
 
 # 전역 변수로 변경
 firebase_app = None
