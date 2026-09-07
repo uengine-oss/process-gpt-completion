@@ -2,6 +2,14 @@ import os
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
+from dotenv import load_dotenv
+
+# Load local configuration before importing modules that initialize clients at
+# import time.  override=True also prevents stale shell variables from winning
+# over the project's .env during local development.
+if os.getenv("ENV") != "production":
+    load_dotenv(override=True)
+
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,11 +27,9 @@ from callbot_api import add_routes_to_app as add_callbot_routes_to_app
 from test_mode import add_routes_to_app as add_test_mode_routes_to_app
 from process_start_api import add_routes_to_app as add_process_start_routes_to_app
 from validate_improve import add_routes_to_app as add_validate_improve_routes_to_app
-
-from dotenv import load_dotenv
+from mock_api import add_routes_to_app as add_mock_routes_to_app
 
 if os.getenv("ENV") != "production":
-    load_dotenv(override=True)
     # 캐시 적용
     from langchain.cache import SQLiteCache
     from langchain.globals import set_llm_cache
@@ -83,6 +89,7 @@ add_callbot_routes_to_app(app)
 add_test_mode_routes_to_app(app)
 add_validate_improve_routes_to_app(app)
 add_process_start_routes_to_app(app)
+add_mock_routes_to_app(app)
 
 import asyncio
 
