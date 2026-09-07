@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import HTTPException
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
 from contextvars import ContextVar
 from dotenv import load_dotenv
@@ -1794,19 +1794,145 @@ def fetch_tenant_mcp_config(tenant_id: str) -> Optional[Dict[str, Any]]:
         print(f"[ERROR] Failed to fetch tenant MCP config: {str(e)}")
         return None
 
-def fetch_mcp_python_code(proc_def_id: str, activity_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+def fetch_mcp_python_code(
+    proc_def_id: str, activity_id: str, tenant_id: str, include_deactivated: bool = False
+) -> Optional[Dict[str, Any]]:
+    """해당 액티비티의 최신 코드 행.
+
+    `include_deactivated` 는 보상(undo) 생성 전용이다. 비활성화는 "이 순방향 코드를 더는
+    믿지 않는다"는 뜻이지 "되돌리지 않아도 된다"는 뜻이 아니다. 그런데 이 조회가 늘
+    활성 행만 보면, 코드가 한 번 비활성화된 뒤로는 보상을 **영영 저장할 곳이 없어진다**
+    (행이 없다고 보고 새 행을 만들려다 유일 제약에 걸린다). 실행 런타임도 되돌리기를
+    위해서는 비활성 여부와 무관하게 최신 행을 읽는다 — 양쪽이 같은 행을 봐야 한다.
+    """
     try:
         supabase = supabase_client_var.get()
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
-        
-        response = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).order('created_at', desc=True).limit(1).execute()
+
+        query = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
+        if not include_deactivated:
+            # 비활성화된 코드는 제외한다. 재작업이 반복되어 신뢰를 잃은 코드는 행으로
+            # 남되 다시 선택되지 않는다.
+            query = query.is_('deactivated_at', 'null')
+        response = query.order('created_at', desc=True).limit(1).execute()
         if response.data and len(response.data) > 0:
             return response.data[0]
         else:
             return None
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+def fetch_last_deactivated_at(proc_def_id: str, activity_id: str, tenant_id: str) -> Optional[str]:
+    """해당 액티비티의 가장 최근 비활성 시각. 표본 재축적의 기준점이 된다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table('mcp_python_code').select('deactivated_at').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).not_.is_('deactivated_at', 'null').order('deactivated_at', desc=True).limit(1).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0].get('deactivated_at')
+        return None
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch last deactivated_at: {str(e)}")
+        return None
+
+def deactivate_mcp_python_code(proc_def_id: str, activity_id: str, tenant_id: str, reason: str) -> int:
+    """해당 액티비티의 활성 코드를 비활성화한다. 행은 이력으로 남긴다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table('mcp_python_code').update({
+            'deactivated_at': datetime.now(timezone.utc).isoformat(),
+            'deactivated_reason': reason,
+        }).eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).is_('deactivated_at', 'null').execute()
+        return len(response.data or [])
+    except Exception as e:
+        print(f"[WARNING] Failed to deactivate mcp_python_code: {str(e)}")
+        return 0
+
+def fetch_workitems_by_activity(
+    proc_def_id: str,
+    activity_id: str,
+    tenant_id: str,
+    status: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = 12
+) -> List[Dict[str, Any]]:
+    """같은 액티비티의 워크아이템을 최신순으로 조회한다. 고착화 표본 수집에 쓴다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        # query(워크아이템 지시문)까지 가져온다. 파라미터 이름표를 그 지시문에서
+        # 관측하기 때문이다 — 없으면 고착화 코드가 다음 실행에서 입력을 못 찾는다.
+        query = supabase.table('todolist').select('id, proc_inst_id, root_proc_inst_id, rework_count, start_date, updated_at, status, query') \
+            .eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
+        if status:
+            query = query.eq('status', status)
+        if since:
+            query = query.gt('updated_at', since)
+        response = query.order('updated_at', desc=True).limit(limit).execute()
+        return response.data or []
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch workitems by activity: {str(e)}")
+        return []
+
+def fetch_related_workitem_outputs(
+    tenant_id: str,
+    root_proc_inst_id: Optional[str],
+    proc_inst_id: Optional[str],
+    exclude_id: Optional[str] = None,
+    before: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """같은 루트 프로세스에서 이미 완료된 다른 워크아이템의 산출물.
+
+    에이전트가 `get_related_workitem_outputs` 도구로 읽던 것과 **같은 자료를 같은
+    모양으로** 돌려준다. 고착화 생성기는 이것으로 "이 값이 앞 액티비티의 산출물에서
+    왔는가"를 관측하고, 실행 런타임은 같은 조회로 그 값을 다시 채운다. 모양이 갈리면
+    관측한 자리와 읽는 자리가 달라져 조용히 틀린다.
+
+    `before`(그 워크아이템의 시작 시각)를 주면 그때 이미 끝나 있던 것만 남긴다. 지금
+    조회하면 **뒤에** 끝난 액티비티의 산출물까지 딸려 와, 그 실행에서는 알 수 없었던
+    값을 근거로 삼게 된다.
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        query = supabase.table('todolist').select(
+            'id, proc_inst_id, activity_id, activity_name, end_date, output'
+        ).eq('tenant_id', tenant_id).not_.is_('output', 'null')
+        if root_proc_inst_id:
+            query = query.eq('root_proc_inst_id', root_proc_inst_id)
+        elif proc_inst_id:
+            query = query.eq('proc_inst_id', proc_inst_id)
+        else:
+            return []
+        if exclude_id:
+            query = query.neq('id', exclude_id)
+        if before:
+            query = query.lt('end_date', before)
+        response = query.order('end_date', desc=True).execute()
+        return [
+            {
+                "workitemId": row.get("id"),
+                "procInstId": row.get("proc_inst_id"),
+                "activityId": row.get("activity_id"),
+                "activityName": row.get("activity_name"),
+                "endDate": row.get("end_date"),
+                "output": row.get("output"),
+            }
+            for row in (response.data or [])
+        ]
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch related workitem outputs: {str(e)}")
+        return []
 
 def upsert_mcp_python_code(record: Dict[str, Any]):
     try:
