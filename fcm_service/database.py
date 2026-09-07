@@ -19,6 +19,8 @@ import asyncio
 from recipients import (
     notification_text,
     resolve_user_emails as _resolve_user_emails,
+    target_devices,
+    tokens_of,
     usable_tokens,
 )
 
@@ -93,8 +95,15 @@ def fetch_device_tokens(user_id: str) -> List[str]:
         if not emails:
             return []
 
-        response = supabase.table('user_devices').select('device_token').in_('user_email', emails).execute()
-        return usable_tokens(response.data or [])
+        # 기기마다 한 줄이다. 어느 기기로 보낼지는 target_devices 가 정한다 —
+        # 지금 쓰고 있는 기기가 있으면 거기로만, 없으면 가진 기기 모두로.
+        response = (
+            supabase.table('user_devices')
+            .select('device_token, last_active_at, device_type')
+            .in_('user_email', emails)
+            .execute()
+        )
+        return tokens_of(target_devices(response.data or []))
 
     except HTTPException:
         raise
@@ -109,6 +118,22 @@ def fetch_device_token(user_id: str) -> Optional[str]:
     """
     tokens = fetch_device_tokens(user_id)
     return tokens[0] if tokens else None
+
+
+def forget_device_token(device_token: str) -> None:
+    """
+    더 이상 닿지 않는 기기를 목록에서 지운다.
+
+    실패해도 발송은 계속한다 — 정리는 부수적인 일이고, 그것 때문에 다른 기기로
+    갈 알림을 막으면 안 된다.
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            return
+        supabase.table('user_devices').delete().eq('device_token', device_token).execute()
+    except Exception as e:  # noqa: BLE001 - 정리 실패가 발송을 막으면 안 된다
+        realtime_logger.warning(f"사라진 기기 정리 실패: {e}")
 
 
 def send_fcm_message(user_id: str, notification_data: dict) -> dict:
@@ -198,6 +223,12 @@ def send_fcm_message(user_id: str, notification_data: dict) -> dict:
             try:
                 messaging.send(message)
                 success_count += 1
+            except messaging.UnregisteredError:
+                # 앱을 지웠거나 브라우저 자료를 비운 기기다. 이 토큰은 앞으로도
+                # 영원히 실패한다. 지우지 않으면 죽은 기기가 계속 쌓이고,
+                # "지금 쓰는 기기가 없을 때 모두에게 보내기" 가 헛발송이 된다.
+                realtime_logger.info("사라진 기기의 토큰을 지웁니다.")
+                forget_device_token(device_token)
             except Exception as e:
                 print(f"FCM 메시지 전송 오류: {e}")
                 failed = True
@@ -273,21 +304,26 @@ def fetch_unprocessed_notifications() -> Optional[List[dict]]:
         
         env = os.getenv("ENV")
 
-        # 1) ENV 기반 tenant 필터 적용 후 조회
+        # 1) 아직 아무도 가져가지 않은 알림을 집는다.
+        #
+        # 예전에는 조직으로 갈랐다 — dev 는 `uengine` 만, 운영은 `uengine` 을 뺀
+        # 나머지. 개발용과 운영용이 같은 데이터베이스를 보면서 같은 알림을 두 번
+        # 보내지 않으려던 것이다.
+        #
+        # 그런데 그 결과 두 가지가 아무 데도 가지 않았다.
+        #   - `uengine` 조직: 운영이 빼고, 그것을 가져갈 dev 는 떠 있지 않다.
+        #   - 조직이 비어 있는 알림: NULL 은 `=` 에도 `<>` 에도 걸리지 않는다.
+        #     대화 알림이 여기 해당해 103건이 그대로 남아 있었다.
+        #
+        # 그래서 운영은 **전부** 가져간다. 두 번 보내는 것은 아래의 선점
+        # (consumer 를 먼저 찍고, 이미 찍힌 것은 건너뛴다)이 막아 준다 —
+        # 조직으로 가르는 것은 애초에 그 일을 하기에 알맞은 도구가 아니었다.
+        query = supabase.table('notifications').select('*').is_('consumer', 'null')
         if env == 'dev':
-            response = supabase.table('notifications') \
-                .select('*') \
-                .is_('consumer', 'null') \
-                .eq('tenant_id', 'uengine') \
-                .limit(10) \
-                .execute()
-        else:
-            response = supabase.table('notifications') \
-                .select('*') \
-                .is_('consumer', 'null') \
-                .neq('tenant_id', 'uengine') \
-                .limit(10) \
-                .execute()
+            # 개발 환경은 여전히 자기 조직만 본다. 운영 사용자에게 개발 중인
+            # 코드가 알림을 보내면 안 된다.
+            query = query.eq('tenant_id', 'uengine')
+        response = query.limit(10).execute()
         
         if not response.data:
             return None

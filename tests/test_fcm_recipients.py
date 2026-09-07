@@ -19,9 +19,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fcm_service"))
 
 from recipients import (  # noqa: E402
+    ACTIVE_WINDOW_SECONDS,
     looks_like_uuid,
     resolve_user_emails,
     split_recipients,
+    target_devices,
+    tokens_of,
     usable_tokens,
 )
 
@@ -160,3 +163,113 @@ def test_notification_text_does_not_repeat_itself():
     head, body = notification_text("승인 요청", "승인 요청")
     assert head == "승인 요청"
     assert body == ""
+
+
+# =============================================================================
+# 어느 기기로 보낼 것인가
+#
+# 지키려는 것은 하나다: **어느 기기를 집어 들든 알림이 거기 있는 것.**
+#
+# 예전에는 사람당 기기가 하나였다. 회사 PC 에서 웹을 켜면 휴대폰 토큰이 덮어써져
+# 휴대폰 알림이 조용히 끊겼다. 끊긴 줄도 모른다.
+# =============================================================================
+
+NOW = 1_757_000_000.0
+
+
+def _device(token, seconds_ago=None, kind="web"):
+    return {
+        "device_token": token,
+        "device_type": kind,
+        "last_active_at": None if seconds_ago is None else NOW - seconds_ago,
+    }
+
+
+def test_보고_있는_기기로만_보낸다():
+    """노트북을 보고 있는데 휴대폰이 같이 울릴 이유가 없다."""
+    devices = [_device("pc", 60), _device("phone", 4000, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["pc"]
+
+
+def test_휴대폰을_보고_있으면_휴대폰으로():
+    devices = [_device("pc", 4000), _device("phone", 30, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["phone"]
+
+
+def test_아무_기기도_안_쓰면_모든_기기로_보낸다():
+    """
+    PC 를 마지막으로 썼더라도 지금 꺼져 있는지 우리는 알 수 없다.
+    어느 것을 집어 들든 보이게 하는 편이 안전하다 — 못 받는 것이 가장 나쁘다.
+    """
+    devices = [_device("pc", 4000), _device("phone", 5000, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["pc", "phone"]
+
+
+def test_둘_다_쓰고_있으면_둘_다():
+    devices = [_device("pc", 10), _device("phone", 20, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["pc", "phone"]
+
+
+def test_기준_시간_경계():
+    """딱 경계에 걸친 기기는 아직 쓰고 있는 것으로 본다."""
+    on_edge = [_device("pc", ACTIVE_WINDOW_SECONDS), _device("phone", 99999, "android")]
+    just_over = [_device("pc", ACTIVE_WINDOW_SECONDS + 1), _device("phone", 99999, "android")]
+
+    assert tokens_of(target_devices(on_edge, now=NOW)) == ["pc"]
+    # 아무도 활동 중이 아니므로 모두에게
+    assert tokens_of(target_devices(just_over, now=NOW)) == ["pc", "phone"]
+
+
+def test_마지막_사용_시각을_모르는_기기():
+    """
+    옛날에 등록만 되고 활동 기록이 없는 기기. 활동 중으로 치지는 않지만,
+    아무도 활동 중이 아니면 함께 받는다 — 그 기기가 유일한 통로일 수 있다.
+    """
+    only_unknown = [_device("old", None)]
+    assert tokens_of(target_devices(only_unknown, now=NOW)) == ["old"]
+
+    with_active = [_device("old", None), _device("pc", 10)]
+    assert tokens_of(target_devices(with_active, now=NOW)) == ["pc"]
+
+
+def test_토큰_없는_줄은_보내지_않는다():
+    """포털이 로그인마다 만드는 빈 줄. 빈 값으로 보내면 Firebase 가 거절한다."""
+    devices = [_device("", 10), _device(None, 10), _device("phone", 4000, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["phone"]
+
+
+def test_기기가_없으면_보낼_곳도_없다():
+    assert target_devices([], now=NOW) == []
+    assert target_devices(None, now=NOW) == []
+
+
+def test_시각이_문자열로_와도_읽는다():
+    """Postgres 는 '2026-09-07T05:49:46.808+00:00' 처럼 준다."""
+    import datetime
+
+    recent = datetime.datetime.fromtimestamp(NOW - 60, datetime.timezone.utc).isoformat()
+    stale = datetime.datetime.fromtimestamp(NOW - 9999, datetime.timezone.utc).isoformat()
+    devices = [
+        {"device_token": "pc", "last_active_at": recent},
+        {"device_token": "phone", "last_active_at": stale},
+    ]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["pc"]
+
+
+def test_읽을_수_없는_시각은_모르는_것으로_둔다():
+    """모양이 이상하다고 그 기기를 잃으면 안 된다."""
+    devices = [{"device_token": "odd", "last_active_at": "언젠가"}]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["odd"]
+
+
+def test_같은_토큰이_두_줄에_있어도_한_번만():
+    devices = [_device("same", 10), _device("same", 20, "android")]
+
+    assert tokens_of(target_devices(devices, now=NOW)) == ["same"]

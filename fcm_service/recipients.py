@@ -132,3 +132,71 @@ def notification_text(title: Optional[str], description: Optional[str]) -> tuple
     if body == head:
         body = ''
     return head, body
+
+
+# =============================================================================
+# 어느 기기로 보낼 것인가
+# =============================================================================
+
+# 이 시간 안에 쓴 기기는 "지금 쓰고 있는 기기" 로 본다.
+#
+# 왜 10분인가
+#   메신저들이 쓰는 값과 같다(Slack 의 자리 비움 판정이 10분이다). 너무 짧으면
+#   잠깐 다른 창을 본 사이에 "안 쓰는 기기" 가 되어 알림이 여기저기로 흩어지고,
+#   너무 길면 이미 덮어 둔 노트북으로만 가서 휴대폰에는 오지 않는다.
+ACTIVE_WINDOW_SECONDS = 600
+
+
+def _as_epoch(value) -> Optional[float]:
+    """시각을 숫자로. 모양이 제각각이라(문자열·datetime) 한 곳에서 흡수한다."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Postgres 는 '2026-09-07T05:49:46.808+00:00' 처럼 준다. 'Z' 도 받아 준다.
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
+    except Exception:  # noqa: BLE001 - 못 읽으면 "모르는 시각" 으로 둔다
+        return None
+
+
+def target_devices(rows, now=None, window_seconds: int = ACTIVE_WINDOW_SECONDS) -> List[Dict]:
+    """
+    이 사람의 기기들 중 어디로 보낼지 고른다.
+
+    규칙은 메신저들이 하는 것과 같다.
+      - 지금 쓰고 있는 기기가 있으면 **그 기기들로만** 보낸다.
+        노트북을 보고 있는데 휴대폰이 같이 울릴 이유가 없다.
+      - 아무 기기도 쓰고 있지 않으면 **가진 기기 모두로** 보낸다.
+        노트북을 덮어 두었는지, 꺼 두었는지 우리는 알 수 없다. 어느 것을 집어
+        들든 보이게 하는 편이 안전하다 — 못 받는 것이 가장 나쁘다.
+
+    `last_active_at` 이 없는 기기(옛날에 등록만 된 것)는 "쓰고 있지 않다" 로 본다.
+    그래도 아무도 활동 중이 아니면 함께 받는다.
+    """
+    usable = [row for row in (rows or []) if (row.get('device_token') or '').strip()]
+    if not usable:
+        return []
+
+    import time
+
+    current = float(now if now is not None else time.time())
+    active = []
+    for row in usable:
+        seen = _as_epoch(row.get('last_active_at'))
+        if seen is not None and (current - seen) <= window_seconds:
+            active.append(row)
+
+    return active or usable
+
+
+def tokens_of(rows) -> List[str]:
+    """고른 기기들의 토큰. 같은 토큰이 두 줄에 있어도 한 번만 보낸다."""
+    return dedupe((row.get('device_token') or '').strip() for row in (rows or []))
