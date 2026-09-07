@@ -1,4 +1,4 @@
-﻿from supabase import create_client, Client
+from supabase import create_client, Client
 from pydantic import BaseModel, validator
 from typing import Any, Dict, List, Optional, Set, Union
 from langchain_community.vectorstores import SupabaseVectorStore
@@ -1117,10 +1117,32 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
             if workitem:
                 workitem.status = completed_activity['result']
                 workitem.end_date = datetime.now(pytz.timezone('Asia/Seoul'))
-                user_info = fetch_assignee_info(completed_activity['completedUserEmail'])
-                if user_info:
-                    workitem.user_id = user_info.get('id')
-                    workitem.username = user_info.get('name')
+                # completedUserEmail은 담당자가 여러 명(멀티 에이전트)인 경우 쉼표로 이어진 목록으로 넘어온다.
+                # 목록 전체를 하나의 식별자로 조회하면 사용자를 찾지 못해 "a,b,c" 자체가 새 담당자로 추가되고,
+                # 결국 user_id가 "a,b,c,a,b,c"가 되어 칸반보드에 담당자가 두 배로 표기된다.
+                completed_user_keys = [
+                    key.strip()
+                    for key in (completed_activity.get('completedUserEmail') or '').split(',')
+                    if key.strip()
+                ]
+                existing_user_ids = [uid.strip() for uid in (workitem.user_id or '').split(',') if uid.strip()]
+                existing_usernames = [name.strip() for name in (workitem.username or '').split(',') if name.strip()]
+                for completed_user_key in completed_user_keys:
+                    user_info = fetch_assignee_info(completed_user_key)
+                    if not user_info:
+                        continue
+                    completed_user_id = user_info.get('id')
+                    if not completed_user_id or completed_user_id in existing_user_ids:
+                        continue
+                    existing_user_ids.append(completed_user_id)
+
+                    completed_username = user_info.get('name')
+                    if completed_username and completed_username not in existing_usernames:
+                        existing_usernames.append(completed_username)
+                if existing_user_ids:
+                    workitem.user_id = ','.join(existing_user_ids)
+                if existing_usernames:
+                    workitem.username = ','.join(existing_usernames)
                 if workitem.assignees and len(workitem.assignees) > 0:
                     for assignee in workitem.assignees:
                         if assignee.get('endpoint') and assignee.get('endpoint') == workitem.user_id:
@@ -1172,9 +1194,28 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                             user_id = ','.join(role_binding['endpoint']) if isinstance(role_binding['endpoint'], list) else role_binding['endpoint']
                             assignees.append(role_binding)
                 
-                user_info = None
-                if completed_activity.get('completedUserEmail') and completed_activity['completedUserEmail'] != user_id:
-                    user_info = fetch_assignee_info(completed_activity['completedUserEmail'])
+                # 위와 마찬가지로 담당자가 여러 명이면 쉼표 목록으로 넘어오므로 하나씩 조회한다.
+                # 조회 결과가 없으면 역할 바인딩에서 구한 user_id를 그대로 사용한다.
+                completed_user_keys = [
+                    key.strip()
+                    for key in (completed_activity.get('completedUserEmail') or '').split(',')
+                    if key.strip()
+                ]
+                resolved_user_ids = []
+                resolved_usernames = []
+                for completed_user_key in completed_user_keys:
+                    user_info = fetch_assignee_info(completed_user_key)
+                    if not user_info:
+                        continue
+                    resolved_user_id = user_info.get('id')
+                    if not resolved_user_id or resolved_user_id in resolved_user_ids:
+                        continue
+                    resolved_user_ids.append(resolved_user_id)
+                    resolved_username = user_info.get('name')
+                    if resolved_username and resolved_username not in resolved_usernames:
+                        resolved_usernames.append(resolved_username)
+                completed_user_id = ','.join(resolved_user_ids) if resolved_user_ids else user_id
+                completed_username = ','.join(resolved_usernames) if resolved_usernames else None
 
                 agent_orch = safeget(activity, 'orchestration', None)
                 if agent_orch == 'none':
@@ -1203,8 +1244,8 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
                     proc_def_id=process_result_data['processDefinitionId'].lower(),
                     activity_id=completed_activity['completedActivityId'],
                     activity_name= f"{safeget(activity, 'name', '')}{scope_name}",
-                    user_id=user_info.get('id'),
-                    username=user_info.get('name'),
+                    user_id=completed_user_id,
+                    username=completed_username,
                     status=completed_activity['result'],
                     tool=safeget(activity, 'tool', ''),
                     start_date=start_date,
@@ -1268,7 +1309,7 @@ def upsert_completed_workitem(process_instance_data, process_result_data, proces
             
             upsert_workitem_completed_log(workitems, process_result_data, tenant_id)
             ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
-            supabase.table('todolist').upsert(workitem_dict).execute()
+            _save_todolist_row(supabase, workitem_dict)
             
         return workitems
     except Exception as e:
@@ -1368,7 +1409,7 @@ def upsert_cancelled_workitem(process_instance_data, process_result_data, proces
             if supabase is None:
                 raise Exception("Supabase client is not configured for this request")
             ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
-            supabase.table('todolist').upsert(workitem_dict).execute()
+            _save_todolist_row(supabase, workitem_dict)
             workitems.append(workitem)
         return workitems
             
@@ -1524,7 +1565,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                         break
                 
                 # activity.agent媛 ?덉쑝硫?user_id??異붽? (以묐났 泥댄겕, ?곗꽑?쒖쐞 ?믪쓬)
-                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
+                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "" and is_user_in_tenant(safeget(activity, 'agent', None), tenant_id):
                     agent_id = safeget(activity, 'agent', None)
                     
                     # 湲곗〈 user_id? 議곗씤 (以묐났 泥댄겕)
@@ -1707,7 +1748,7 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 if supabase is None:
                     raise Exception("Supabase client is not configured for this request")
                 ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
-                supabase.table('todolist').upsert(workitem_dict).execute()
+                _save_todolist_row(supabase, workitem_dict)
                 workitems.append(workitem)
         except Exception as e:
             print(f"[ERROR] upsert_next_workitems: {str(e)}")
@@ -1834,7 +1875,7 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                     activity_tool = 'formHandler:defaultForm'
                     
                 # activity.agent媛 ?덉쑝硫?user_id??異붽? (以묐났 泥댄겕, ?곗꽑?쒖쐞 ?믪쓬)
-                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "":
+                if safeget(activity, 'agent', None) is not None and safeget(activity, 'agent', None) != "" and is_user_in_tenant(safeget(activity, 'agent', None), tenant_id):
                     agent_id = safeget(activity, 'agent', None)
                     
                     # 湲곗〈 user_id? 議곗씤 (以묐났 泥댄겕)
@@ -1925,7 +1966,7 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 if supabase is None:
                     raise Exception("Supabase client is not configured for this request")
                 ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
-                supabase.table('todolist').upsert(workitem_dict).execute()
+                _save_todolist_row(supabase, workitem_dict)
     except Exception as e:
         print(f"[ERROR] upsert_todo_workitems: {str(e)}")
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -2093,9 +2134,44 @@ def upsert_workitem(workitem_data: dict, tenant_id: Optional[str] = None):
             tenant_id = subdomain_var.get()
         workitem_data["tenant_id"] = tenant_id
 
-        return supabase.table('todolist').upsert(workitem_data).execute()
+        return _save_todolist_row(supabase, workitem_data)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+def _save_todolist_row(supabase, workitem_dict: dict):
+    """todolist 행을 저장하는 유일한 길목.
+
+    워크아이템 저장은 완료(`upsert_completed_workitem`), 취소, 다음 활동 생성, 직접
+    상태 갱신 등 네댓 군데에서 일어난다. 고착화 트리거를 그 중 한 곳에만 걸면
+    나머지 경로로 DONE 이 된 워크아이템은 조용히 빠진다 — 실제로 그렇게 빠졌다.
+    쓰기를 여기 하나로 모아 두면 빠질 자리가 없다.
+    """
+    response = supabase.table('todolist').upsert(workitem_dict).execute()
+    _try_freeze_on_done(workitem_dict, response)
+    return response
+
+
+def _try_freeze_on_done(workitem_data: dict, response: Any) -> None:
+    """워크아이템이 DONE으로 확정되면 고착화를 시도한다.
+
+    상태 쓰기는 전부 `upsert_workitem`을 지나므로 여기 한 곳만 걸면 모든 경로
+    (에이전트 자율 완료, userTask 체크포인트 통과, serviceTask)를 잡는다. 호출부마다
+    거는 것보다 빠뜨릴 여지가 없다.
+
+    저장 응답의 행을 쓰는 이유는 호출부가 `{"id": ..., "status": "DONE"}` 처럼 일부
+    필드만 보내는 경우가 많기 때문이다. 고착화에는 proc_def_id/activity_id가 필요하다.
+    """
+    if str(workitem_data.get("status") or "").upper() != "DONE":
+        return
+    try:
+        from deterministic_generator import freeze_on_done
+
+        rows = getattr(response, "data", None) or []
+        freeze_on_done(rows[0] if rows else workitem_data)
+    except Exception as e:  # noqa: BLE001
+        # 고착화는 최적화다. 실패가 워크아이템 저장을 되돌려서는 안 된다.
+        print(f"[WARNING] Deterministic freeze skipped: {str(e)}")
 
 
 def delete_workitem(workitem_id: str, tenant_id: Optional[str] = None):
@@ -2156,6 +2232,24 @@ def upsert_chat_message(chat_room_id: str, data: Any, tenant_id: Optional[str] =
         
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+def is_user_in_tenant(user_id: str, tenant_id: str) -> bool:
+    try:
+        if not user_id or not tenant_id:
+            return False
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table("users").select("id").eq('id', user_id).eq('tenant_id', tenant_id).execute()
+        if response.data:
+            return True
+        response = supabase.table("users").select("id").eq('email', user_id).eq('tenant_id', tenant_id).execute()
+        return bool(response.data)
+    except Exception as e:
+        print(f"[ERROR] is_user_in_tenant: {str(e)}")
+        return False
+
 
 def fetch_user_info(email: str) -> Dict[str, str]:
     try:
@@ -2672,3 +2766,163 @@ async def get_input_data_with_file_parsing(workitem: dict, process_definition: A
         # ?먮윭 諛쒖깮??湲곕낯 ?낅젰 ?곗씠?곕씪??諛섑솚
         return get_input_data(workitem, process_definition)
 
+
+
+# ---------------------------------------------------------------------------
+# 결정론적 코드(고착화) 저장소
+#
+# 고착화 판정의 근거는 "이 액티비티가 성공적으로 끝난 적이 몇 번인가"이고, 그
+# 판정(DONE 전환)이 내려지는 곳이 이 서비스다. 그래서 생성기가 여기 있고, 생성기가
+# 쓰는 조회/저장도 여기 있다. 함수 모양은 completion 쪽 `database.py`와 같다.
+# ---------------------------------------------------------------------------
+
+def fetch_events_by_todo_id(todo_id: str) -> Optional[List[Dict[str, Any]]]:
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table('events').select("*").eq('todo_id', todo_id).order('timestamp', desc=True).execute()
+        return response.data or []
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch events by todo_id: {str(e)}")
+        return None
+
+
+def fetch_mcp_python_code(
+    proc_def_id: str, activity_id: str, tenant_id: str, include_deactivated: bool = False
+) -> Optional[Dict[str, Any]]:
+    """해당 액티비티의 최신 코드 행.
+
+    `include_deactivated` 는 보상(undo) 생성 전용이다. 비활성화는 "이 순방향 코드를 더는
+    믿지 않는다"는 뜻이지 "되돌리지 않아도 된다"는 뜻이 아니다. 그런데 이 조회가 늘
+    활성 행만 보면, 코드가 한 번 비활성화된 뒤로는 보상을 **영영 저장할 곳이 없어진다**
+    (행이 없다고 보고 새 행을 만들려다 유일 제약에 걸린다). 실행 런타임도 되돌리기를
+    위해서는 비활성 여부와 무관하게 최신 행을 읽는다 — 양쪽이 같은 행을 봐야 한다.
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        query = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
+        if not include_deactivated:
+            # 비활성화된 코드는 제외한다. 재작업이 반복되어 신뢰를 잃은 코드는 행으로
+            # 남되 다시 선택되지 않는다.
+            query = query.is_('deactivated_at', 'null')
+        response = query.order('created_at', desc=True).limit(1).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch mcp_python_code: {str(e)}")
+        return None
+
+
+def fetch_last_deactivated_at(proc_def_id: str, activity_id: str, tenant_id: str) -> Optional[str]:
+    """해당 액티비티의 가장 최근 비활성 시각. 표본 재축적의 기준점이 된다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table('mcp_python_code').select('deactivated_at').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).not_.is_('deactivated_at', 'null').order('deactivated_at', desc=True).limit(1).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0].get('deactivated_at')
+        return None
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch last deactivated_at: {str(e)}")
+        return None
+
+
+def fetch_workitems_by_activity(
+    proc_def_id: str,
+    activity_id: str,
+    tenant_id: str,
+    status: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = 12
+) -> List[Dict[str, Any]]:
+    """같은 액티비티의 워크아이템을 최신순으로 조회한다. 고착화 표본 수집에 쓴다.
+
+    query(워크아이템 지시문)까지 가져온다. 파라미터 이름표를 그 지시문에서 관측하기
+    때문이다 — 없으면 고착화 코드가 다음 실행에서 입력을 못 찾는다.
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        query = supabase.table('todolist').select('id, proc_inst_id, root_proc_inst_id, rework_count, start_date, updated_at, status, query') \
+            .eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
+        if status:
+            query = query.eq('status', status)
+        if since:
+            query = query.gt('updated_at', since)
+        response = query.order('updated_at', desc=True).limit(limit).execute()
+        return response.data or []
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch workitems by activity: {str(e)}")
+        return []
+
+
+def fetch_related_workitem_outputs(
+    tenant_id: str,
+    root_proc_inst_id: Optional[str],
+    proc_inst_id: Optional[str],
+    exclude_id: Optional[str] = None,
+    before: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """같은 루트 프로세스에서 이미 완료된 다른 워크아이템의 산출물.
+
+    에이전트가 `get_related_workitem_outputs` 도구로 읽던 것과 **같은 자료를 같은
+    모양으로** 돌려준다. 고착화 생성기는 이것으로 "이 값이 앞 액티비티의 산출물에서
+    왔는가"를 관측하고, 실행 런타임은 같은 조회로 그 값을 다시 채운다. 모양이 갈리면
+    관측한 자리와 읽는 자리가 달라져 조용히 틀린다.
+
+    `before`(그 워크아이템의 시작 시각)를 주면 그때 이미 끝나 있던 것만 남긴다. 지금
+    조회하면 **뒤에** 끝난 액티비티의 산출물까지 딸려 와, 그 실행에서는 알 수 없었던
+    값을 근거로 삼게 된다.
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        query = supabase.table('todolist').select(
+            'id, proc_inst_id, activity_id, activity_name, end_date, output'
+        ).eq('tenant_id', tenant_id).not_.is_('output', 'null')
+        if root_proc_inst_id:
+            query = query.eq('root_proc_inst_id', root_proc_inst_id)
+        elif proc_inst_id:
+            query = query.eq('proc_inst_id', proc_inst_id)
+        else:
+            return []
+        if exclude_id:
+            query = query.neq('id', exclude_id)
+        if before:
+            query = query.lt('end_date', before)
+        response = query.order('end_date', desc=True).execute()
+        return [
+            {
+                "workitemId": row.get("id"),
+                "procInstId": row.get("proc_inst_id"),
+                "activityId": row.get("activity_id"),
+                "activityName": row.get("activity_name"),
+                "endDate": row.get("end_date"),
+                "output": row.get("output"),
+            }
+            for row in (response.data or [])
+        ]
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch related workitem outputs: {str(e)}")
+        return []
+
+def upsert_mcp_python_code(record: Dict[str, Any]):
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+        return supabase.table("mcp_python_code").upsert(record).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
