@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import HTTPException
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
 from contextvars import ContextVar
 from dotenv import load_dotenv
@@ -17,11 +17,19 @@ import socket
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from task_deadline import ensure_minimum_task_due_date
+from supabase_config import get_supabase_key, get_supabase_url
 
 db_config_var = ContextVar('db_config', default={})
 supabase_client_var = ContextVar('supabase', default=None)
-subdomain_var = ContextVar('subdomain', default='localhost')
+DEFAULT_TENANT_ID = (os.getenv("DEFAULT_TENANT_ID") or "skt").strip()
+subdomain_var = ContextVar('subdomain', default=DEFAULT_TENANT_ID)
+DEFAULT_DB_CONFIG = {
+    "dbname": "postgres",
+    "user": "supabase_admin",
+    "password": "pi-system-supabase",
+    "host": "pi-system-supabase-supabase-db",
+    "port": "5432",
+}
 
 
 def setting_database():
@@ -31,17 +39,17 @@ def setting_database():
             # Local dev still works because .env fills missing values.
             load_dotenv(override=False)
 
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_KEY")
+        supabase_url = get_supabase_url()
+        supabase_key = get_supabase_key()
         supabase: Client = create_client(supabase_url, supabase_key)
         supabase_client_var.set(supabase)
         
         db_config = {
-            "dbname": os.getenv("DB_NAME"),
-            "user": os.getenv("DB_USER"),
-            "password": os.getenv("DB_PASSWORD"),
-            "host": os.getenv("DB_HOST"),
-            "port": os.getenv("DB_PORT")
+            "dbname": os.getenv("DB_NAME") or DEFAULT_DB_CONFIG["dbname"],
+            "user": os.getenv("DB_USER") or DEFAULT_DB_CONFIG["user"],
+            "password": os.getenv("DB_PASSWORD") or DEFAULT_DB_CONFIG["password"],
+            "host": os.getenv("DB_HOST") or DEFAULT_DB_CONFIG["host"],
+            "port": os.getenv("DB_PORT") or DEFAULT_DB_CONFIG["port"]
         }
         db_config_var.set(db_config)
         
@@ -275,8 +283,9 @@ def fetch_process_definition(def_id, tenant_id: Optional[str] = None):
             tenant_id = subdomain
 
 
-        response = supabase.table('proc_def').select('*').eq('id', def_id.lower()).eq('tenant_id', tenant_id).execute()
-        
+        # definition 만 사용 — tobe/executable 등 분리 컬럼(대용량 To-Be 작업본)을 끌어오지 않는다
+        response = supabase.table('proc_def').select('definition').eq('id', def_id.lower()).eq('tenant_id', tenant_id).execute()
+
         # Check if the response contains data
         if response.data:
             # Assuming the first match is the desired one since ID should be unique
@@ -349,7 +358,8 @@ def upsert_process_definition(definition: dict, tenant_id: Optional[str] = None)
         process_definition_id = definition.get('id')
         definition['tenant_id'] = tenant_id
         
-        process_definition = supabase.table('proc_def').select('*').eq('id', process_definition_id).eq('tenant_id', tenant_id).execute()
+        # 기존 행 보존 필드만 조회 (uuid/bpmn/isdeleted) — 분리 컬럼(tobe/executable)은 upsert 페이로드에 없어 보존됨
+        process_definition = supabase.table('proc_def').select('uuid, bpmn, isdeleted').eq('id', process_definition_id).eq('tenant_id', tenant_id).execute()
         
         if process_definition.data:
             existing_data = process_definition.data[0]
@@ -499,19 +509,6 @@ class ProcessInstance(BaseModel):
     class Config:
         extra = "allow"
 
-    @validator("variables_data", pre=True, always=True)
-    def _coerce_variables_data(cls, v):
-        # 콜/서브 프로세스 자식 인스턴스는 variables_data가 dict({})로 저장되는 경우가 있어
-        # List 타입 검증에 실패한다. dict를 list로 안전하게 변환한다.
-        if v is None:
-            return []
-        if isinstance(v, dict):
-            if not v:
-                return []
-            return [{"key": k, "value": val} for k, val in v.items()]
-        if isinstance(v, list):
-            return v
-        return []
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -1016,7 +1013,6 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 supabase = supabase_client_var.get()
                 if supabase is None:
                     raise Exception("Supabase client is not configured for this request")
-                ensure_minimum_task_due_date(workitem_dict, process_instance_data.get("start_date"))
                 supabase.table('todolist').upsert(workitem_dict).execute()
     except Exception as e:
         print(f"[ERROR] upsert_todo_workitems: {str(e)}")
@@ -1029,7 +1025,6 @@ def upsert_workitem(workitem_data: dict, tenant_id: Optional[str] = None):
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
         
-        ensure_minimum_task_due_date(workitem_data)
         if "start_date" in workitem_data and workitem_data["start_date"]:
             if not isinstance(workitem_data["start_date"], str):
                 workitem_data["start_date"] = workitem_data["start_date"].isoformat()
@@ -1236,23 +1231,33 @@ def fetch_assignee_info(assignee_id: str) -> Dict[str, str]:
         }
 
 
-from langchain_community.vectorstores import SupabaseVectorStore
-from llm_factory import create_embedding
+_vector_store_cache = None
 
 
 def get_vector_store():
+    global _vector_store_cache
+    if _vector_store_cache is not None:
+        return _vector_store_cache
+
     supabase = supabase_client_var.get()
     if supabase is None:
         raise Exception("Supabase client is not configured")
-    
+
+    try:
+        from llm_factory import create_embedding
+        from langchain_community.vectorstores import SupabaseVectorStore
+    except ImportError as exc:
+        raise RuntimeError("Vector store feature requires langchain dependencies") from exc
+
     embeddings = create_embedding()
-    
-    return SupabaseVectorStore(
+
+    _vector_store_cache = SupabaseVectorStore(
         client=supabase,
         embedding=embeddings,
         table_name="documents",
         query_name="match_documents",
     )
+    return _vector_store_cache
 
 
 def update_user_admin(input):
@@ -1456,6 +1461,27 @@ def fetch_user_info_by_uid(uid: str) -> Dict[str, str]:
             return response.data[0]
         else:
             raise HTTPException(status_code=404, detail="User not found")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+def fetch_user_info_by_uid_and_tenant(uid: str, tenant_id: str) -> Dict[str, Any]:
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = (
+            supabase.table("users")
+            .select("*")
+            .eq('id', uid)
+            .eq('tenant_id', tenant_id)
+            .limit(1)
+            .execute()
+        )
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        raise HTTPException(status_code=404, detail="User not found")
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -1768,19 +1794,145 @@ def fetch_tenant_mcp_config(tenant_id: str) -> Optional[Dict[str, Any]]:
         print(f"[ERROR] Failed to fetch tenant MCP config: {str(e)}")
         return None
 
-def fetch_mcp_python_code(proc_def_id: str, activity_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+def fetch_mcp_python_code(
+    proc_def_id: str, activity_id: str, tenant_id: str, include_deactivated: bool = False
+) -> Optional[Dict[str, Any]]:
+    """해당 액티비티의 최신 코드 행.
+
+    `include_deactivated` 는 보상(undo) 생성 전용이다. 비활성화는 "이 순방향 코드를 더는
+    믿지 않는다"는 뜻이지 "되돌리지 않아도 된다"는 뜻이 아니다. 그런데 이 조회가 늘
+    활성 행만 보면, 코드가 한 번 비활성화된 뒤로는 보상을 **영영 저장할 곳이 없어진다**
+    (행이 없다고 보고 새 행을 만들려다 유일 제약에 걸린다). 실행 런타임도 되돌리기를
+    위해서는 비활성 여부와 무관하게 최신 행을 읽는다 — 양쪽이 같은 행을 봐야 한다.
+    """
     try:
         supabase = supabase_client_var.get()
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
-        
-        response = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).order('created_at', desc=True).limit(1).execute()
+
+        query = supabase.table('mcp_python_code').select('*').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
+        if not include_deactivated:
+            # 비활성화된 코드는 제외한다. 재작업이 반복되어 신뢰를 잃은 코드는 행으로
+            # 남되 다시 선택되지 않는다.
+            query = query.is_('deactivated_at', 'null')
+        response = query.order('created_at', desc=True).limit(1).execute()
         if response.data and len(response.data) > 0:
             return response.data[0]
         else:
             return None
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+def fetch_last_deactivated_at(proc_def_id: str, activity_id: str, tenant_id: str) -> Optional[str]:
+    """해당 액티비티의 가장 최근 비활성 시각. 표본 재축적의 기준점이 된다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table('mcp_python_code').select('deactivated_at').eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).not_.is_('deactivated_at', 'null').order('deactivated_at', desc=True).limit(1).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0].get('deactivated_at')
+        return None
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch last deactivated_at: {str(e)}")
+        return None
+
+def deactivate_mcp_python_code(proc_def_id: str, activity_id: str, tenant_id: str, reason: str) -> int:
+    """해당 액티비티의 활성 코드를 비활성화한다. 행은 이력으로 남긴다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        response = supabase.table('mcp_python_code').update({
+            'deactivated_at': datetime.now(timezone.utc).isoformat(),
+            'deactivated_reason': reason,
+        }).eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id).is_('deactivated_at', 'null').execute()
+        return len(response.data or [])
+    except Exception as e:
+        print(f"[WARNING] Failed to deactivate mcp_python_code: {str(e)}")
+        return 0
+
+def fetch_workitems_by_activity(
+    proc_def_id: str,
+    activity_id: str,
+    tenant_id: str,
+    status: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = 12
+) -> List[Dict[str, Any]]:
+    """같은 액티비티의 워크아이템을 최신순으로 조회한다. 고착화 표본 수집에 쓴다."""
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        # query(워크아이템 지시문)까지 가져온다. 파라미터 이름표를 그 지시문에서
+        # 관측하기 때문이다 — 없으면 고착화 코드가 다음 실행에서 입력을 못 찾는다.
+        query = supabase.table('todolist').select('id, proc_inst_id, root_proc_inst_id, rework_count, start_date, updated_at, status, query') \
+            .eq('proc_def_id', proc_def_id).eq('activity_id', activity_id).eq('tenant_id', tenant_id)
+        if status:
+            query = query.eq('status', status)
+        if since:
+            query = query.gt('updated_at', since)
+        response = query.order('updated_at', desc=True).limit(limit).execute()
+        return response.data or []
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch workitems by activity: {str(e)}")
+        return []
+
+def fetch_related_workitem_outputs(
+    tenant_id: str,
+    root_proc_inst_id: Optional[str],
+    proc_inst_id: Optional[str],
+    exclude_id: Optional[str] = None,
+    before: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """같은 루트 프로세스에서 이미 완료된 다른 워크아이템의 산출물.
+
+    에이전트가 `get_related_workitem_outputs` 도구로 읽던 것과 **같은 자료를 같은
+    모양으로** 돌려준다. 고착화 생성기는 이것으로 "이 값이 앞 액티비티의 산출물에서
+    왔는가"를 관측하고, 실행 런타임은 같은 조회로 그 값을 다시 채운다. 모양이 갈리면
+    관측한 자리와 읽는 자리가 달라져 조용히 틀린다.
+
+    `before`(그 워크아이템의 시작 시각)를 주면 그때 이미 끝나 있던 것만 남긴다. 지금
+    조회하면 **뒤에** 끝난 액티비티의 산출물까지 딸려 와, 그 실행에서는 알 수 없었던
+    값을 근거로 삼게 된다.
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            raise Exception("Supabase client is not configured for this request")
+
+        query = supabase.table('todolist').select(
+            'id, proc_inst_id, activity_id, activity_name, end_date, output'
+        ).eq('tenant_id', tenant_id).not_.is_('output', 'null')
+        if root_proc_inst_id:
+            query = query.eq('root_proc_inst_id', root_proc_inst_id)
+        elif proc_inst_id:
+            query = query.eq('proc_inst_id', proc_inst_id)
+        else:
+            return []
+        if exclude_id:
+            query = query.neq('id', exclude_id)
+        if before:
+            query = query.lt('end_date', before)
+        response = query.order('end_date', desc=True).execute()
+        return [
+            {
+                "workitemId": row.get("id"),
+                "procInstId": row.get("proc_inst_id"),
+                "activityId": row.get("activity_id"),
+                "activityName": row.get("activity_name"),
+                "endDate": row.get("end_date"),
+                "output": row.get("output"),
+            }
+            for row in (response.data or [])
+        ]
+    except Exception as e:
+        print(f"[WARNING] Failed to fetch related workitem outputs: {str(e)}")
+        return []
 
 def upsert_mcp_python_code(record: Dict[str, Any]):
     try:
@@ -1790,3 +1942,197 @@ def upsert_mcp_python_code(record: Dict[str, Any]):
         return supabase.table("mcp_python_code").upsert(record).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# ============================================
+# Admin Requests (권한 신청/승인)
+# ============================================
+
+def create_admin_request(user_id: str, email: str, username: str, tenant_id: str, reason: str = "", requested_role: str = "admin") -> Dict[str, Any]:
+    supabase = supabase_client_var.get()
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase client is not configured")
+
+    # 유효한 역할인지 확인
+    valid_roles = {"admin", "owner", "editor", "reviewer", "viewer"}
+    if requested_role not in valid_roles:
+        requested_role = "admin"
+
+    # 이미 pending 상태의 신청이 있는지 확인
+    existing = (
+        supabase.table("admin_requests")
+        .select("id, status")
+        .eq("user_id", user_id)
+        .eq("tenant_id", tenant_id)
+        .eq("status", "pending")
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        raise HTTPException(status_code=409, detail="이미 대기 중인 권한 신청이 있습니다.")
+
+    record = {
+        "user_id": user_id,
+        "email": email,
+        "username": username,
+        "tenant_id": tenant_id,
+        "reason": reason or "",
+        "requested_role": requested_role,
+        "status": "pending",
+    }
+    response = supabase.table("admin_requests").insert(record).execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="권한 신청 생성에 실패했습니다.")
+    return response.data[0]
+
+
+def get_admin_requests(tenant_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    supabase = supabase_client_var.get()
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase client is not configured")
+
+    query = (
+        supabase.table("admin_requests")
+        .select("*")
+        .eq("tenant_id", tenant_id)
+        .order("created_at", desc=True)
+    )
+    if status and status != "all":
+        query = query.eq("status", status)
+
+    response = query.execute()
+    return response.data or []
+
+
+def get_my_admin_requests(user_id: str, tenant_id: str) -> List[Dict[str, Any]]:
+    supabase = supabase_client_var.get()
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase client is not configured")
+
+    response = (
+        supabase.table("admin_requests")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("tenant_id", tenant_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return response.data or []
+
+
+def approve_admin_request(request_id: str, reviewer: str, tenant_id: str) -> Dict[str, Any]:
+    supabase = supabase_client_var.get()
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase client is not configured")
+
+    now = datetime.now(pytz.utc).isoformat()
+
+    # 신청 조회
+    req_response = (
+        supabase.table("admin_requests")
+        .select("*")
+        .eq("id", request_id)
+        .eq("tenant_id", tenant_id)
+        .limit(1)
+        .execute()
+    )
+    if not req_response.data:
+        raise HTTPException(status_code=404, detail="권한 신청을 찾을 수 없습니다.")
+
+    admin_request = req_response.data[0]
+    if admin_request["status"] != "pending":
+        raise HTTPException(status_code=400, detail="이미 처리된 신청입니다.")
+
+    # users 테이블에 신청 역할 반영
+    requested_role = admin_request.get("requested_role") or "admin"
+    valid_roles = {"admin", "owner", "editor", "reviewer", "viewer"}
+    if requested_role not in valid_roles:
+        raise HTTPException(status_code=400, detail="유효하지 않은 신청 역할입니다.")
+
+    # SSO 전환 과정에서 admin_requests.user_id와 기존 users.id가 다른 레거시 계정은
+    # 같은 테넌트의 신청 이메일로 한 번 더 찾아 실제 users 행을 갱신한다.
+    user_response = (
+        supabase.table("users")
+        .select("id, role, is_admin")
+        .eq("id", admin_request["user_id"])
+        .eq("tenant_id", tenant_id)
+        .limit(1)
+        .execute()
+    )
+    if not user_response.data and admin_request.get("email"):
+        user_response = (
+            supabase.table("users")
+            .select("id, role, is_admin")
+            .eq("email", admin_request["email"])
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute()
+        )
+    if not user_response.data:
+        raise HTTPException(status_code=404, detail="권한을 반영할 사용자를 찾을 수 없습니다.")
+
+    target_user_id = user_response.data[0]["id"]
+    user_update = supabase.table("users").update({
+        "role": requested_role,
+        "is_admin": requested_role == "admin",
+    }).eq("id", target_user_id).eq("tenant_id", tenant_id).execute()
+    if not user_update.data:
+        raise HTTPException(status_code=500, detail="사용자 역할 반영에 실패했습니다.")
+
+    updated_user = user_update.data[0]
+    if (
+        updated_user.get("role") != requested_role
+        or bool(updated_user.get("is_admin")) != (requested_role == "admin")
+    ):
+        raise HTTPException(status_code=500, detail="사용자 역할이 올바르게 반영되지 않았습니다.")
+
+    # 실제 역할 갱신이 확인된 뒤에만 신청을 승인 완료로 전환한다.
+    request_update = supabase.table("admin_requests").update({
+        "status": "approved",
+        "reject_reason": None,
+        "reviewed_by": reviewer,
+        "reviewed_at": now,
+        "updated_at": now,
+    }).eq("id", request_id).eq("tenant_id", tenant_id).execute()
+    if not request_update.data:
+        raise HTTPException(status_code=500, detail="권한 신청 승인 상태 저장에 실패했습니다.")
+
+    return request_update.data[0]
+
+
+def reject_admin_request(request_id: str, reviewer: str, tenant_id: str, reject_reason: str = "") -> Dict[str, Any]:
+    supabase = supabase_client_var.get()
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase client is not configured")
+
+    now = datetime.now(pytz.utc).isoformat()
+
+    # 신청 조회
+    req_response = (
+        supabase.table("admin_requests")
+        .select("*")
+        .eq("id", request_id)
+        .eq("tenant_id", tenant_id)
+        .limit(1)
+        .execute()
+    )
+    if not req_response.data:
+        raise HTTPException(status_code=404, detail="권한 신청을 찾을 수 없습니다.")
+
+    if req_response.data[0]["status"] != "pending":
+        raise HTTPException(status_code=400, detail="이미 처리된 신청입니다.")
+
+    supabase.table("admin_requests").update({
+        "status": "rejected",
+        "reject_reason": reject_reason or None,
+        "reviewed_by": reviewer,
+        "reviewed_at": now,
+        "updated_at": now,
+    }).eq("id", request_id).eq("tenant_id", tenant_id).execute()
+
+    rejected = req_response.data[0]
+    rejected["status"] = "rejected"
+    rejected["reject_reason"] = reject_reason or None
+    rejected["reviewed_by"] = reviewer
+    rejected["reviewed_at"] = now
+    return rejected

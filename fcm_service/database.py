@@ -16,8 +16,17 @@ import firebase_admin
 import logging
 import asyncio
 
+from recipients import (
+    notification_text,
+    resolve_user_emails as _resolve_user_emails,
+    target_devices,
+    tokens_of,
+    usable_tokens,
+)
+
 supabase_client_var = ContextVar('supabase', default=None)
-subdomain_var = ContextVar('subdomain', default='localhost')
+DEFAULT_TENANT_ID = (os.getenv("DEFAULT_TENANT_ID") or "skt").strip()
+subdomain_var = ContextVar('subdomain', default=DEFAULT_TENANT_ID)
 
 # 전역 변수로 변경
 firebase_app = None
@@ -53,32 +62,79 @@ async def update_tenant_id(subdomain):
     except Exception as e:
         print(f"An error occurred: {e}")
 
-def fetch_device_token(user_id: str) -> Optional[str]:
+def _lookup_emails_by_uuid(uuids: List[str]) -> List[Dict[str, Any]]:
+    """UUID 로 사용자 이메일을 찾는다. 규칙은 recipients 모듈에 있다."""
+    supabase = supabase_client_var.get()
+    if supabase is None:
+        raise Exception("Supabase client is not configured for this request")
+    response = supabase.table('users').select('id, email').in_('id', uuids).execute()
+    return response.data or []
+
+
+def resolve_user_emails(user_id: str) -> List[str]:
+    """알림의 수신자 칸(이메일 · UUID · 콤마로 이은 여럿)을 이메일 목록으로 바꾼다."""
+    return _resolve_user_emails(
+        user_id,
+        _lookup_emails_by_uuid,
+        on_error=lambda e: realtime_logger.warning(f"사용자 UUID -> 이메일 변환 실패: {e}"),
+    )
+
+
+def fetch_device_tokens(user_id: str) -> List[str]:
     """
-    특정 사용자의 FCM 디바이스 토큰을 조회합니다.
-    
-    Args:
-        user_id (str): 사용자 ID (이메일)
-        
-    Returns:
-        Optional[str]: 디바이스 토큰
+    수신자의 기기 토큰들을 조회한다.
+
+    user_id 는 이메일일 수도, 사용자 UUID 일 수도, 콤마로 이어진 여럿일 수도
+    있다 — 업무 알림은 UUID 로 오기 때문에 이 변환이 없으면 아무것도 못 찾는다.
     """
     try:
         supabase = supabase_client_var.get()
         if supabase is None:
             raise Exception("Supabase client is not configured for this request")
-        
-        response = supabase.table('user_devices').select('device_token').eq('user_email', user_id).execute()
-        
-        if response.data:
-            device_token = response.data[0].get('device_token')
-            if device_token and device_token.strip():  # None이 아니고 빈 문자열이 아닌 경우
-                return device_token
-        
-        return None
-    
+
+        emails = resolve_user_emails(user_id)
+        if not emails:
+            return []
+
+        # 기기마다 한 줄이다. 어느 기기로 보낼지는 target_devices 가 정한다 —
+        # 지금 쓰고 있는 기기가 있으면 거기로만, 없으면 가진 기기 모두로.
+        response = (
+            supabase.table('user_devices')
+            .select('device_token, last_active_at, device_type')
+            .in_('user_email', emails)
+            .execute()
+        )
+        return tokens_of(target_devices(response.data or []))
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def fetch_device_token(user_id: str) -> Optional[str]:
+    """
+    첫 번째 기기 토큰. 기존 호출부(REST /device-token/{user_id})와의 호환을 위해 남깁니다.
+    실제 발송은 fetch_device_tokens 로 전원에게 보냅니다.
+    """
+    tokens = fetch_device_tokens(user_id)
+    return tokens[0] if tokens else None
+
+
+def forget_device_token(device_token: str) -> None:
+    """
+    더 이상 닿지 않는 기기를 목록에서 지운다.
+
+    실패해도 발송은 계속한다 — 정리는 부수적인 일이고, 그것 때문에 다른 기기로
+    갈 알림을 막으면 안 된다.
+    """
+    try:
+        supabase = supabase_client_var.get()
+        if supabase is None:
+            return
+        supabase.table('user_devices').delete().eq('device_token', device_token).execute()
+    except Exception as e:  # noqa: BLE001 - 정리 실패가 발송을 막으면 안 된다
+        realtime_logger.warning(f"사라진 기기 정리 실패: {e}")
 
 
 def send_fcm_message(user_id: str, notification_data: dict) -> dict:
@@ -98,9 +154,10 @@ def send_fcm_message(user_id: str, notification_data: dict) -> dict:
     """
     try:
         global firebase_app
-        # 디바이스 토큰 조회
-        device_token = fetch_device_token(user_id)
-        if not device_token:
+        # 기기 토큰 조회. 수신자가 여럿(콤마)일 수 있고, 이메일이 아니라
+        # 사용자 UUID 로 올 수도 있다 — resolve_user_emails 가 둘 다 처리한다.
+        device_tokens = fetch_device_tokens(user_id)
+        if not device_tokens:
             return {"success": False, "message": "No device token found for the user"}
         
         # FCM 메시지 발송
@@ -142,35 +199,45 @@ def send_fcm_message(user_id: str, notification_data: dict) -> dict:
         data['title'] = noti_title
         data['body'] = noti_body
 
-        message = messaging.Message(
-            token=device_token,
-            notification=messaging.Notification(
-                title=noti_title,
-                body=noti_body
-            ),
-            data=data,
-            android=messaging.AndroidConfig(
-                priority='high',
-            ),
-            apns=messaging.APNSConfig(
-                payload=messaging.APNSPayload(
-                    aps=messaging.Aps(
-                        badge=1,
-                        sound='default'
+        # 담당자가 여럿인 업무는 기기도 여럿이다. 하나가 실패해도 나머지는 보낸다.
+        for device_token in device_tokens:
+            message = messaging.Message(
+                token=device_token,
+                notification=messaging.Notification(
+                    title=noti_title,
+                    body=noti_body
+                ),
+                data=data,
+                android=messaging.AndroidConfig(
+                    priority='high',
+                ),
+                apns=messaging.APNSConfig(
+                    payload=messaging.APNSPayload(
+                        aps=messaging.Aps(
+                            badge=1,
+                            sound='default'
+                        )
                     )
                 )
             )
-        )
-        
-        try:
-            response = messaging.send(message)
-            success_count = 1
-        except Exception as e:
-            print(f"FCM 메시지 전송 오류: {e}")
-            failed = True
-        
+
+            try:
+                messaging.send(message)
+                success_count += 1
+            except messaging.UnregisteredError:
+                # 앱을 지웠거나 브라우저 자료를 비운 기기다. 이 토큰은 앞으로도
+                # 영원히 실패한다. 지우지 않으면 죽은 기기가 계속 쌓이고,
+                # "지금 쓰는 기기가 없을 때 모두에게 보내기" 가 헛발송이 된다.
+                realtime_logger.info("사라진 기기의 토큰을 지웁니다.")
+                forget_device_token(device_token)
+            except Exception as e:
+                print(f"FCM 메시지 전송 오류: {e}")
+                failed = True
+
         return {
             "success": success_count > 0,
+            "sent": success_count,
+            "total": len(device_tokens),
             "message": "Message sent successfully" if success_count > 0 else "Failed to send message",
         }
     
@@ -202,9 +269,16 @@ def handle_new_notification(notification_record):
 
         print(f"url: {url}")
         
+        # 본문에 인스턴스 식별자가 그대로 붙어 오는 것을 다듬는다.
+        # 알림은 두 줄이 전부라, 절반이 UUID 면 무슨 일인지 알 수 없다.
+        title, body = notification_text(
+            notification_record.get('title'),
+            notification_record.get('description'),
+        )
+
         notification_data = {
-            'title': notification_record.get('title', '새 알림'),
-            'body': notification_record.get('description', '새로운 알림이 도착했습니다.'),
+            'title': title or '새 알림',
+            'body': body or '새로운 알림이 도착했습니다.',
             'type': notification_record.get('type', 'general'),
             'url': url,
             'from_user_id': notification_record.get('from_user_id', ''),
@@ -231,21 +305,26 @@ def fetch_unprocessed_notifications() -> Optional[List[dict]]:
         
         env = os.getenv("ENV")
 
-        # 1) ENV 기반 tenant 필터 적용 후 조회
+        # 1) 아직 아무도 가져가지 않은 알림을 집는다.
+        #
+        # 예전에는 조직으로 갈랐다 — dev 는 `uengine` 만, 운영은 `uengine` 을 뺀
+        # 나머지. 개발용과 운영용이 같은 데이터베이스를 보면서 같은 알림을 두 번
+        # 보내지 않으려던 것이다.
+        #
+        # 그런데 그 결과 두 가지가 아무 데도 가지 않았다.
+        #   - `uengine` 조직: 운영이 빼고, 그것을 가져갈 dev 는 떠 있지 않다.
+        #   - 조직이 비어 있는 알림: NULL 은 `=` 에도 `<>` 에도 걸리지 않는다.
+        #     대화 알림이 여기 해당해 103건이 그대로 남아 있었다.
+        #
+        # 그래서 운영은 **전부** 가져간다. 두 번 보내는 것은 아래의 선점
+        # (consumer 를 먼저 찍고, 이미 찍힌 것은 건너뛴다)이 막아 준다 —
+        # 조직으로 가르는 것은 애초에 그 일을 하기에 알맞은 도구가 아니었다.
+        query = supabase.table('notifications').select('*').is_('consumer', 'null')
         if env == 'dev':
-            response = supabase.table('notifications') \
-                .select('*') \
-                .is_('consumer', 'null') \
-                .eq('tenant_id', 'uengine') \
-                .limit(10) \
-                .execute()
-        else:
-            response = supabase.table('notifications') \
-                .select('*') \
-                .is_('consumer', 'null') \
-                .neq('tenant_id', 'uengine') \
-                .limit(10) \
-                .execute()
+            # 개발 환경은 여전히 자기 조직만 본다. 운영 사용자에게 개발 중인
+            # 코드가 알림을 보내면 안 된다.
+            query = query.eq('tenant_id', 'uengine')
+        response = query.limit(10).execute()
         
         if not response.data:
             return None

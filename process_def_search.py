@@ -1,9 +1,9 @@
 from fastapi import HTTPException, Request
 from typing import List, Optional
 import json
-from langchain.prompts import PromptTemplate
-from langchain.output_parsers.json import SimpleJsonOutputParser
-from llm_factory import create_llm, create_openai_llm
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers.json import SimpleJsonOutputParser
+from llm_factory import create_openai_llm
 from langchain_core.runnables import RunnableLambda
 from langserve import add_routes
 from pydantic import BaseModel
@@ -12,8 +12,14 @@ from database import fetch_all_process_definitions
 from process_var_sql_gen import get_process_definitions
 
 
-model = create_llm()
-vision_model = create_openai_llm(max_tokens=4096)
+# LLM 지연 초기화 — 키 없는 환경에서도 임포트(=라우트 등록)는 성공해야 한다 (process_engine과 동일 패턴).
+_vision_model = None
+
+def get_vision_model():
+    global _vision_model
+    if _vision_model is None:
+        _vision_model = create_openai_llm(max_tokens=4096)
+    return _vision_model
 
 parser = SimpleJsonOutputParser()
 
@@ -43,12 +49,12 @@ prompt = PromptTemplate.from_template(
     )
 
 import base64
-from langchain.schema.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 def vision_model_chain(input):
     formatted_prompt = prompt.format(**input)
     
-    msg = vision_model.invoke(
+    msg = get_vision_model().invoke(
         [   AIMessage(
                 content=formatted_prompt
             ),
@@ -87,13 +93,8 @@ def process_search(process_result_json: dict) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-chain = (
-    prompt | model | parser | process_search
-)
-
-vision_chain = (
-    vision_model_chain | parser | process_search
-)
+# (제거) 모듈 레벨 chain/vision_chain — 주석 처리된 langserve add_routes 전용 잔재로,
+# 실제 라우트(combine_input_with_process_definition)는 LLM을 호출하지 않는다.
 
 async def combine_input_with_process_definition(request: Request):
     try:

@@ -1,12 +1,12 @@
 from fastapi import Request, HTTPException
-from langchain.prompts import PromptTemplate
-from langchain.output_parsers.json import SimpleJsonOutputParser
-from llm_factory import create_llm
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers.json import SimpleJsonOutputParser
 from datetime import datetime, timedelta
 
-from database import fetch_process_definition_by_version, fetch_organization_chart, upsert_workitem, fetch_workitem_by_proc_inst_and_activity, insert_process_instance, fetch_workitem_by_id, upsert_process_definition, fetch_assignee_info, upsert_process_instance_source, fetch_process_instance
+from database import fetch_process_definition_by_version, fetch_organization_chart, upsert_workitem, fetch_workitem_by_proc_inst_and_activity, insert_process_instance, fetch_workitem_by_id, upsert_process_definition, fetch_assignee_info, upsert_process_instance_source, fetch_process_instance, deactivate_mcp_python_code
 from process_definition import load_process_definition, convert_definition_to_raw_json
 from compensation_handler import generate_compensation
+from deterministic_generator import REWORK_DISTRUST_THRESHOLD, count_reworked_code_runs
 from semantic_naming import generate_semantic_name
 
 import traceback
@@ -14,8 +14,15 @@ import uuid
 import json
 import pytz
 
-# LLM 객체 생성 (공통 팩토리 사용)
-model = create_llm(streaming=True)
+# LLM 지연 초기화 — 키 없는 환경에서도 임포트(=/complete 등 라우트 등록)는 성공해야 한다.
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        from llm_factory import create_llm
+        _model = create_llm(streaming=True)
+    return _model
 
 # parser 생성
 import re
@@ -57,7 +64,7 @@ async def handle_generate_name(request: Request):
     if kind not in {"chat", "instance"}:
         raise HTTPException(status_code=400, detail="kind must be 'chat' or 'instance'")
     name = await generate_semantic_name(
-        model,
+        get_model(),
         kind=kind,
         source=payload.get("source"),
         process_name=str(payload.get("process_name") or ""),
@@ -65,8 +72,22 @@ async def handle_generate_name(request: Request):
     return {"name": name}
     
 
-async def create_process_instance(process_definition, process_instance_id, is_initiate=False, role_bindings=[], project_id=None):
+async def create_process_instance(process_definition, process_instance_id, is_initiate=False, role_bindings=[], project_id=None, start_event_id=None, process_definition_id=None):
     try:
+        # When the start request carries no role bindings (e.g. the UI "start" button sends
+        # role_mappings:[]), fall back to the process definition's own roles so downstream
+        # activities auto-resolve assignees from each role's endpoint/default. Without this the
+        # instance role_bindings stay empty and next-activity assignees are left blank (or would
+        # require an LLM role-binding call).
+        if not role_bindings:
+            derived = []
+            for role in (getattr(process_definition, "roles", None) or []):
+                endpoint = getattr(role, "endpoint", None) or getattr(role, "default", None)
+                if getattr(role, "name", None) and endpoint:
+                    derived.append({"name": role.name, "endpoint": endpoint, "default": endpoint})
+            if derived:
+                role_bindings = derived
+
         participants = []
         if isinstance(role_bindings, list) and len(role_bindings) > 0:
             for role_binding in role_bindings:
@@ -77,7 +98,11 @@ async def create_process_instance(process_definition, process_instance_id, is_in
                     participants.append(role_binding.get('endpoint'))
         
         
-        process_definition_id = process_definition.processDefinitionId
+        # 요청받은 정의 id를 신뢰한다 — definition JSON 내부 processDefinitionId는 복사본에
+        # 원본 id가 남는 식으로 오염될 수 있고, 그 경우 인스턴스가 다른 정의 소속으로 생성되어
+        # 이후 모든 태스크가 원본 정의로 진행된다.
+        if not process_definition_id:
+            process_definition_id = process_definition.processDefinitionId
         process_instance_data = {
             "proc_inst_id": process_instance_id,
             "proc_inst_name": process_definition.processDefinitionName,
@@ -90,6 +115,11 @@ async def create_process_instance(process_definition, process_instance_id, is_in
             "version_tag": getattr(process_definition, 'version_tag', None),
             "version": getattr(process_definition, 'version', None),
         }
+        # 다중 시작 정의에서 선택된 시작 이벤트 기록 — polling placeholder 생성·실행 이력 조회 근거 (specs/010 FR-004)
+        if start_event_id:
+            process_instance_data["variables_data"] = [
+                {"key": "__start_event_id", "name": "시작 이벤트", "value": start_event_id}
+            ]
         insert_process_instance(process_instance_data)
     except Exception as e:
         print(traceback.format_exc())
@@ -163,10 +193,17 @@ async def submit_workitem(input: dict):
                 print(f"[SUBMIT][{trace_id}] warn: failed to reload definition after task_id override: {e}")
 
     # Resolve activity_id as early as possible (needed for matching existing todolist row)
+    start_event_id = input.get('start_event_id')
     if activity_id is None:
         if not process_definition:
             raise HTTPException(status_code=400, detail="Process definition is required to resolve initial activity")
-        activity_id = process_definition.find_initial_activity().id
+        # 다중 시작 정의: 선택된 startEvent 기준으로 초기 액티비티 결정 (specs/010 contracts/engine-start-api.md)
+        if start_event_id and not any(e.id == start_event_id for e in process_definition.find_start_events()):
+            raise HTTPException(status_code=400, detail=f"Unknown start_event_id '{start_event_id}' for definition '{process_definition_id}'")
+        initial_activity = process_definition.find_initial_activity(start_event_id)
+        if initial_activity is None:
+            raise HTTPException(status_code=400, detail="No initial activity found for the selected start event")
+        activity_id = initial_activity.id
     activity = process_definition.find_activity_by_id(activity_id) if process_definition else None
     prev_activities = process_definition.find_prev_activities(activity.id, []) if (process_definition and activity is not None) else []
 
@@ -231,8 +268,8 @@ async def submit_workitem(input: dict):
             process_definition_json = fetch_process_definition_by_version(process_definition_id, version_tag, version)
             process_definition = load_process_definition(process_definition_json) if process_definition_json else None
         if process_instance is None:
-            print(f"[SUBMIT][{trace_id}] create_process_instance proc_inst_id={process_instance_id} tenant_id={tenant_ctx}")
-            await create_process_instance(process_definition, process_instance_id, False, role_bindings, project_id)
+            print(f"[SUBMIT][{trace_id}] create_process_instance proc_inst_id={process_instance_id} tenant_id={tenant_ctx} start_event_id={start_event_id}")
+            await create_process_instance(process_definition, process_instance_id, False, role_bindings, project_id, start_event_id, process_definition_id=process_definition_id)
     else:
         raise HTTPException(status_code=400, detail="Process instance id is required")
     
@@ -262,11 +299,8 @@ async def submit_workitem(input: dict):
         workitem_data['output'] = output
         workitem_data['user_id'] = user_info.get('id')
         workitem_data['username'] = user_info.get('name')
-        # duration 없는 activity 는 due_date 가 None 일 수 있다(initiate 에서 None 허용) → None.isoformat() 크래시 방지.
-        _sd = workitem_data.get('start_date')
-        _dd = workitem_data.get('due_date')
-        workitem_data['start_date'] = _sd.isoformat() if hasattr(_sd, 'isoformat') else _sd
-        workitem_data['due_date'] = _dd.isoformat() if hasattr(_dd, 'isoformat') else _dd
+        workitem_data['start_date'] = workitem_data['start_date'].isoformat()
+        workitem_data['due_date'] = workitem_data['due_date'].isoformat()
         workitem_data['retry'] = 0
         workitem_data['consumer'] = None
         workitem_data['version_tag'] = version_tag
@@ -334,6 +368,13 @@ async def submit_workitem(input: dict):
         )
     )
     upsert_workitem(workitem_data)
+
+    # 고착화(순방향 코드 생성)는 여기서 하지 않는다. 근거는 "이 액티비티가 성공적으로
+    # 끝난 적이 몇 번인가"이고 그 판정(DONE 전환)은 폴링 서비스가 내리므로, 트리거도
+    # 거기 있다(`polling_service/database.py`의 워크아이템 저장 훅). 제출 시점에 걸면
+    # 자율 완료 모드 에이전트 액티비티는 이 경로를 지나지 않아 영영 고착화되지 않고,
+    # 사람이 제출하는 폼 액티비티에서는 부수효과 이력이 없어 매번 헛돈다.
+
     return workitem_data
 
 ############# start of role binding #############
@@ -365,9 +406,8 @@ def process_role_binding(result_json: dict) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-role_binding_chain = (
-    role_binding_prompt | model | parser | process_role_binding
-)
+def role_binding_chain():
+    return role_binding_prompt | get_model() | parser | process_role_binding
 
 async def handle_role_binding(request: Request):
     try:
@@ -413,7 +453,7 @@ async def handle_role_binding(request: Request):
                 "myUuid": my_uuid
             }
 
-            result = role_binding_chain.invoke(chain_input)
+            result = role_binding_chain().invoke(chain_input)
 
         if process_definition_id and process_definition and len(role_bindings) == 0:
             role_bindings = json.loads(result).get('roleBindings')
@@ -472,7 +512,7 @@ async def initiate_workitem(input: dict):
             raise HTTPException(status_code=400, detail="No default user email found")
         
     process_instance_id = f"{process_definition_id.lower()}.{str(uuid.uuid4())}"
-    await create_process_instance(process_definition, process_instance_id, True, [{"name": activity.role, "endpoint": user_email}])
+    await create_process_instance(process_definition, process_instance_id, True, [{"name": activity.role, "endpoint": user_email}], process_definition_id=process_definition_id)
 
     now = datetime.now(pytz.timezone('Asia/Seoul'))
     start_date = now.isoformat()
@@ -500,9 +540,7 @@ async def initiate_workitem(input: dict):
         "due_date": due_date,
         "status": 'TODO',
         "assignees": None,
-        # prev_activities 가 ProcessActivity 객체 리스트일 수 있어 그대로 두면 JSON 직렬화 실패
-        # ("Object of type ProcessActivity is not JSON serializable") → id 문자열로 정규화.
-        "reference_ids": [getattr(a, 'id', a) for a in (prev_activities or [])],
+        "reference_ids": prev_activities,
         "duration": activity.duration,
         "tool": activity.tool,
         "output": None,
@@ -553,9 +591,8 @@ result should be in this JSON format:
 """
 )
 
-feedback_chain = (
-    feedback_prompt | model | parser
-)
+def feedback_chain():
+    return feedback_prompt | get_model() | parser
 
 async def handle_get_feedback(request: Request):
     try:
@@ -587,13 +624,13 @@ async def handle_get_feedback(request: Request):
             arcv_id,
         )
         process_definition = load_process_definition(process_definition_json)
-        
+
         chain_input = {
             "process_definition": process_definition,
             "activity_id": activity_id,
             "activity_result": workitem
         }
-        result = feedback_chain.invoke(chain_input)
+        result = feedback_chain().invoke(chain_input)
         feedback = result.get('feedback')
         return feedback
 
@@ -602,31 +639,105 @@ async def handle_get_feedback(request: Request):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 diff_prompt = PromptTemplate.from_template("""
-Please analyze the full process definition and feedback to produce an updated version of the process definition.
+Please analyze the activity and feedback to provide a detailed comparison of the modifiable properties.
 
-Process Definition (raw JSON, schema: processDefinitionName/processDefinitionId/description/isHorizontal/data/roles/elements/subProcesses,
-where each item in `elements` is discriminated by `elementType`: "Event", "Sequence", "Activity", or "Gateway"): {process_definition_json}
+Activities: {activities}
+Gateways: {gateways}
+Sequences: {sequences}
 Feedback: {feedback}
 Feedback Result: {feedback_result}
 
-Apply the feedback to the process definition as a whole - the feedback may imply changes to a single activity,
-or to multiple activities, roles, data, gateways, or sequences across the process. Only change what the feedback
-implies; leave everything else exactly as given.
+IMPORTANT RULES FOR conditionExamples:
+- The sequenceId must be a sequence where the target is one of the activities (from the Activities list)
+- The source can be a gateway (from the Gateways list) or an activity (from the Activities list)
+- Do NOT use sequences where:
+  * The target is an endEvent
+  * The target is not an activity
 
-Preserve the exact JSON schema of the input (same top-level keys, same `elements` shape with `elementType`,
-same `subProcesses`/`children` structure). Do not add, rename, or remove keys beyond what feedback requires.
+Based on the feedback, provide the before and after values for the following modifiable properties:
+- inputData: Data fields that the activity receives as input
+- checkpoints: Verification points that need to be completed
+- description: Description of what the activity does
+- instruction: Instructions for completing the activity
+- conditionExamples: Condition examples of the sequence that connects to an activity (as target). The sequenceId must be from the Sequences list where the target is an activity ID. The source can be a gateway ID or an activity ID.
 
 Output format (must be wrapped in ```json and ``` markers. Do not include any other text):
 {{
-    "jsonModel": <the full process definition JSON, in the same schema as the input, with feedback applied>,
+    "modifications": {{
+        "inputData": {{
+            "before": [
+                {{
+                    "key": "input data field key",
+                    "name": "input data field name (Korean)"
+                }}
+            ],
+            "after": [
+                {{
+                    "key": "input data field key",
+                    "name": "input data field name (Korean)"
+                }}
+            ],
+            "changed": true/false
+        }},
+        "checkpoints": {{
+            "before": ["original checkpoints"],
+            "after": ["modified checkpoints"],
+            "changed": true/false
+        }},
+        "description": {{
+            "before": "original description",
+            "after": "modified description",
+            "changed": true/false
+        }},
+        "instruction": {{
+            "before": "original instruction",
+            "after": "modified instruction",
+            "changed": true/false
+        }},
+        "conditionExamples": {{
+            "sequenceId": "sequence id where target is an activity (source can be a gateway or activity, but target must be an activity, NOT endEvent)",
+            "before": {{
+                "good_example": [
+                    {{
+                        "given": "original given value in the sequence condition good_example",
+                        "when": "original when value in the sequence condition good_example",
+                        "then": "original then value in the sequence condition good_example"
+                    }}
+                ],
+                "bad_example": [
+                    {{
+                        "given": "original given value in the sequence condition bad_example",
+                        "when": "original when value in the sequence condition bad_example",
+                        "then": "original then value in the sequence condition bad_example"
+                    }}
+                ]
+            }},
+            "after": {{
+                "good_example": [
+                    {{
+                        "given": "modified given value in the sequence condition good_example",
+                        "when": "modified when value in the sequence condition good_example",
+                        "then": "modified then value in the sequence condition good_example"
+                    }}
+                ],
+                "bad_example": [
+                    {{
+                        "given": "modified given value in the sequence condition bad_example",
+                        "when": "modified when value in the sequence condition bad_example",
+                        "then": "modified then value in the sequence condition bad_example"
+                    }}
+                ]
+            }},
+            "changed": true/false
+        }}
+    }},
     "summary": "Brief summary of the key changes made based on feedback"
 }}
 """
 )
 
-diff_chain = (
-    diff_prompt | model | parser
-)
+def diff_chain():
+    return diff_prompt | get_model() | parser
 
 
 async def handle_get_feedback_diff(request: Request):
@@ -662,14 +773,35 @@ async def handle_get_feedback_diff(request: Request):
         if activity is None:
             raise HTTPException(status_code=400, detail="No activity found")
 
-        raw_process_definition_json = convert_definition_to_raw_json(process_definition)
+        activities = [ activity.model_dump() ]
+        gateways = []
+        sequences = []
+        next_item = process_definition.find_next_item(activity_id)
+        if 'Task' not in next_item.type:
+            gateways.append(next_item.model_dump())
+            # 게이트웨이를 소스로 하는 시퀀스 중에서 액티비티를 타겟으로 하는 시퀀스만 필터링
+            gateway_sequences = process_definition.find_sequences(next_item.id, None)
+            for seq in gateway_sequences:
+                # 타겟이 액티비티인 시퀀스만 포함
+                if process_definition.find_activity_by_id(seq.target):
+                    sequences.append(seq.model_dump())
+        else:
+            activities.append(next_item.model_dump())
+        # 액티비티를 소스로 하는 시퀀스 중에서도 타겟이 액티비티인 시퀀스 포함
+        activity_sequences = process_definition.find_sequences(activity_id, None)
+        for seq in activity_sequences:
+            # 타겟이 액티비티인 시퀀스만 포함 (종료 이벤트 등은 제외)
+            if process_definition.find_activity_by_id(seq.target):
+                sequences.append(seq.model_dump())
 
         chain_input = {
-            "process_definition_json": json.dumps(raw_process_definition_json, ensure_ascii=False),
+            "activities": activities,
+            "gateways": gateways,
+            "sequences": sequences,
             "feedback": workitem.temp_feedback,
             "feedback_result": workitem.log
         }
-        result = diff_chain.invoke(chain_input)
+        result = diff_chain().invoke(chain_input)
         return result
 
     except Exception as e:
@@ -857,6 +989,35 @@ async def handle_rework_complete(request: Request):
             new_workitem = await create_new_workitem(workitem, status)
             db_result = upsert_workitem(new_workitem)
             await generate_compensation(workitem, new_workitem)
+
+            # 재작업 1회는 대개 입력이 틀린 경우이므로 고착화된 코드를 그대로 두고
+            # 되돌린 뒤 새 파라미터로 재실행한다. 그런데도 다시 재작업되면 코드
+            # 자체를 의심해 비활성화하고 이후 실행을 에이전트에게 되돌린다.
+            #
+            # 세는 것은 재작업 횟수가 아니라 **코드가 실제로 돈 회차**다. 되돌리기가
+            # 실패해 재작업이 통째로 에이전트에게 넘어간 회차까지 세면, 코드는 한 번도
+            # 의심받을 짓을 하지 않았는데 비활성화된다 — 그러면 그 액티비티는 새
+            # 인스턴스까지 전부 에이전트가 맡게 되고, 다시 굳으려면 표본 3건을 새로
+            # 쌓아야 한다.
+            code_runs = count_reworked_code_runs(
+                workitem.proc_inst_id, workitem.activity_id, workitem.tenant_id
+            )
+            next_rework_count = int(new_workitem.get('rework_count') or 0)
+            if code_runs >= REWORK_DISTRUST_THRESHOLD:
+                removed = deactivate_mcp_python_code(
+                    workitem.proc_def_id, workitem.activity_id, workitem.tenant_id, 'rework'
+                )
+                if removed:
+                    print(
+                        f"[INFO] Deterministic code deactivated for activity={workitem.activity_id} "
+                        f"(코드 실행 회차={code_runs}, rework_count={next_rework_count})"
+                    )
+            else:
+                print(
+                    f"[INFO] Deterministic code kept for activity={workitem.activity_id} "
+                    f"(코드 실행 회차={code_runs} < {REWORK_DISTRUST_THRESHOLD}, "
+                    f"rework_count={next_rework_count})"
+                )
             if db_result and hasattr(db_result, 'data') and db_result.data:
                 new_workitem_id = db_result.data[0].get('id')
                 result[new_workitem_id] = db_result.data[0]
