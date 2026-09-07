@@ -102,12 +102,68 @@ class ProcessDefinition(BaseModel):
     subProcesses: Optional[List[SubProcess]] = []
     sequences: Optional[List[ProcessSequence]] = []
     gateways: Optional[List[ProcessGateway]] = []
+    participants: Optional[Any] = None  # BPMN participant(Pool) 원본 — 단일 객체 또는 배열로 저장됨
     version_tag: Optional[str] = None
     version: Optional[str] = None
 
+    def _participants_as_list(self) -> List[dict]:
+        if isinstance(self.participants, dict):
+            return [self.participants]
+        if isinstance(self.participants, list):
+            return [p for p in self.participants if isinstance(p, dict)]
+        return []
+
+    def non_executable_process_ids(self) -> set:
+        """비실행형 Pool(외부 시스템 참여자)이 참조하는 process id 집합.
+
+        프론트(ParticipantPanel)는 serviceURL이 설정된 Pool의 process를
+        isExecutable=false로 두지만 그 플래그는 XML에만 있고 정의 JSON에는
+        저장되지 않으므로, participants의 uengine 확장 속성(serviceURL 유무)으로 판별한다.
+        """
+        ids = set()
+        for participant in self._participants_as_list():
+            process_ref = participant.get("processRef")
+            if not process_ref:
+                continue
+            extension = participant.get("bpmn:extensionElements")
+            properties = extension.get("uengine:properties") if isinstance(extension, dict) else None
+            raw = properties.get("uengine:json") if isinstance(properties, dict) else None
+            parsed = raw if isinstance(raw, dict) else {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    loaded = json.loads(raw)
+                    if isinstance(loaded, dict):
+                        parsed = loaded
+                except Exception:
+                    parsed = {}
+            if str(parsed.get("serviceURL") or "").strip():
+                ids.add(process_ref)
+        return ids
+
+    def find_start_events(self) -> List[ProcessGateway]:
+        """정의 내 실행형 Pool의 startEvent를 선언 순서대로 반환한다(다중 시작 지원, specs/010).
+
+        비실행형 Pool의 startEvent가 먼저 선언돼 있으면 인스턴스가 그 Pool에서
+        시작되는 문제가 있어 시작 후보에서 제외한다. 전부 걸러지는 정의는
+        방어적으로 기존 동작(전체 반환)을 유지한다.
+        """
+        start_events = [
+            g for g in (self.gateways or [])
+            if str(getattr(g, "type", "") or "").lower() == "startevent"
+        ]
+        non_executable = self.non_executable_process_ids()
+        if non_executable:
+            executable_events = [
+                event for event in start_events
+                if getattr(event, "process", None) not in non_executable
+            ]
+            if executable_events:
+                return executable_events
+        return start_events
+
     def is_starting_activity(self, activity_id: str) -> bool:
         """
-        Check if the given activity is the starting activity by verifying there's no previous activity.
+        Check if the given activity is a starting activity (directly follows a start node).
 
         Args:
             activity_id (str): The ID of the activity to check.
@@ -115,12 +171,15 @@ class ProcessDefinition(BaseModel):
         Returns:
             bool: True if it's the starting activity, False otherwise.
         """
-        start_event_id = self.find_start_event_id()
-        if not start_event_id:
+        start_ids = {event.id for event in self.find_start_events() if event.id}
+        graph_start_id = self.find_start_event_id()
+        if graph_start_id:
+            start_ids.add(graph_start_id)
+        if not start_ids:
             return False
 
         for sequence in self.sequences:
-            if sequence.source == start_event_id and sequence.target == activity_id:
+            if sequence.source in start_ids and sequence.target == activity_id:
                 return True
         return False
 
@@ -147,9 +206,22 @@ class ProcessDefinition(BaseModel):
             if seq.source and seq.source not in targets and seq.source not in candidates:
                 candidates.append(seq.source)
 
+        # 비실행형 Pool(serviceURL 참여자) 소속 노드는 시작 후보에서 제외한다.
+        # 전부 걸러지면 방어적으로 기존 후보를 유지한다.
+        non_executable = self.non_executable_process_ids()
+        if non_executable and candidates:
+            executable_candidates = []
+            for cid in candidates:
+                node = self.find_gateway_by_id(cid)
+                owner = getattr(node, "process", None) if node else None
+                if owner not in non_executable:
+                    executable_candidates.append(cid)
+            if executable_candidates:
+                candidates = executable_candidates
+
         if not candidates:
-            node = next((g for g in self.gateways if str(getattr(g, "type", "")) == "startEvent"), None)
-            return node.id if node else None
+            start_events = self.find_start_events()
+            return start_events[0].id if start_events else None
 
         sub_process_ids = {sp.id for sp in (getattr(self, "subProcesses", None) or [])}
         if sub_process_ids:
@@ -165,14 +237,19 @@ class ProcessDefinition(BaseModel):
         typed = next((cid for cid in candidates if self._is_start_typed_node(cid)), None)
         return typed or candidates[0]
 
-    def find_initial_activity(self) -> Optional[ProcessActivity]:
+    def find_initial_activity(self, start_event_id: Optional[str] = None) -> Optional[ProcessActivity]:
         """
         프로세스에서 가장 먼저 실행해야 할 액티비티를 반환한다.
 
         시작 지점에서 연결을 따라가며 처음 만나는 액티비티를 찾으므로,
         시작 직후에 게이트웨이가 오는 정의도 올바르게 처리된다.
+
+        Args:
+            start_event_id: 다중 시작 정의에서 시작할 startEvent id.
+                미지정 시 그래프 구조로 판별한 시작 지점 기준(기존 동작 유지).
         """
-        start_event_id = self.find_start_event_id()
+        if not start_event_id:
+            start_event_id = self.find_start_event_id()
 
         visited: set = set()
         queue: List[str] = [start_event_id] if start_event_id else []
