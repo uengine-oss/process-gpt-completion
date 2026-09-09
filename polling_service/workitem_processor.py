@@ -1700,31 +1700,55 @@ def _register_event(process_instance: ProcessInstance, process_result: ProcessRe
         
         # Find intermediate events in current process state
         events = []
-        
-        # Check current activity IDs for intermediate events
-        if process_result.nextActivities:
-            for activity in process_result.nextActivities:
-                # Check if activity is an intermediate event (gateway with event type)
-                gateway = process_definition.find_gateway_by_id(activity.nextActivityId)
-                if gateway:
-                    events.append({
-                        'event_id': gateway.id,
-                        'event_name': gateway.name,
-                        'event_type': gateway.type,
-                        'condition': gateway.condition,
-                        'expression': activity.expression,
-                        'process_id': process_instance.proc_inst_id,
-                        'properties': gateway.properties
-                    })
-                    print(f"[DEBUG] Found intermediate event: {gateway.id} of type {gateway.type}")
-        
+        seen_ids: set = set()
+
+        # 후보는 두 곳에서 모은다.
+        #  - process_result: execute_next_activity 진입 시점에 만든 pydantic 객체
+        #  - process_result_json: _process_next_activities 가 게이트웨이를 확장하며 갈아끼운 최신 목록
+        # 둘 중 하나만 보면 타이머가 조용히 등록되지 않는다(파킹된 워크아이템은 만들어지는데
+        # 크론은 없어서 인스턴스가 영구 정지한다).
+        candidates: list[tuple[str, Any]] = []
+        for activity in (process_result.nextActivities or []):
+            nid = getattr(activity, "nextActivityId", None)
+            if nid:
+                candidates.append((nid, getattr(activity, "expression", None)))
+        for activity in (process_result_json.get("nextActivities") or []):
+            if isinstance(activity, dict):
+                nid, expr = activity.get("nextActivityId"), activity.get("expression")
+            else:
+                nid, expr = getattr(activity, "nextActivityId", None), getattr(activity, "expression", None)
+            if nid:
+                candidates.append((nid, expr))
+
+        for next_activity_id, expression in candidates:
+            if next_activity_id in seen_ids:
+                continue
+            gateway = process_definition.find_gateway_by_id(next_activity_id)
+            # find_gateway_by_id 는 평범한 게이트웨이도 잡는다. 이벤트가 아닌 노드에
+            # 크론을 걸면 안 되므로 이벤트 타입일 때만 등록 대상으로 삼는다.
+            if not gateway or not _is_intermediate_event(gateway):
+                continue
+            seen_ids.add(next_activity_id)
+            events.append({
+                'event_id': gateway.id,
+                'event_name': gateway.name,
+                'event_type': gateway.type,
+                'condition': gateway.condition,
+                'expression': expression,
+                'due_date': _next_activity_due_date(process_result, process_result_json, next_activity_id),
+                'process_id': process_instance.proc_inst_id,
+                'properties': gateway.properties
+            })
+            print(f"[DEBUG] Found intermediate event: {gateway.id} of type {gateway.type}")
+
         # Register events if found
         if events:
             for event in events:
                 _register_single_event(process_instance, event, process_result_json)
                 print(f"[INFO] Registered intermediate event: {event['event_id']}")
         else:
-            print(f"[DEBUG] No intermediate events found for process instance: {process_instance.proc_inst_id}")
+            print(f"[DEBUG] No intermediate events found for process instance: "
+                  f"{process_instance.proc_inst_id} (candidates={[c[0] for c in candidates]})")
             
     except Exception as e:
         print(f"[ERROR] Failed to register events for process instance {process_instance.proc_inst_id}: {str(e)}")
@@ -1769,15 +1793,83 @@ def _register_single_event(process_instance: ProcessInstance, event: dict, proce
     # else:
     #     _register_generic_event(process_instance, event)
     
+def _next_activity_due_date(process_result: ProcessResult, process_result_json: dict, activity_id: str):
+    """다음 액티비티 payload 에 실린 dueDate 를 찾는다."""
+    for activity in (process_result_json.get("nextActivities") or []):
+        if isinstance(activity, dict):
+            if activity.get("nextActivityId") == activity_id and activity.get("dueDate"):
+                return activity.get("dueDate")
+    for activity in (process_result.nextActivities or []):
+        if getattr(activity, "nextActivityId", None) == activity_id and getattr(activity, "dueDate", None):
+            return getattr(activity, "dueDate")
+    return None
+
+
+DEFAULT_TIMER_HOUR = int(os.getenv("TIMER_DEFAULT_HOUR", "9"))
+
+
+def _due_date_to_cron(due_date: str) -> Optional[str]:
+    """'YYYY-MM-DD' 또는 'YYYY-MM-DDTHH:MM' 을 7필드 Quartz cron 으로 바꾼다.
+
+    타이머 표현식을 정하는 LLM 은 시각 정보가 없다고 판단하면 expression 대신
+    dueDate 로 답한다(프롬프트가 그렇게 허용한다). 그런데 그동안 dueDate 를 쓰는
+    쪽이 없어서, 그렇게 답한 타이머는 크론이 등록되지 않고 인스턴스가 영구 정지했다.
+    날짜만 온 경우 TIMER_DEFAULT_HOUR(기본 09시)로 채운다.
+    """
+    if not isinstance(due_date, str) or not due_date.strip():
+        return None
+    try:
+        text = due_date.strip().replace("Z", "")
+        date_part, _, time_part = text.partition("T")
+        year, month, day = (int(x) for x in date_part.split("-")[:3])
+        hour, minute = DEFAULT_TIMER_HOUR, 0
+        if time_part:
+            pieces = time_part.split(":")
+            hour = int(pieces[0])
+            if len(pieces) > 1:
+                minute = int(pieces[1])
+        return f"0 {minute} {hour} {day} {month} ? {year}"
+    except Exception as e:
+        print(f"[WARN] Failed to convert dueDate '{due_date}' to cron: {e}")
+        return None
+
+
+def _resolve_timer_expression(event: dict) -> Optional[str]:
+    """타이머 cron 식을 정한다: expression → properties.expression → condition → dueDate."""
+    expression = event.get('expression')
+    if isinstance(expression, str) and expression.strip():
+        return expression.strip()
+
+    properties = event.get('properties')
+    if isinstance(properties, str):
+        try:
+            properties = json.loads(properties)
+        except Exception:
+            properties = None
+    if isinstance(properties, dict):
+        prop_expr = properties.get('expression')
+        if isinstance(prop_expr, str) and prop_expr.strip():
+            return prop_expr.strip()
+
+    condition = event.get('condition')
+    if isinstance(condition, dict):
+        cond_expr = condition.get('expression') or condition.get('cron')
+        if isinstance(cond_expr, str) and cond_expr.strip():
+            return cond_expr.strip()
+
+    return _due_date_to_cron(event.get('due_date'))
+
+
 def _register_timer_event(process_instance: ProcessInstance, event: dict):
     """Register a timer intermediate event"""
     print(f"[INFO] Registering timer intermediate event: {event['event_id']}")
-    if not event.get('expression'):
-        print(f"[WARN] Timer event has no expression: event_id={event.get('event_id')}")
+    cron_expr = _resolve_timer_expression(event)
+    if not cron_expr:
+        print(f"[WARN] Timer event has no expression: event_id={event.get('event_id')} "
+              f"due_date={event.get('due_date')} properties={event.get('properties')}")
         return None
 
     job_name = f"{event['process_id']}_{event['event_id']}"
-    cron_expr = event['expression']
     next_workitem = fetch_workitem_by_proc_inst_and_activity(
         event['process_id'],
         event['event_id'],
