@@ -11,11 +11,28 @@
 
 from __future__ import annotations
 
+import importlib.util
+import pathlib
 from types import SimpleNamespace
 
 import pytest
 
-import workitem_processor as wp
+
+def _load_module():
+    """workitem_processor 를 무거운 의존성(langchain·LLM 키 등) 없이 읽어들인다.
+
+    평범하게 import 하면 모듈 로드 시점에 LLM 이 만들어져 CI 에서 API 키가 없다고
+    죽는다. 이웃 유닛 테스트가 쓰는 스텁 로더를 그대로 재사용한다.
+    """
+    helper_path = pathlib.Path(__file__).with_name("test_workitem_processor_unit.py")
+    spec = importlib.util.spec_from_file_location("_wp_test_helpers", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(helpers)
+    return helpers._load_workitem_processor_module()
+
+
+wp = _load_module()
 
 
 class _Definition:
