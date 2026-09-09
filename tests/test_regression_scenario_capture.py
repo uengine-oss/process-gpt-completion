@@ -30,6 +30,25 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+class _NullModel:
+    """LLM 자리를 채우는 빈 모델. 이 테스트는 라우팅 기록만 보므로 호출되지 않는다."""
+
+    async def astream(self, *_args, **_kwargs):
+        return
+        yield  # pragma: no cover - async generator 로 만들기 위한 구문
+
+    def invoke(self, *_args, **_kwargs):
+        return types.SimpleNamespace(content="")
+
+
+class _NullEmbeddings:
+    def embed_documents(self, texts):
+        return [[0.0] * 4 for _ in texts]
+
+    def embed_query(self, _text):
+        return [0.0] * 4
+
+
 def _shadowed_module_names() -> tuple[str, ...]:
     """저장소 루트와 `polling_service/` 양쪽에 같은 이름으로 존재하는 모듈들.
 
@@ -63,6 +82,13 @@ def wiproc():
 
     shadowed = _shadowed_module_names() + ("workitem_processor",)
     saved = {name: sys.modules.pop(name) for name in shadowed if name in sys.modules}
+
+    # workitem_processor 는 로드 시점에 `model = create_llm(...)` 을 실행한다.
+    # 실제 LLM 을 만들 이유가 없고, 키가 없는 CI 에서는 그대로 죽는다.
+    llm_stub = types.ModuleType("llm_factory")
+    llm_stub.create_llm = lambda *a, **k: _NullModel()
+    llm_stub.create_embedding = lambda *a, **k: _NullEmbeddings()
+    sys.modules["llm_factory"] = llm_stub
 
     injected = "supabase_config" not in sys.modules
     if injected:
