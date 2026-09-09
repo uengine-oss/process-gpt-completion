@@ -30,15 +30,40 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _shadowed_module_names() -> tuple[str, ...]:
+    """저장소 루트와 `polling_service/` 양쪽에 같은 이름으로 존재하는 모듈들.
+
+    두 곳의 `database.py` 는 내용이 다르다(폴링 서비스 쪽에만 있는 함수가 있다).
+    어느 쪽이 잡히느냐가 import 순서에 달려 있어, 이름을 손으로 나열하면 새 모듈이
+    생길 때마다 조용히 어긋난다. 파일 목록에서 그때그때 구한다.
+    """
+    polling = REPO_ROOT / "polling_service"
+    return tuple(
+        path.stem
+        for path in polling.glob("*.py")
+        if path.stem != "__init__" and (REPO_ROOT / path.name).exists()
+    )
+
+
 @pytest.fixture(scope="module")
 def wiproc():
     """폴링 서비스의 workitem_processor.
 
     폴링 서비스는 `polling_service/` 를 루트로 도는 별도 프로세스라, 저장소 루트 기준으로
     import 하면 같은 이름의 다른 `database` 모듈이 잡힌다. 실행 때와 같은 경로로 맞춘다.
+
+    sys.path 를 앞에 꽂는 것만으로는 부족하다. 앞선 테스트가 이미 루트 쪽 `database` 를
+    import 해 두면 sys.modules 캐시가 이겨서, 폴링 서비스의 workitem_processor 가
+    루트 `database` 를 잡고 `fetch_ui_definitions_by_def_id` 가 없다며 ImportError 로
+    죽는다(루트 테스트를 통째로 돌리는 CI 에서만 재현됐다). 그래서 겹치는 이름들을
+    잠시 캐시에서 들어내고 import 한 뒤 원래 것으로 되돌린다.
     """
     added = str(REPO_ROOT / "polling_service")
     sys.path.insert(0, added)
+
+    shadowed = _shadowed_module_names() + ("workitem_processor",)
+    saved = {name: sys.modules.pop(name) for name in shadowed if name in sys.modules}
+
     injected = "supabase_config" not in sys.modules
     if injected:
         stub = types.ModuleType("supabase_config")
@@ -50,10 +75,13 @@ def wiproc():
 
         yield workitem_processor
     finally:
-        # 같은 이름의 모듈이 저장소 루트에도 있어, 경로를 남겨 두면 뒤따르는 테스트가
-        # 엉뚱한 `database` 를 잡는다.
+        # 같은 이름의 모듈이 저장소 루트에도 있어, 경로나 캐시를 남겨 두면 뒤따르는
+        # 테스트가 엉뚱한 `database` 를 잡는다.
         if added in sys.path:
             sys.path.remove(added)
+        for name in shadowed:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
         if injected:
             sys.modules.pop("supabase_config", None)
 
