@@ -299,8 +299,12 @@ async def submit_workitem(input: dict):
         workitem_data['output'] = output
         workitem_data['user_id'] = user_info.get('id')
         workitem_data['username'] = user_info.get('name')
-        workitem_data['start_date'] = workitem_data['start_date'].isoformat()
-        workitem_data['due_date'] = workitem_data['due_date'].isoformat()
+        # 액티비티에 duration 이 없으면 워크아이템 생성 시 due_date 가 비어 있다. 그대로
+        # isoformat() 을 부르면 제출이 500 으로 죽고, 그 프로세스는 실행도 검증도 할 수 없다
+        # (생성된 정의에 duration 이 빠지는 일이 실제로 있다). 비어 있으면 비운 채 둔다.
+        for _key in ('start_date', 'due_date'):
+            _value = workitem_data.get(_key)
+            workitem_data[_key] = _value.isoformat() if _value is not None else None
         workitem_data['retry'] = 0
         workitem_data['consumer'] = None
         workitem_data['version_tag'] = version_tag

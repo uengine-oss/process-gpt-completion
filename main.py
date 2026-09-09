@@ -18,16 +18,13 @@ from process_db_manager import add_routes_to_app as add_db_manager_routes_to_app
 from database import update_tenant_id
 # notification_polling_task는 FCM 서비스로 분리됨
 from mcp_config_api import add_routes_to_app as add_mcp_routes_to_app
-from sql_import_api import add_routes_to_app as add_sql_import_routes_to_app
-from db_backup_api import add_routes_to_app as add_db_backup_routes_to_app
-from bpmn_git_export import add_routes_to_app as add_bpmn_git_export_routes_to_app
 from agent_chat import add_routes_to_app as add_agent_chat_routes_to_app
 from callbot_api import add_routes_to_app as add_callbot_routes_to_app
 from test_mode import add_routes_to_app as add_test_mode_routes_to_app
 from process_start_api import add_routes_to_app as add_process_start_routes_to_app
 from audio_transcribe import add_routes_to_app as add_audio_routes_to_app
 from validate_improve import add_routes_to_app as add_validate_improve_routes_to_app
-from mock_api import add_routes_to_app as add_mock_routes_to_app
+from regression.api import add_routes_to_app as add_regression_routes_to_app
 
 if os.getenv("ENV") != "production":
     # 캐시 적용
@@ -136,9 +133,12 @@ def _register_optional_route_module(app: FastAPI, module_name: str) -> None:
 
 add_db_manager_routes_to_app(app)
 add_mcp_routes_to_app(app)
-add_sql_import_routes_to_app(app)
-add_db_backup_routes_to_app(app)
-add_bpmn_git_export_routes_to_app(app)
+# 아래 세 모듈은 저장소에 파일이 없다(main.py 는 이들을 import 하도록 커밋됐지만
+# 모듈 자체는 어느 브랜치에도 push 되지 않았다). 하드 import 는 서버 기동 자체를 막으므로
+# 저장소가 이미 쓰는 선택적 등록 방식으로 바꾼다 — 파일이 돌아오면 그대로 다시 붙는다.
+_register_optional_route_module(app, "sql_import_api")
+_register_optional_route_module(app, "db_backup_api")
+_register_optional_route_module(app, "bpmn_git_export")
 _register_optional_route_module(app, "process_chat")
 
 if ENABLE_LANGCHAIN_ROUTES:
@@ -174,33 +174,62 @@ add_agent_chat_routes_to_app(app)
 add_callbot_routes_to_app(app)
 add_test_mode_routes_to_app(app)
 add_validate_improve_routes_to_app(app)
+add_regression_routes_to_app(app)
 add_process_start_routes_to_app(app)
-add_mock_routes_to_app(app)
+_register_optional_route_module(app, "mock_api")
 # 음성 입력(/completion/upload). 화면은 예전부터 이 경로를 불렀는데 서버에 없었다.
 add_audio_routes_to_app(app)
 
 import asyncio
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+# apscheduler 는 이 저장소의 의존성 목록에 없다(스케줄러를 들여온 커밋이 함께 올리지
+# 않았다). 없으면 예약 잡만 끄고 나머지 서버는 정상 기동한다.
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+    SCHEDULER_AVAILABLE = True
+except ImportError as _sched_exc:
+    print(f"[startup] Scheduler disabled: {_sched_exc}")
+    SCHEDULER_AVAILABLE = False
+
 from pytz import timezone as pytz_timezone
 
-from db_backup_api import run_scheduled_db_backup
-from bpmn_git_export import is_bpmn_git_export_enabled, run_scheduled_bpmn_git_export
-from governance_notification_service import run_outbox_processor
+# 스케줄러가 부르는 세 모듈도 저장소에 파일이 없다. 없으면 해당 잡만 끄고 나머지 서버는
+# 정상 기동한다 — 백업·내보내기·알림이 없다고 프로세스 실행까지 막을 이유가 없다.
+def _optional(module_name: str, *attrs):
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:
+        print(f"[startup] Skipping scheduled jobs from {module_name}: {exc}")
+        return (None,) * len(attrs)
+    return tuple(getattr(module, a, None) for a in attrs)
+
+
+(run_scheduled_db_backup,) = _optional("db_backup_api", "run_scheduled_db_backup")
+is_bpmn_git_export_enabled, run_scheduled_bpmn_git_export = _optional(
+    "bpmn_git_export", "is_bpmn_git_export_enabled", "run_scheduled_bpmn_git_export"
+)
+(run_outbox_processor,) = _optional(
+    "governance_notification_service", "run_outbox_processor"
+)
 KST = pytz_timezone("Asia/Seoul")
 DB_BACKUP_CRON_HOUR = int(os.getenv("DB_BACKUP_CRON_HOUR", "4"))
 DB_BACKUP_CRON_MINUTE = int(os.getenv("DB_BACKUP_CRON_MINUTE", "0"))
 BPMN_GIT_EXPORT_CRON_HOUR = int(os.getenv("BPMN_GIT_EXPORT_CRON_HOUR", "5"))
 BPMN_GIT_EXPORT_CRON_MINUTE = int(os.getenv("BPMN_GIT_EXPORT_CRON_MINUTE", "0"))
-BPMN_GIT_EXPORT_ENABLED = is_bpmn_git_export_enabled()
+BPMN_GIT_EXPORT_ENABLED = bool(
+    SCHEDULER_AVAILABLE and is_bpmn_git_export_enabled and run_scheduled_bpmn_git_export
+    and is_bpmn_git_export_enabled()
+)
 # 거버넌스 알림: 변경 발생 시 outbox(트리거 적재) 행을 즉시 발송하는 백그라운드 프로세서 주기(초)
 GOVERNANCE_NOTIFY_INTERVAL_SECONDS = int(os.getenv("GOVERNANCE_NOTIFY_INTERVAL_SECONDS", "60"))
-GOVERNANCE_NOTIFY_ENABLED = _env_flag("GOVERNANCE_NOTIFY_ENABLED", default=True)
+GOVERNANCE_NOTIFY_ENABLED = SCHEDULER_AVAILABLE and bool(run_outbox_processor) and _env_flag(
+    "GOVERNANCE_NOTIFY_ENABLED", default=True
+)
 GOVERNANCE_NOTIFY_MAX_ITEMS = int(os.getenv("GOVERNANCE_NOTIFY_MAX_ITEMS", "100"))
 
-scheduler = AsyncIOScheduler(timezone=KST)
+scheduler = AsyncIOScheduler(timezone=KST) if SCHEDULER_AVAILABLE else None
 
 
 def _background_tenant_id() -> str:
@@ -215,12 +244,15 @@ async def _scheduled_db_backup_job():
         print(f"[scheduled-db-backup] failed: {exc}")
 
 
-scheduler.add_job(
-    _scheduled_db_backup_job,
-    trigger=CronTrigger(hour=DB_BACKUP_CRON_HOUR, minute=DB_BACKUP_CRON_MINUTE),
-    id="db-backup",
-    replace_existing=True,
-)
+DB_BACKUP_ENABLED = SCHEDULER_AVAILABLE and bool(run_scheduled_db_backup)
+
+if DB_BACKUP_ENABLED:
+    scheduler.add_job(
+        _scheduled_db_backup_job,
+        trigger=CronTrigger(hour=DB_BACKUP_CRON_HOUR, minute=DB_BACKUP_CRON_MINUTE),
+        id="db-backup",
+        replace_existing=True,
+    )
 
 
 async def _scheduled_bpmn_git_export_job():
@@ -270,10 +302,18 @@ if GOVERNANCE_NOTIFY_ENABLED:
 
 @app.on_event("startup")
 async def start_background_tasks():
+    if not SCHEDULER_AVAILABLE:
+        print("[scheduler] not started – apscheduler is not installed")
+        return
     scheduler.start()
     governance_state = (
         f"every {GOVERNANCE_NOTIFY_INTERVAL_SECONDS}s"
         if GOVERNANCE_NOTIFY_ENABLED
+        else "DISABLED"
+    )
+    db_backup_state = (
+        f"at {DB_BACKUP_CRON_HOUR:02d}:{DB_BACKUP_CRON_MINUTE:02d} KST"
+        if DB_BACKUP_ENABLED
         else "DISABLED"
     )
     bpmn_git_export_state = (
@@ -283,7 +323,7 @@ async def start_background_tasks():
     )
     print(
         f"[scheduler] started – "
-        f"db-backup at {DB_BACKUP_CRON_HOUR:02d}:{DB_BACKUP_CRON_MINUTE:02d} KST, "
+        f"db-backup {db_backup_state}, "
         f"bpmn-git-export {bpmn_git_export_state}, "
         f"governance-notify {governance_state}"
     )
@@ -291,7 +331,8 @@ async def start_background_tasks():
 
 @app.on_event("shutdown")
 async def stop_background_tasks():
-    scheduler.shutdown(wait=False)
+    if scheduler is not None:
+        scheduler.shutdown(wait=False)
 
 if __name__ == "__main__":
     import uvicorn

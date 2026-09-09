@@ -541,6 +541,9 @@ class WorkItem(BaseModel):
     version_tag: Optional[str] = None
     version: Optional[str] = None
     adhoc: Optional[bool] = None
+    # 이 워크아이템 완료 시점의 게이트웨이 분기 판정. 라우팅에 쓰인 conditionEval 을 그대로
+    # 남긴 것으로, 회귀 테스트 재생과 "왜 이 길로 갔는지" 추적에 쓴다.
+    gateway_decisions: Optional[Dict[str, Any]] = None
     
     @validator('start_date', 'end_date', 'due_date', pre=True)
     def parse_datetime(cls, value):

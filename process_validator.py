@@ -118,6 +118,7 @@ class ProcessValidator:
         tenant_id: str,
         fetch_instance_state=None,
         cleanup_instance=None,
+        fetch_gateway_decisions=None,
         max_iters: int = 5,
         actor_email: str = None,
         advance_timeout: float = 30.0,
@@ -131,6 +132,9 @@ class ProcessValidator:
         self._save = save_definition
         self._fetch_state = fetch_instance_state
         self._cleanup = cleanup_instance
+        # 워크아이템에 남은 게이트웨이 분기 판정을 읽어 오는 함수(선택).
+        # 주입되지 않으면 트레이스에 분기 판정이 비고, 회귀 재생은 그 케이스를 쓰지 않는다.
+        self._fetch_decisions = fetch_gateway_decisions
         self.engine_base_url = (engine_base_url or "").rstrip("/")
         self.tenant_id = tenant_id or "localhost"
         self.max_iters = max(1, int(max_iters or 1))
@@ -184,6 +188,10 @@ class ProcessValidator:
             "history": [],
             "trace": None,
             "final_definition": None,
+            # 회귀 테스트가 재사용할 시나리오. test_plan 은 모델이 만든 케이스 원본이고,
+            # passing_cases 는 그중 실제로 통과한 것 + 그때의 실행 경로·분기 판정이다.
+            "test_plan": None,
+            "passing_cases": [],
         }
 
         if httpx is None:
@@ -217,6 +225,10 @@ class ProcessValidator:
             84, {"proc_def_id": proc_def_id},
         )
         test_plan = await self._build_test_plan(current, forms)
+        # 이 플랜은 정의당 한 번 모델 호출로 만들어진다. 회귀 테스트는 같은 케이스를 병합
+        # 전에 다시 돌리는 일이므로, 여기서 리포트에 실어 두면 다시 만들 이유가 없어진다.
+        report["test_plan"] = test_plan
+        report["passing_cases"] = []
 
         # --- 상세 리포트: 헤더 + 테스트 시나리오 ---
         nmap0 = self._node_name_map(current)
@@ -404,6 +416,10 @@ class ProcessValidator:
                 # static 통과 + 모든 분기 케이스가 엔진 실행에서 무결.
                 report["passed"] = True
                 report["final_score"] = 0
+                # 통과한 케이스를 회귀 테스트가 쓸 수 있는 모양으로 남긴다. 여기서 남기지
+                # 않으면 이 케이스들은 리포트 문자열에만 흔적을 남기고 사라져, 병합 전
+                # 회귀 검증이 비교에 쓸 시나리오를 갖지 못한다.
+                report["passing_cases"] = self._passing_cases(case_runs)
                 self._rep("- ✅ 모든 분기 케이스 통과 — start→end 정상 실행")
                 self._rep("")
                 await self._emit(
@@ -796,6 +812,7 @@ class ProcessValidator:
 
         actual_order: list = []
         errors: list = []
+        gateway_decisions: dict = {}
         proc_inst_id = None
         reached_end = False
         last_status = "RUNNING"
@@ -856,6 +873,13 @@ class ProcessValidator:
                     #   (current_activity_ids 를 DB 에서 폴링. 다음 태스크 탐색은 폴링 서비스가 함.)
                     state = await self._wait_for_advance(proc_inst_id, aid, node_type, errors)
                     last_status = state.get("status") or last_status
+
+                    # 폴링 서비스가 이 활동을 넘기며 남긴 분기 판정을 거둔다. 실행 경로만으로는
+                    # 두 분기가 같은 활동으로 향할 때 어느 조건이 참이었는지 구분할 수 없어,
+                    # 회귀 재생이 이 기록에 의존한다. 없으면 비워 두고 넘어간다 — 회귀 쪽이
+                    # 그 케이스를 재생 대상에서 빼는 편이 추측해 채우는 것보다 안전하다.
+                    await self._collect_decisions(proc_inst_id, aid, gateway_decisions)
+
                     if str(last_status).upper() == "COMPLETED":
                         reached_end = True
                         break
@@ -877,7 +901,24 @@ class ProcessValidator:
                     except Exception as e:
                         self.log.debug(f"[VALIDATION] cleanup 실패(무시): {e}")
 
-        return self._trace_result(proc_inst_id, actual_order, reached_end, last_status, errors, step)
+        return self._trace_result(proc_inst_id, actual_order, reached_end, last_status,
+                                  errors, step, gateway_decisions)
+
+    async def _collect_decisions(self, proc_inst_id, activity_id, into: dict) -> None:
+        """워크아이템에 남은 게이트웨이 분기 판정을 트레이스에 모은다.
+
+        조회 함수가 주입되지 않았거나 실패해도 검증을 멈추지 않는다 — 이 기록은 회귀
+        테스트용 부산물이고, 생성 시 검증의 판정에는 쓰이지 않는다.
+        """
+        if self._fetch_decisions is None or not proc_inst_id:
+            return
+        try:
+            decisions = await self._fetch_decisions(proc_inst_id, activity_id)
+        except Exception as e:
+            self.log.debug(f"[VALIDATION] 분기 판정 조회 실패(무시): {e}")
+            return
+        if isinstance(decisions, dict):
+            into.update(decisions)
 
     async def _submit(self, client, base, proc_def_id, proc_inst_id, activity_id,
                       form_values, errors) -> bool:
@@ -939,7 +980,8 @@ class ProcessValidator:
         return last
 
     @staticmethod
-    def _trace_result(proc_inst_id, actual_order, reached_end, status, errors, steps) -> dict:
+    def _trace_result(proc_inst_id, actual_order, reached_end, status, errors, steps,
+                      gateway_decisions=None) -> dict:
         return {
             "proc_inst_id": proc_inst_id,
             "actual_order": actual_order,
@@ -949,6 +991,8 @@ class ProcessValidator:
             "errors": errors,
             "steps": steps,
             "no_progress": (len(actual_order) <= 1 and not reached_end),
+            # 게이트웨이별 분기 판정. 회귀 재생의 입력이 된다(비어 있을 수 있다).
+            "gateway_decisions": gateway_decisions or {},
         }
 
     @staticmethod
@@ -1214,6 +1258,39 @@ class ProcessValidator:
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _passing_cases(case_runs: list) -> list:
+        """통과한 케이스를 회귀 시나리오로 쓸 수 있는 모양으로 추린다.
+
+        기대 경로로 `expected_activity_order`(모델이 추론한 '의미상 올바른 순서')가 아니라
+        **실제로 실행된 경로**를 남긴다. 회귀 테스트가 답할 질문은 "지금 되던 게 깨지는가"
+        이므로 기준은 현재 실제 동작이어야 한다. 모델의 추론값을 기준으로 굳히면 아직 고치지
+        않은 논리 결함까지 회귀 결함으로 다시 보고된다.
+
+        결함이 하나라도 남은 케이스는 제외한다 — 결함이 있는 실행의 경로를 기준으로 삼으면
+        그 결함이 "정상 동작" 으로 굳는다.
+        """
+        cases: list = []
+        for (case, trace, cdefs) in (case_runs or []):
+            if cdefs:
+                continue
+            trace = trace or {}
+            actual = [str(a) for a in (trace.get("actual_order") or [])]
+            if not actual:
+                continue
+            cases.append({
+                "name": case.get("name"),
+                "activity_inputs": case.get("activity_inputs") or {},
+                "expected_activity_order": actual,
+                "gateway_decisions": trace.get("gateway_decisions") or {},
+                # 모델이 애초에 기대했던 순서. 실제와 다를 수 있어 참고용으로만 남긴다.
+                "proposed_activity_order": [
+                    str(x) for x in (case.get("expected_activity_order") or [])
+                ],
+                "reached_end": bool(trace.get("reached_end")),
+            })
+        return cases
+
     def _finalize_skip(self, report: dict, current: dict) -> dict:
         # 건너뛴 경우 proc_json 을 수정하지 않았으므로 final_definition 은 비워 둔다
         # (executor 가 굳이 동일 내용으로 재할당하지 않게 함).

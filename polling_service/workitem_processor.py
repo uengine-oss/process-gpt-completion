@@ -2442,6 +2442,68 @@ def _set_condition_eval(sequence_condition_data, seq_id, condition_met, reason=N
         entry["conditionReason"] = reason.strip()
 
 
+def build_gateway_decisions(process_definition: Any, sequence_condition_data: dict) -> dict:
+    """게이트웨이에서 나가는 시퀀스의 판정 결과를 게이트웨이별로 묶는다.
+
+    `_evaluate_sequence_conditions` 가 채운 conditionEval 을 그대로 읽을 뿐 새로 판정하지
+    않는다 — 같은 답을 다시 구하면 모델 호출이 두 배가 된다.
+
+    게이트웨이에서 출발하는 시퀀스가 하나도 없으면 빈 dict 를 돌려준다. 호출부는 이때
+    저장을 건너뛰어, 직선 흐름 워크아이템에 쓰기가 늘지 않게 한다.
+    """
+    decisions: dict = {}
+    if not process_definition or not isinstance(sequence_condition_data, dict):
+        return decisions
+
+    try:
+        for seq in (getattr(process_definition, "sequences", None) or []):
+            seq_id = getattr(seq, "id", None)
+            source_id = getattr(seq, "source", None)
+            if not seq_id or not source_id:
+                continue
+            if seq_id not in sequence_condition_data:
+                continue
+            if not process_definition.find_gateway_by_id(source_id):
+                continue
+
+            entry = sequence_condition_data.get(seq_id) or {}
+            if not isinstance(entry, dict):
+                continue
+            # 판정을 거치지 않은 시퀀스는 남기지 않는다. "판정 안 됨" 과 "거짓으로 판정됨" 을
+            # 섞으면 재생 시 두 경우를 구분할 수 없다.
+            if "conditionEval" not in entry:
+                continue
+
+            gateway = decisions.setdefault(source_id, {"selected": [], "sequences": {}})
+            chosen = bool(entry.get("conditionEval"))
+            gateway["sequences"][seq_id] = {
+                "target": getattr(seq, "target", None),
+                "condition": entry.get("condition") or entry.get("name"),
+                "eval": chosen,
+                "reason": entry.get("conditionReason"),
+            }
+            if chosen:
+                gateway["selected"].append(seq_id)
+    except Exception as e:
+        print(f"[WARN] build_gateway_decisions failed: {str(e)}")
+        return {}
+
+    return decisions
+
+
+def _persist_gateway_decisions(workitem: dict, process_definition: Any,
+                               sequence_condition_data: dict, tenant_id: Optional[str]) -> None:
+    """분기 판정을 워크아이템 행에 남긴다. 실패해도 프로세스 진행을 막지 않는다."""
+    try:
+        decisions = build_gateway_decisions(process_definition, sequence_condition_data)
+        if not decisions:
+            return
+        upsert_workitem({"id": workitem["id"], "gateway_decisions": decisions}, tenant_id)
+    except Exception as e:
+        # 기록용이므로 실패가 업무를 멈춰서는 안 된다.
+        print(f"[WARN] Failed to persist gateway decisions for {workitem.get('id')}: {str(e)}")
+
+
 async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions):
     ui_field_keys = collect_ui_field_keys(ui_definitions)
     all_workitem_input_data = apply_field_name_annotation_recursively(all_workitem_input_data, ui_definitions, ui_field_keys)
@@ -4648,6 +4710,10 @@ async def handle_workitem(workitem):
 
         sequence_condition_data = sequence_condition_data or {}
         await _evaluate_sequence_conditions(model, parser, process_definition, all_workitem_input_data, workitem_input_data, sequence_condition_data, ui_definitions, workitem=workitem)
+
+        # 판정 결과를 워크아이템에 남긴다. 여기서 남기지 않으면 sequence_condition_data 는
+        # 라우팅에 쓰인 뒤 사라져, 나중에 "이 갈림길에서 어느 쪽으로 갔는지" 를 알 방법이 없다.
+        _persist_gateway_decisions(workitem, process_definition, sequence_condition_data, tenant_id)
 
         attached_activities = []
         for next_activity in next_near_activities:

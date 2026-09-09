@@ -116,6 +116,34 @@ def _make_fetch_instance_state(supabase, tenant_id: str):
     return fetch_instance_state
 
 
+def _make_fetch_gateway_decisions(supabase, tenant_id: str):
+    """워크아이템에 남은 게이트웨이 분기 판정을 읽는다.
+
+    폴링 서비스가 활동을 넘길 때 `todolist.gateway_decisions` 에 남긴 값이다. 검증기는 이
+    값을 새로 계산하지 않고 읽기만 한다 — 판정은 이미 라우팅 과정에서 한 번 이뤄졌고,
+    같은 답을 다시 구하면 모델 호출이 두 배가 된다.
+    """
+    async def fetch_gateway_decisions(proc_inst_id: str, activity_id: str) -> dict:
+        def _do():
+            return (
+                supabase.table("todolist")
+                .select("gateway_decisions")
+                .eq("proc_inst_id", proc_inst_id)
+                .eq("activity_id", activity_id)
+                .eq("tenant_id", tenant_id)
+                .limit(1)
+                .execute()
+            )
+
+        resp = await asyncio.to_thread(_do)
+        rows = getattr(resp, "data", None) or []
+        if not rows:
+            return {}
+        return rows[0].get("gateway_decisions") or {}
+
+    return fetch_gateway_decisions
+
+
 async def _attribute_instances_to_user(supabase, tenant_id: str, inst_ids: list, user_uid: str) -> None:
     """검증으로 생성된 실행 인스턴스를 요청 사용자에게 귀속한다(participants 에 uid 추가).
 
@@ -224,6 +252,7 @@ async def validate_and_improve(input: dict) -> dict:
         tenant_id=tenant_id,
         fetch_instance_state=_make_fetch_instance_state(supabase, tenant_id),
         cleanup_instance=None if keep_instances else _make_cleanup_instance(supabase, tenant_id),
+        fetch_gateway_decisions=_make_fetch_gateway_decisions(supabase, tenant_id),
         max_iters=max_iters,
         actor_email=actor_email,
         logger=logger,
