@@ -41,6 +41,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -651,6 +652,25 @@ class ProcessValidator:
     # 2) 테스트 플랜 (LLM)
     # ------------------------------------------------------------------ #
     @staticmethod
+    def _case_name(raw_name, order: list, index: int) -> str:
+        """케이스 이름. 번호는 이름이 아니다.
+
+        이 이름은 리포트에서 끝나지 않는다 — 통과한 케이스는 회귀 시나리오로 승격돼
+        병합 전 검증 목록에 그대로 걸린다. 거기서는 이름과 통과/실패만 나란히 서기 때문에,
+        `1`, `2` 로는 무엇이 깨졌는지 알 수 없어 매번 케이스를 열어 봐야 한다.
+        모델이 번호를 써 보내면 그 케이스가 타는 경로로 이름을 짓는다.
+        """
+        name = str(raw_name or "").strip()
+        if name and not re.fullmatch(r"[\d\s.,\-_#()]+", name):
+            return name
+        if order:
+            path = " \u2192 ".join(str(a) for a in order)
+            if len(path) > 60:
+                path = f"{order[0]} \u2192 \u2026 \u2192 {order[-1]}"
+            return f"{path} 경로"
+        return f"케이스 {index + 1}"
+
+    @staticmethod
     def _normalize_test_plan(result) -> dict:
         """LLM 응답을 { "cases": [ {name, activity_inputs, expected_activity_order} ], ... } 로 정규화."""
         out = {"cases": [], "rationale": ""}
@@ -667,12 +687,11 @@ class ProcessValidator:
                     continue
                 ai = c.get("activity_inputs")
                 eo = c.get("expected_activity_order")
+                order = [str(x) for x in eo] if isinstance(eo, list) else []
                 out["cases"].append({
-                    "name": str(c.get("name") or f"케이스 {i + 1}"),
+                    "name": ProcessValidator._case_name(c.get("name"), order, i),
                     "activity_inputs": ai if isinstance(ai, dict) else {},
-                    "expected_activity_order": (
-                        [str(x) for x in eo] if isinstance(eo, list) else []
-                    ),
+                    "expected_activity_order": order,
                 })
         if not out["cases"]:
             out["cases"] = [{"name": "기본 경로", "activity_inputs": {},
@@ -755,7 +774,7 @@ class ProcessValidator:
             "{\n"
             '  "cases": [\n'
             '    {\n'
-            '      "name": "<이 케이스가 타는 경로 설명, 예: 심의 승인 경로>",\n'
+            '      "name": "<이 케이스가 타는 경로 설명, 예: 심의 승인 경로. 번호만 쓰지 말 것>",\n'
             '      "activity_inputs": { "<activity_id>": { "<form_field_key>": <예시값>, ... } 또는 [<1회차 객체>, <2회차 객체>], ... },\n'
             '      "expected_activity_order": ["<activity_id>", ...]\n'
             '    }\n'
@@ -763,6 +782,8 @@ class ProcessValidator:
             '  "rationale": "<케이스 구성 근거 간단히>"\n'
             "}\n\n"
             "규칙:\n"
+            "- name: 그 케이스가 무엇을 지키는지 읽히는 짧은 말로 쓴다. 통과한 케이스는 회귀 시나리오로 남아 "
+            "병합 전 검증 목록에 이름만으로 나열되므로, 번호('1', '케이스 2')를 쓰면 무엇이 깨졌는지 알 수 없다.\n"
             "- cases: 게이트웨이의 모든 분기가 최소 한 케이스에서 실행되도록 만든다. "
             "게이트웨이가 없으면 cases 는 1개.\n"
             "- activity_inputs: 각 액티비티의 form_fields 에 맞춰 현실적인 예시값. 필드 type 에 맞게. "

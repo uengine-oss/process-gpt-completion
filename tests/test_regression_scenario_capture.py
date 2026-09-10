@@ -242,3 +242,39 @@ def test_cases_without_a_path_are_not_promoted():
     trace = {"actual_order": [], "reached_end": False, "gateway_decisions": {}}
 
     assert ProcessValidator._passing_cases([(case, trace, [])]) == []
+
+
+# --------------------------------------------------------------------------- #
+# 4) 케이스 이름은 번호가 아니다
+# --------------------------------------------------------------------------- #
+def test_numbered_case_names_are_replaced_with_the_path():
+    """모델이 `1`, `2` 로 이름을 보내도 경로로 이름을 짓는다.
+
+    통과한 케이스는 회귀 시나리오로 승격돼 병합 전 검증 목록에 이름만으로 나열된다.
+    번호로는 어느 시나리오가 깨졌는지 알 수 없어 매번 케이스를 열어 봐야 한다.
+    """
+    from process_validator import ProcessValidator
+
+    plan = ProcessValidator._normalize_test_plan({
+        "cases": [
+            {"name": "1", "activity_inputs": {}, "expected_activity_order": ["apply", "review"]},
+            {"name": " 2. ", "activity_inputs": {}, "expected_activity_order": []},
+            {"name": "고액 승인 경로", "activity_inputs": {}, "expected_activity_order": ["apply", "audit"]},
+        ]
+    })
+
+    names = [c["name"] for c in plan["cases"]]
+    assert names[0] == "apply → review 경로"
+    # 경로조차 없으면 더 나은 이름을 지어낼 재료가 없다 — 그때만 번호로 남는다.
+    assert names[1] == "케이스 2"
+    assert names[2] == "고액 승인 경로"
+
+
+def test_long_paths_are_shortened_in_the_name():
+    from process_validator import ProcessValidator
+
+    order = [f"a{i}" for i in range(20)]
+    plan = ProcessValidator._normalize_test_plan({
+        "cases": [{"name": "3", "activity_inputs": {}, "expected_activity_order": order}]
+    })
+    assert plan["cases"][0]["name"] == "a0 → … → a19 경로"

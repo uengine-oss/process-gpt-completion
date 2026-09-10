@@ -30,7 +30,12 @@ logger = logging.getLogger(__name__)
 _NOT_EQUAL = ("ne", "neq")
 
 CHECK_OUTCOME_EQUALS = "outcome_equals"
+# 행 번호로 규칙을 가리키는 예전 검사. 위에 행이 하나 끼어들면 아래 행이 전부 밀려서
+# **동작이 그대로인데도 실패**로 잡힌다(제주도 조건을 3행에 끼워 넣자 4·5행이 그렇게 됐다).
 CHECK_MATCHED_RULE = "matched_rule_index"
+# 규칙의 정체(id)로 가리키는 검사. 행이 밀려도 같은 규칙이면 통과하고, 다른 규칙이
+# 대신 맞으면 결론이 우연히 같아도 잡아낸다 — 자리는 바뀌어도 규칙은 그대로이기 때문이다.
+CHECK_MATCHED_RULE_ID = "matched_rule_id"
 
 _NO_MATCH = -1
 
@@ -115,26 +120,68 @@ def _normalize(value: Any) -> Any:
     return n if n is not None else s
 
 
-def parse_decision_table(dmn_xml: str) -> dict:
-    """DMN XML 에서 입력 정의와 규칙 행을 뽑는다.
+_EMPTY_TABLE = {"decision_id": "", "name": "", "inputs": [], "rules": []}
+
+
+def parse_decision_tables(dmn_xml: str) -> list[dict]:
+    """DMN XML 의 **모든** 결정 표를 뽑는다.
+
+    하나의 DMN 에 결정이 여럿인 것이 보통이다(기본 혜택 · 추가 혜택 · 등급 업그레이드…).
+    첫 결정만 읽으면 나머지 표는 규칙이 통째로 바뀌어도 회귀 검증이 아무 말도 하지 못한다.
 
     Returns:
-        {"name", "inputs": [{item,label,mode}], "rules": [{conditions,outcome,note}]}
-        표를 찾지 못하면 rules 가 빈 목록이다.
+        [{"decision_id", "name", "inputs": [{item,label,mode}], "rules": [...]}, …]
     """
     if not dmn_xml or not dmn_xml.strip():
-        return {"name": "", "inputs": [], "rules": []}
+        return []
     try:
         root = ET.fromstring(dmn_xml)
     except ET.ParseError as e:
         logger.warning("dmn-replay: XML 파싱 실패: %s", e)
-        return {"name": "", "inputs": [], "rules": []}
+        return []
 
-    decision = _find_first(root, "decision")
-    table = _find_first(decision, "decisionTable") if decision is not None else None
-    if table is None:
-        return {"name": "", "inputs": [], "rules": []}
+    tables: list[dict] = []
+    for decision in [c for c in root if _local(c.tag) == "decision"]:
+        table = _find_first(decision, "decisionTable")
+        if table is None:
+            continue
+        parsed = _parse_table(table)
+        parsed["decision_id"] = decision.get("id") or ""
+        parsed["name"] = decision.get("name") or ""
+        tables.append(parsed)
+    return tables
 
+
+def find_decision_table(dmn_xml: str, decision_id: str = "", decision_name: str = "") -> dict | None:
+    """시나리오가 가리키는 결정의 표. 못 찾으면 None.
+
+    id 로 먼저 찾고, 없으면 이름으로 찾는다 — 편집기가 결정을 다시 만들면 id 는 바뀌어도
+    이름은 남는 경우가 많다. 둘 다 비어 있으면(예전 시나리오) 첫 표를 쓴다.
+    """
+    tables = parse_decision_tables(dmn_xml)
+    if not tables:
+        return None
+    if decision_id:
+        for table in tables:
+            if table.get("decision_id") == decision_id:
+                return table
+    if decision_name:
+        for table in tables:
+            if table.get("name") == decision_name:
+                return table
+    if decision_id or decision_name:
+        return None
+    return tables[0]
+
+
+def parse_decision_table(dmn_xml: str) -> dict:
+    """첫 결정의 표. (결정을 가리지 않는 예전 호출부를 위해 남겨 둔다)"""
+    tables = parse_decision_tables(dmn_xml)
+    return tables[0] if tables else dict(_EMPTY_TABLE)
+
+
+def _parse_table(table) -> dict:
+    """decisionTable 요소 하나에서 입력 정의와 규칙 행을 뽑는다."""
     inputs: list[dict] = []
     for idx, node in enumerate([c for c in table if _local(c.tag) == "input"]):
         expr = _find_first(node, "inputExpression")
@@ -158,13 +205,14 @@ def parse_decision_table(dmn_xml: str) -> dict:
 
         outcome = _unquote(_text_of(outputs[0])) if outputs else ""
         note = _unquote(_text_of(annotations[0])) if annotations else ""
-        rules.append({"conditions": conditions, "outcome": outcome, "note": note})
+        rules.append({
+            "id": node.get("id") or "",
+            "conditions": conditions,
+            "outcome": outcome,
+            "note": note,
+        })
 
-    return {
-        "name": (decision.get("name") or "") if decision is not None else "",
-        "inputs": inputs,
-        "rules": rules,
-    }
+    return {"decision_id": "", "name": "", "inputs": inputs, "rules": rules}
 
 
 def _matches(condition: dict, inputs: dict) -> bool:
@@ -215,10 +263,12 @@ def evaluate(table: dict, inputs: dict) -> dict:
         if all(_matches(c, inputs) for c in conditions):
             return {
                 "matched_rule_index": index,
+                # 행 번호는 위에 행이 끼어들면 밀린다 — 규칙을 가리키는 것은 id 다.
+                "matched_rule_id": rule.get("id") or "",
                 "outcome": rule.get("outcome") or "",
                 "note": rule.get("note") or "",
             }
-    return {"matched_rule_index": _NO_MATCH, "outcome": "", "note": ""}
+    return {"matched_rule_index": _NO_MATCH, "matched_rule_id": "", "outcome": "", "note": ""}
 
 
 def grade(observed: dict, texts: list[str], checks: list[dict | None]) -> dict | None:
@@ -234,6 +284,19 @@ def grade(observed: dict, texts: list[str], checks: list[dict | None]) -> dict |
             actual = observed.get("outcome") or ""
             ok = actual == (value or "")
             evidence = f"결론 '{actual or '(매칭 없음)'}' (기대 '{value or '(매칭 없음)'}')"
+        elif kind == CHECK_MATCHED_RULE_ID:
+            actual_id = observed.get("matched_rule_id") or ""
+            actual_index = observed.get("matched_rule_index")
+            ok = actual_id == (value or "")
+            if not value:
+                # 아무 규칙에도 맞지 않아야 하는 시나리오.
+                evidence = f"{_rule_label(actual_index)} 적용" if actual_id else "매칭 없음"
+            elif ok:
+                evidence = f"{_rule_label(actual_index)} · 변경 전과 같은 규칙"
+            elif actual_id:
+                evidence = f"{_rule_label(actual_index)} · 다른 규칙이 적용됨"
+            else:
+                evidence = "매칭 없음"
         elif kind == CHECK_MATCHED_RULE:
             actual = observed.get("matched_rule_index")
             ok = actual == value
@@ -273,8 +336,37 @@ def evaluate_case(dmn_xml: str, case: dict) -> tuple[dict, dict | None]:
     if not isinstance(inputs, dict):
         inputs = {}
 
-    table = parse_decision_table(dmn_xml)
-    if not table.get("rules"):
+    # 시나리오는 자기가 어느 결정을 지키는지 들고 다닌다. 없으면(예전 시나리오) 첫 결정이다.
+    decision_id = str(inputs.get("decision_id") or "")
+    decision_name = str(inputs.get("decision_name") or "")
+
+    tables = parse_decision_tables(dmn_xml)
+    if not tables:
+        # 문서를 아예 읽지 못한 것과 결정 하나가 사라진 것은 다르다.
+        # 전자는 판단할 수 없고, 후자는 판단해야 한다.
+        return ({"matched_rule_index": _NO_MATCH, "outcome": "", "note": "",
+                 "undecided": "이 버전에서 의사결정 표를 읽지 못했습니다."}, None)
+
+    table = find_decision_table(dmn_xml, decision_id, decision_name)
+
+    if table is None and (decision_id or decision_name):
+        # 결정이 통째로 사라진 것도 동작 변화다 — "판단 불가" 로 접으면 병합해도 되는 줄 안다.
+        # 실제로도 이 결정을 부르는 쪽은 아무 결론도 받지 못한다.
+        label = decision_name or decision_id
+        return (
+            {
+                "matched_rule_index": _NO_MATCH,
+                "outcome": "",
+                "note": f"이 버전에는 '{label}' 결정이 없습니다.",
+            },
+            grade(
+                {"matched_rule_index": _NO_MATCH, "outcome": "", "note": ""},
+                case.get("assertions") or [],
+                case.get("checks") or [],
+            ),
+        )
+
+    if table is None or not table.get("rules"):
         return ({"matched_rule_index": _NO_MATCH, "outcome": "", "note": "",
                  "undecided": "이 버전에서 의사결정 표를 읽지 못했습니다."}, None)
 
