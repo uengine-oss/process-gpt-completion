@@ -40,6 +40,7 @@ def load_process_definition(tenant_id: str, resource_id: str, ref: str) -> tuple
         rows = (
             sb.table("proc_def_version")
             .select("definition")
+            .eq("tenant_id", tenant_id)
             .eq("arcv_id", f"{resource_id}_{version}")
             .limit(1)
             .execute()
@@ -82,6 +83,7 @@ def load_dmn_xml(tenant_id: str, resource_id: str, ref: str) -> tuple[str, str]:
         rows = (
             sb.table("proc_def_version")
             .select("snapshot")
+            .eq("tenant_id", tenant_id)
             .eq("arcv_id", f"{resource_id}_{version}")
             .limit(1)
             .execute()
