@@ -2476,10 +2476,25 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
         def _out(wi: Any) -> Optional[dict]:
             return getattr(wi, "output", None) or (wi.get("output") if isinstance(wi, dict) else None)
 
-        def _val_from_form(out: dict) -> Optional[Any]:
+        def _val_from_form(out: dict, allow_flat: bool = False) -> Optional[Any]:
+            """워크아이템 output 에서 이 폼의 필드 값을 꺼낸다.
+
+            output 이 늘 {form_id: {필드: 값}} 인 것은 아니다. 에이전트가 수행한
+            태스크는 폼 id 로 감싸지 않고 필드를 평면으로 저장한다. 중첩만 보면
+            에이전트 태스크의 산출물을 참조하는 후속 태스크의 inputData 가 통째로
+            비어서 전달된다(에이전트가 값을 지어내거나 빈 칸으로 제출하게 된다).
+
+            평면 조회는 그 워크아이템이 이 폼의 액티비티라는 게 확인된 경우에만
+            허용한다. 아무 워크아이템에나 허용하면 다른 폼의 같은 이름 필드를
+            잘못 집어올 수 있다.
+            """
             form = out.get(form_id)
             if isinstance(form, dict):
-                return form.get(field_id)
+                value = form.get(field_id)
+                if value is not None:
+                    return value
+            if allow_flat:
+                return out.get(field_id)
             return None
 
         def _to_int(v: Any, default: int = 0) -> int:
@@ -2512,7 +2527,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
         if workitem:
             out = _out(workitem)
             if out:
-                val = _val_from_form(out)
+                val = _val_from_form(out, allow_flat=True)
                 if val is not None:
                     field_value[form_id] = { field_id: val }
                     return field_value
@@ -2541,7 +2556,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
         if workitem_root:
             out = _out(workitem_root)
             if out:
-                val = _val_from_form(out)
+                val = _val_from_form(out, allow_flat=True)
                 if val is not None:
                     field_value[form_id] = { field_id: val }
                     return field_value
@@ -2588,7 +2603,7 @@ def get_field_value(field_info: str, process_definition: Any, process_instance_i
             out = _out(wi)
             if not out:
                 continue
-            val = _val_from_form(out)
+            val = _val_from_form(out, allow_flat=True)
             if val is not None:
                 scope_i = _to_int(getattr(wi, "execution_scope", None) or (wi.get("execution_scope") if isinstance(wi, dict) else None), 0)
                 values.append(f"{scope_i}:{val}")
