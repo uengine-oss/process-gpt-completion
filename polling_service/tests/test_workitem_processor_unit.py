@@ -4,6 +4,7 @@ import json
 import pathlib
 import importlib.util
 import pytest
+from datetime import datetime
 
 
 # ------------------------------------------------------------
@@ -801,6 +802,61 @@ def test_call_activity_parent_form_mapping_prefills_child_initial_workitem(wipro
         "criticalFinding": "5000000",
     }
     assert child_workitems[0]["output"]["__mapped"]["childForm.vendor_security_form.assessmentSummary"] == "ACME Partners"
+
+
+@pytest.mark.parametrize("existing_status", [None, "TODO"])
+def test_call_activity_parent_waiting_workitem_records_actual_start_date(wiproc, monkeypatch, existing_status):
+    # 부모 대기 워크아이템은 IN_PROGRESS 를 거치지 않고 곧장 PENDING 이 된다. DB 트리거는
+    # IN_PROGRESS 전환 때만 actual_start_date 를 남기므로, 엔진이 대기에 들어가는 시각을 직접 남겨야 한다.
+    call_activity = _Activity("Call_review", name="Security review", type="callActivity")
+    call_activity.properties = json.dumps({"definitionId": "vendor-security-review"})
+    parent_def = _ProcDef(activities=[call_activity])
+    parent_inst = types.SimpleNamespace(
+        proc_inst_id="parent-1",
+        proc_def_id="vendor-onboarding",
+        root_proc_inst_id="parent-1",
+        role_bindings=[],
+        participants=[],
+        variables_data={},
+        current_activity_ids=[],
+        tenant_id="localhost",
+        process_definition=parent_def,
+    )
+    process_result = types.SimpleNamespace(
+        nextActivities=[types.SimpleNamespace(nextActivityId="Call_review", nextActivityName="Security review", type="callActivity", result=None)],
+        completedActivities=[],
+    )
+    child_initial_activity = types.SimpleNamespace(id="AssessRisk", name="Assess Risk", duration=None, tool="", description="")
+    child_def = types.SimpleNamespace(
+        processDefinitionId="vendor-security-review",
+        gateways=[],
+        activities=[child_initial_activity],
+        find_initial_activity=lambda: child_initial_activity,
+    )
+    # 예정업무(TODO)로 미리 만들어 둔 부모 워크아이템 — 또는 아직 없는 경우
+    existing = types.SimpleNamespace(id="wi-call", status=existing_status) if existing_status else None
+    upserted_workitems = []
+
+    monkeypatch.setattr(wiproc, "fetch_process_definition_by_version", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(wiproc, "load_process_definition", lambda *_args, **_kwargs: child_def)
+    monkeypatch.setattr(
+        wiproc,
+        "fetch_workitem_by_proc_inst_and_activity",
+        lambda proc_inst_id, *_args, **_kwargs: existing if proc_inst_id == "parent-1" else None,
+    )
+    monkeypatch.setattr(wiproc, "insert_process_instance", lambda data, tenant_id=None: None)
+    monkeypatch.setattr(wiproc, "upsert_workitem", lambda data, tenant_id=None: upserted_workitems.append(data))
+    monkeypatch.setattr(wiproc, "_get_immediate_prev_activity_form_data", lambda *_args, **_kwargs: {})
+
+    wiproc._process_sub_processes(parent_inst, process_result, {"nextActivities": [{"nextActivityId": "Call_review"}]}, parent_def)
+
+    waiting = [w for w in upserted_workitems if w.get("status") == "PENDING"]
+    assert len(waiting) == 1
+    if existing:
+        assert waiting[0]["id"] == "wi-call"
+    started = datetime.fromisoformat(waiting[0]["actual_start_date"])
+    # 시간대가 붙어 있어야 한다 — 없으면 TIMESTAMPTZ 가 UTC 로 읽어 한국 시각이 9시간 어긋난다.
+    assert started.tzinfo is not None
 
 
 @pytest.mark.asyncio

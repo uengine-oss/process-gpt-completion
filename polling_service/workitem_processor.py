@@ -12,7 +12,7 @@ import requests
 import os
 import asyncio
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import HTTPException
 import threading
 import queue
@@ -1527,6 +1527,12 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
             root_proc_inst_id = process_instance.proc_inst_id
 
         if is_call_activity:
+            # 부모 대기 워크아이템은 IN_PROGRESS 를 거치지 않고 곧장 PENDING 이 되므로
+            # trg_set_actual_start_date(IN_PROGRESS 전환 때만 기록)가 실제 시작 시각을 남기지 못한다.
+            # 비어 있으면 화면은 예정일(start_date) · 갱신 시각으로 대신하는데, 예정업무의 start_date 는
+            # 미래이고 updated_at 은 서브프로세스가 끝난 시각이라 '교통 민원 처리가 진행됩니다' 가
+            # 서브프로세스 단계들보다 뒤에 찍혔다. 대기에 들어가는 지금을 시작 시각으로 남긴다.
+            started_at = datetime.now(timezone.utc).isoformat()
             try:
                 existing_parent_workitem = fetch_workitem_by_proc_inst_and_activity(
                     process_instance.proc_inst_id,
@@ -1544,6 +1550,7 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                         "activity_name": getattr(parent_activity, "name", None) or activity.nextActivityName or activity.nextActivityId,
                         "start_date": datetime.now().isoformat(),
                         "status": "PENDING",
+                        "actual_start_date": started_at,
                         "assignees": role_bindings,
                         "tenant_id": process_instance.tenant_id,
                         "root_proc_inst_id": root_proc_inst_id,
@@ -1554,7 +1561,11 @@ def _process_sub_processes(process_instance: ProcessInstance, process_result: Pr
                     upsert_workitem(parent_wait_workitem_data, process_instance.tenant_id)
                     print(f"[INFO] Created parent waiting workitem for CallActivity: {activity.nextActivityId}")
                 elif str(getattr(existing_parent_workitem, "status", "") or "").upper() not in ("PENDING", "DONE", "COMPLETED"):
-                    upsert_workitem({"id": existing_parent_workitem.id, "status": "PENDING"}, process_instance.tenant_id)
+                    # 예정업무(TODO)로 미리 만들어 둔 부모 워크아이템이 대기에 들어가는 경우.
+                    update = {"id": existing_parent_workitem.id, "status": "PENDING"}
+                    if not getattr(existing_parent_workitem, "actual_start_date", None):
+                        update["actual_start_date"] = started_at
+                    upsert_workitem(update, process_instance.tenant_id)
             except Exception as e:
                 print(f"[ERROR] Failed to create parent waiting workitem for CallActivity '{activity.nextActivityId}': {e}")
 

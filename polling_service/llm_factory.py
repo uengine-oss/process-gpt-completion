@@ -76,6 +76,18 @@ def _proxy_api_key() -> str:
     return api_key
 
 
+def _fixed_temperature_model(model: str) -> bool:
+    """
+    temperature 를 바꿀 수 없는 모델인가.
+
+    gpt-5 계열과 o 계열(추론 모델)은 기본값(1) 이외의 temperature 를 400 으로 거절한다.
+    이 서비스는 temperature=0 을 기본으로 보내므로, LLM_MODEL 을 gpt-5 로 두면
+    게이트웨이 조건 판단이 매번 실패해 다음 단계가 열리지 않았다(오류는 로그에만 남는다).
+    """
+    name = (model or "").strip().lower().split("/")[-1]
+    return name.startswith("gpt-5") or (len(name) > 1 and name[0] == "o" and name[1].isdigit())
+
+
 def create_llm(
     model: Optional[str] = None,
     streaming: bool = False,
@@ -98,11 +110,14 @@ def create_llm(
     base_url = kwargs.pop("base_url", None) or _proxy_base_url()
     api_key = kwargs.pop("api_key", None) or _proxy_api_key()
 
+    # 고정 temperature 모델에는 허용되는 유일한 값(1)을 보낸다. 빼 버리면 LangChain 이
+    # 제 기본값(0.7)을 채워 보내 똑같이 거절당한다.
+    kwargs["temperature"] = 1 if _fixed_temperature_model(resolved_model) else temperature
+
     return ChatOpenAI(
         model=resolved_model,
         base_url=base_url,
         api_key=api_key,
-        temperature=temperature,
         streaming=streaming,
         disable_streaming=not streaming,
         timeout=timeout,
