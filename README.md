@@ -137,7 +137,7 @@ def combine_input_with_process_definition(input):
 ```
 # firstly Ctrl+C to stop the current debug session inside the terminal the debugger runs
 # insert these commands:
-pipenv shell
+source .venv/bin/activate   # uv sync 로 만든 가상환경 (예전 pipenv shell 대체)
 export OPENAI_API_KEY=sk-...
 # Try to run the debugger again (Cmd+Shift+D to swith to the Debug perspective and just press enter)
 ```
