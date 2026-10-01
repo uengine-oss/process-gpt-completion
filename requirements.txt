@@ -168,10 +168,11 @@ fastmcp==3.4.7
     # via process-gpt-completion
 fastmcp-slim==3.4.7
     # via fastmcp
-filelock==3.18.0
+filelock==4.0.7
     # via
     #   huggingface-hub
     #   process-gpt-completion
+    #   python-discovery
     #   virtualenv
 filetype==1.2.0
     # via
@@ -623,6 +624,7 @@ packaging==24.2
     #   pipenv
     #   process-gpt-completion
     #   pytest
+    #   virtualenv
 pathable==0.6.0
     # via jsonschema-path
 pgvector==0.3.6
@@ -811,6 +813,8 @@ python-dateutil==2.9.0.post0
     #   kubernetes
     #   posthog
     #   process-gpt-completion
+python-discovery==1.6.1
+    # via virtualenv
 python-dotenv==1.1.0
     # via
     #   fastmcp-slim
@@ -1056,7 +1060,7 @@ uvicorn==0.54.0
     #   process-gpt-completion
 vecs==0.4.5
     # via process-gpt-completion
-virtualenv==20.31.2
+virtualenv==21.14.1
     # via
     #   pipenv
     #   process-gpt-completion
