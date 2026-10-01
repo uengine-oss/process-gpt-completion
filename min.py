@@ -1,8 +1,8 @@
 from fastapi import FastAPI
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from llm_factory import create_llm
-from langchain.schema.output_parser import StrOutputParser
-from langchain.output_parsers.json import SimpleJsonOutputParser
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers.json import SimpleJsonOutputParser
 from langserve import add_routes
 from pydantic import BaseModel, Field
 from typing import List  # Import List from typing module

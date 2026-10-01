@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import psycopg2
+from psycopg2 import sql
 from fastapi import Body, FastAPI, HTTPException, Query
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from psycopg2.extras import RealDictCursor
@@ -343,7 +344,9 @@ def _get_system_by_id(tenant_id: str, system_id: str) -> Optional[dict]:
         connection.commit()
 
         cursor.execute(
-            f"SELECT * FROM {TABLE_NAME} WHERE tenant_id = %(tenant_id)s AND id = %(id)s",
+            sql.SQL("SELECT * FROM {} WHERE tenant_id = %(tenant_id)s AND id = %(id)s").format(
+                sql.Identifier(TABLE_NAME)
+            ),
             {"tenant_id": tenant_id, "id": system_id},
         )
         row = cursor.fetchone()

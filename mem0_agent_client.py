@@ -4,9 +4,9 @@ import os
 from typing import Dict, List, Any
 import json
 from datetime import datetime
-from langchain.prompts import PromptTemplate
-from langchain.schema.output_parser import StrOutputParser
-from langchain.schema.runnable import RunnablePassthrough
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
 from fastapi import HTTPException
 from llm_factory import create_llm, get_llm_model, openai_compatible_client_config
 

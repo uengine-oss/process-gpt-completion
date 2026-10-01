@@ -177,3 +177,5 @@ uv.lock
 .agent/
 
 openspec/
+# 보안 점검 결과 (scripts/security/scan.sh)
+reports/

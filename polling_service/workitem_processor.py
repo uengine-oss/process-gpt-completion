@@ -1,6 +1,6 @@
-﻿from langchain.prompts import PromptTemplate
-from langchain.schema import Document
-from langchain.output_parsers.json import SimpleJsonOutputParser
+﻿from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
+from langchain_core.output_parsers.json import SimpleJsonOutputParser
 from llm_factory import create_llm
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any, Tuple

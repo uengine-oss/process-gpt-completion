@@ -1,0 +1,11 @@
+# Trivy 예외 목록 — 사유·만료일 필수. 추가 시 docs/security/vuln-scan-report-2026-10.md 도 갱신한다.
+vulnerabilities:
+  - id: CVE-2026-31240
+    purls:
+      - "pkg:pypi/mem0ai"
+    statement: >-
+      취약점은 mem0 "서버"(REST API: PUT /memories/{id} 등)의 인증 부재다. 이 서비스는 pip 패키지
+      mem0ai 를 라이브러리(mem0.Memory)로만 프로세스 안에서 쓰며, 패키지에는 서버 모듈이 없다
+      (mem0/ 하위: client, configs, embeddings, graphs, llms, memory, proxy, utils, vector_stores).
+      수정 버전이 아직 없어 경로상 영향 없음(vulnerable_code_not_present)으로 예외 처리한다.
+    expired_at: 2027-01-31

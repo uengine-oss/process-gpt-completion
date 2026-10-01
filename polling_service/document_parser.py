@@ -6,8 +6,8 @@ import os
 import tempfile
 import httpx
 from typing import Optional, Dict, Any
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.summarize import load_summarize_chain
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_classic.chains.summarize import load_summarize_chain
 from langchain_core.documents import Document
 from llm_factory import create_llm
 import logging

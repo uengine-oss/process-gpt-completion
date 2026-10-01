@@ -28,8 +28,8 @@ from regression.api import add_routes_to_app as add_regression_routes_to_app
 
 if os.getenv("ENV") != "production":
     # 캐시 적용
-    from langchain.cache import SQLiteCache
-    from langchain.globals import set_llm_cache
+    from langchain_community.cache import SQLiteCache
+    from langchain_core.globals import set_llm_cache
     set_llm_cache(SQLiteCache(database_path=".langchain.db"))
     load_dotenv(override=True)
 

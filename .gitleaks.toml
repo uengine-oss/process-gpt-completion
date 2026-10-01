@@ -1,0 +1,18 @@
+# gitleaks 설정 — 기본 룰 + 검증된 오탐 허용목록 (근거를 주석으로 남긴다)
+title = "process-gpt-completion gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "검증된 오탐"
+paths = [
+    # 값이 모두 비어 있는 환경변수 템플릿 — 빈 SMTP_PASSWORD= 다음 줄의 변수 이름이 값으로 오인됨
+    '''(^|/)\.env\.example$''',
+    '''(^|/)node_modules/''',
+    '''(^|/)\.venv/''',
+]
+regexes = [
+    # mcp.json 의 자리표시자
+    '''<YOUR_[A-Z_]+>''',
+]

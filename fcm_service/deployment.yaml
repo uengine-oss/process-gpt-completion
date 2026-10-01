@@ -19,10 +19,20 @@ spec:
       labels:
         app: fcm-service
     spec:
+      # 보안 기본값 (Trivy KSV-0118): seccomp 기본 프로파일
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       terminationGracePeriodSeconds: 300  # 5분 grace period
       containers:
       - name: fcm-service
         image: ghcr.io/uengine-oss/fcm-service:latest
+        # 보안 기본값 (Trivy KSV-0014/0118): 읽기 전용 루트 FS, 권한 상승·커널 권한 제거
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8666
@@ -90,6 +100,8 @@ spec:
         - name: ENV
           value: production
         volumeMounts:
+        - name: tmp
+          mountPath: /tmp
         - name: firebase-credentials
           mountPath: /etc/secrets
           readOnly: true
@@ -101,6 +113,8 @@ spec:
             cpu: 500m
             memory: 512Mi
       volumes:
+      - name: tmp
+        emptyDir: {}
       - name: firebase-credentials
         secret:
           secretName: firebase-credentials

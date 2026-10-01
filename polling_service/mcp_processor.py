@@ -5,9 +5,9 @@ import os
 from dotenv import load_dotenv
 from database import fetch_tenant_mcp_config, fetch_process_definition_by_version, fetch_workitem_by_proc_inst_and_activity, fetch_process_instance
 from process_definition import load_process_definition
-from langchain.tools import StructuredTool
+from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
-from langchain.tools import StructuredTool
+from langchain_core.tools import StructuredTool
 from llm_factory import create_llm
 
 if os.getenv("ENV") != "production":

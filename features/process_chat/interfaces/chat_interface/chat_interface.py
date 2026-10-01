@@ -3,9 +3,9 @@ from .factories import LangchainMessageFactory
 from fastapi.responses import StreamingResponse
 from Usage import usage
 
-from langchain.schema import Generation
-from langchain.globals import get_llm_cache
-from langchain.schema import BaseMessage
+from langchain_core.outputs import Generation
+from langchain_core.globals import get_llm_cache
+from langchain_core.messages import BaseMessage
 from langchain_core.messages import AIMessageChunk
 from llm_factory import create_llm, create_embedding
 

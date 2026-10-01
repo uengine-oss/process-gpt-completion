@@ -19,10 +19,23 @@ spec:
       labels:
         app: polling-service
     spec:
+      # 보안 기본값 (Trivy KSV-0118): seccomp 기본 프로파일
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       terminationGracePeriodSeconds: 300  # 5분 grace period
       containers:
       - name: polling-service
         image: ghcr.io/uengine-oss/process-gpt-polling-service:latest
+        # 보안 기본값 (Trivy KSV-0014/0118): 읽기 전용 루트 FS, 권한 상승·커널 권한 제거
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
         ports:
         - containerPort: 8000
         lifecycle:
@@ -110,3 +123,6 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
+      volumes:
+      - name: tmp
+        emptyDir: {}

@@ -1,0 +1,84 @@
+name: Security Scan
+
+# 커밋마다 취약점 점검 — Critical/High 가 있으면 실패한다.
+# 같은 점검을 로컬에서: scripts/security/scan.sh [deps|secrets|sast|iac|all]
+on:
+  push:
+  pull_request:
+  schedule:
+    # 코드가 바뀌지 않아도 새로 공개된 CVE 를 잡기 위해 매주 월요일 09:00 KST
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write # SARIF → GitHub Security 탭
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: deps
+            name: 'SCA · Python / npm dependencies'
+          - target: secrets
+            name: 'Secrets · gitleaks'
+          - target: sast
+            name: 'SAST · Semgrep'
+          - target: iac
+            name: 'IaC · Dockerfile / Kubernetes'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # secrets 단계는 이번 push/PR 의 커밋 범위를 이력으로 검사한다
+          fetch-depth: ${{ matrix.target == 'secrets' && 0 || 1 }}
+
+      - name: Cache Trivy DB
+        if: matrix.target == 'deps' || matrix.target == 'iac'
+        uses: actions/cache@v4
+        with:
+          path: .cache/trivy
+          key: trivy-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: trivy-${{ runner.os }}-
+
+      - name: Resolve commit range for history scan
+        if: matrix.target == 'secrets'
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "SECRETS_LOG_OPTS=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_ENV"
+          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ] \
+               && ! echo "${{ github.event.before }}" | grep -qE '^0+$' \
+               && git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+            echo "SECRETS_LOG_OPTS=${{ github.event.before }}..${{ github.sha }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Scan (${{ matrix.target }})
+        run: scripts/security/scan.sh ${{ matrix.target }}
+
+      - name: Upload SARIF to GitHub Security
+        if: always() && hashFiles('reports/security/*.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/security
+          category: security-${{ matrix.target }}
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-${{ matrix.target }}-${{ github.sha }}
+          path: reports/security/
+          if-no-files-found: ignore
+          retention-days: 30

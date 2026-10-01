@@ -9,6 +9,7 @@ from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
 import psycopg2
+from psycopg2 import sql
 from fastapi import FastAPI, HTTPException, Query
 from psycopg2.extras import RealDictCursor, execute_values
 
@@ -149,7 +150,10 @@ def _search_suppliers(keyword: str, page: int, limit: int, tenant_id: str) -> Di
         """
 
         cursor.execute(
-            f"SELECT count(*) AS total FROM {SUPPLIER_TABLE_NAME} WHERE {where_clause}",
+            # 테이블명은 식별자로, 조건절은 고정 SQL 로 조립한다 (값은 모두 바인딩 파라미터)
+            sql.SQL("SELECT count(*) AS total FROM {} WHERE {}").format(
+                sql.Identifier(SUPPLIER_TABLE_NAME), sql.SQL(where_clause)
+            ),
             params,
         )
         total = int(cursor.fetchone()["total"])
@@ -212,7 +216,9 @@ def _import_suppliers_from_xlsx(xlsx_path: Path, tenant_id: str, batch_size: int
         cursor = connection.cursor(cursor_factory=RealDictCursor)
         _ensure_suppliers_table(cursor)
         cursor.execute(
-            f"DELETE FROM {SUPPLIER_TABLE_NAME} WHERE tenant_id = %s AND source_file = %s",
+            sql.SQL("DELETE FROM {} WHERE tenant_id = %s AND source_file = %s").format(
+                sql.Identifier(SUPPLIER_TABLE_NAME)
+            ),
             (tenant_id, xlsx_path.name),
         )
         inserted_or_updated = _upsert_supplier_records(cursor, records, batch_size)

@@ -1,5 +1,5 @@
 from typing import List, Dict, Any
-from langchain.schema import HumanMessage, SystemMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
 
 class LangchainMessageFactory:
     @staticmethod
