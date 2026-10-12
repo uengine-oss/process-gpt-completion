@@ -27,10 +27,14 @@ from validate_improve import add_routes_to_app as add_validate_improve_routes_to
 from regression.api import add_routes_to_app as add_regression_routes_to_app
 
 if os.getenv("ENV") != "production":
-    # 캐시 적용
-    from langchain_community.cache import SQLiteCache
-    from langchain_core.globals import set_llm_cache
-    set_llm_cache(SQLiteCache(database_path=".langchain.db"))
+    # 캐시 적용. 같은 메시지로 여러 번 시험할 때는 LLM_CACHE=off 로 끈다
+    # (켜져 있으면 두 번째부터 캐시된 답을 한 덩어리로 돌려줘 스트리밍을 시험할 수 없다)
+    if os.getenv("LLM_CACHE", "on").lower() not in ("off", "false", "0"):
+        from langchain_community.cache import SQLiteCache
+        from langchain_core.globals import set_llm_cache
+        set_llm_cache(SQLiteCache(database_path=".langchain.db"))
+    else:
+        print("[cache] LLM 캐시 끔 (LLM_CACHE=off)")
     load_dotenv(override=True)
 
 if os.getenv("LANGSMITH_API_KEY"):
