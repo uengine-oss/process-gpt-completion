@@ -1034,8 +1034,87 @@ async def handle_rework_complete(request: Request):
         raise HTTPException(status_code=500, detail=str(e)) from e
 ############# end of rework complete #############
 
+############# start of handover suggestion #############
+# 채팅방에서 '인계하기' 를 눌렀을 때, 지금까지의 산출물과 대화를 근거로
+# "다음에 할 일" 과 담당자 후보를 제안한다. 담당자 후보는 조직도에서 고르며,
+# 사람과 에이전트를 구분하지 않는다(둘 다 조직도/users 의 리소스).
+handover_suggest_prompt = PromptTemplate.from_template(
+    """
+You are helping a knowledge worker hand off their work to the next person or AI agent.
+
+Below is what they produced in a chat workspace, plus the recent conversation and our
+organization chart. Infer (1) what was just completed, (2) what the single next step is,
+(3) who should do it.
+
+- Artifacts produced so far: {artifacts}
+
+- Recent conversation: {recentMessages}
+
+- Organization Chart (contains both humans and AI agents): {organizationChart}
+
+Rules:
+- Write doneLabel, nextActivityLabel and instruction in Korean.
+- nextActivityLabel must be a short work-item name (a noun phrase, under 30 characters).
+- instruction must be concrete enough that the next assignee can start without asking back.
+- Pick at most 3 candidateAssignees from the organization chart, best first.
+  Use the exact id and email from the chart. An AI agent is a valid candidate.
+- If no one in the chart fits, return an empty candidateAssignees list.
+
+result should be in this JSON format, wrapped in ```json ... ```:
+{{
+    "doneLabel": "지금까지 한 일",
+    "nextActivityLabel": "다음에 할 일",
+    "instruction": "다음 담당자를 위한 구체적인 지시사항",
+    "candidateAssignees": [{{
+        "id": "user uuid",
+        "email": "user email",
+        "reason": "왜 이 사람/에이전트인지"
+    }}]
+}}
+    """
+)
+
+handover_suggest_chain = handover_suggest_prompt | model | parser
+
+
+async def handle_handover_suggest(request: Request):
+    try:
+        json_data = await request.json()
+        # 프런트는 최상위로 보내지만, 다른 라우터처럼 input 으로 감싸 보낼 수도 있게 둘 다 받는다.
+        payload = json_data.get('input') if isinstance(json_data.get('input'), dict) else json_data
+
+        artifacts = payload.get('artifacts') or []
+        recent_messages = payload.get('recent_messages') or payload.get('recentMessages') or []
+        tenant_id = payload.get('tenant_id')
+
+        try:
+            organization_chart = fetch_organization_chart(tenant_id)
+        except Exception:
+            organization_chart = None
+        if not organization_chart:
+            organization_chart = "There is no organization chart"
+
+        result = handover_suggest_chain.invoke({
+            "artifacts": json.dumps(artifacts, ensure_ascii=False),
+            "recentMessages": json.dumps(recent_messages, ensure_ascii=False),
+            "organizationChart": organization_chart
+        })
+
+        return {
+            "doneLabel": result.get('doneLabel') or '',
+            "nextActivityLabel": result.get('nextActivityLabel') or '',
+            "instruction": result.get('instruction') or '',
+            "candidateAssignees": result.get('candidateAssignees') or []
+        }
+    except Exception as e:
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e)) from e
+############# end of handover suggestion #############
+
+
 def add_routes_to_app(app) :
     app.add_api_route("/complete", handle_submit, methods=["POST"])
+    app.add_api_route("/handover-suggest", handle_handover_suggest, methods=["POST"])
     app.add_api_route("/generate-name", handle_generate_name, methods=["POST"])
     app.add_api_route("/vision-complete", handle_submit, methods=["POST"])
     app.add_api_route("/role-binding", handle_role_binding, methods=["POST"])
