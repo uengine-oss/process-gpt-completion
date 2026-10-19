@@ -1074,7 +1074,8 @@ result should be in this JSON format, wrapped in ```json ... ```:
     """
 )
 
-handover_suggest_chain = handover_suggest_prompt | model | parser
+def handover_suggest_chain():
+    return handover_suggest_prompt | get_model() | parser
 
 
 async def handle_handover_suggest(request: Request):
@@ -1094,7 +1095,7 @@ async def handle_handover_suggest(request: Request):
         if not organization_chart:
             organization_chart = "There is no organization chart"
 
-        result = handover_suggest_chain.invoke({
+        result = handover_suggest_chain().invoke({
             "artifacts": json.dumps(artifacts, ensure_ascii=False),
             "recentMessages": json.dumps(recent_messages, ensure_ascii=False),
             "organizationChart": organization_chart
