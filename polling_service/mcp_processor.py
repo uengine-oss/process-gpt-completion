@@ -1,3 +1,4 @@
+import json
 from typing import Dict, Any
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
@@ -9,6 +10,11 @@ from langchain.tools import StructuredTool
 from pydantic import BaseModel
 from langchain.tools import StructuredTool
 from llm_factory import create_llm
+import os
+from observability import MCPContext, get_context, observe_tools, set_context
+
+MCP_HUB_URL = os.getenv("MCP_HUB_URL", "http://mcp-hub:8500").rstrip("/")
+MCP_HUB_ENABLED = os.getenv("MCP_HUB_ENABLED", "true").lower() != "false"
 
 if os.getenv("ENV") != "production":
     load_dotenv(override=True)
@@ -54,6 +60,7 @@ class MCPProcessor:
         self.mcp_client = None
         self.mcp_tools = {}
         self.mcp_configs = {}
+        self.tool_servers = {}
     
     async def get_mcp_tools_from_tenant(self, tenant_id: str, agent_info: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -72,46 +79,98 @@ class MCPProcessor:
                 print(f"[WARNING] No tools found for agent: {agent_info.get('id')}")
                 return {}
             
-            if ',' in agent_tools:
-                agent_tools = agent_tools.split(',')
-            else:
-                agent_tools = [agent_tools]
-            
+            # CSV 앞뒤 공백을 정리한다 — "a, b" 형태로 저장된 값이 흔하다.
+            agent_tools = [t.strip() for t in agent_tools.split(',') if t.strip()]
+
+            # mcp-hub 에 이 에이전트가 쓸 수 있는 서버를 물어본다.
+            # 허브는 enabled·status·접근권한을 모두 적용한 결과만 준다.
+            # 허브에 닿지 못하면 None 이고, 아래 jsonb 경로로 폴백한다.
+            allowed = await self._hub_allowed_servers(tenant_id, agent_info)
+
             available_tools = {}
             for tool_name in agent_tools:
-                if tool_name in mcp_servers:
-                    tool_config = mcp_servers[tool_name]
-                    available_tools[tool_name] = tool_config
-                    print(f"[INFO] Found MCP tool: {tool_name} for agent: {agent_info.get('id')}")
-                else:
+                if tool_name not in mcp_servers:
                     print(f"[WARNING] Tool {tool_name} not found in MCP config for tenant: {tenant_id}")
-            
+                    continue
+                tool_config = mcp_servers[tool_name]
+                # UI 가 저장만 하고 아무도 읽지 않던 플래그를 여기서 실제로 지킨다.
+                if tool_config.get("enabled", True) is False:
+                    print(f"[INFO] MCP server disabled, skipping: {tool_name}")
+                    continue
+                if allowed is not None and tool_name not in allowed:
+                    print(f"[INFO] MCP server not permitted for agent, skipping: {tool_name}")
+                    continue
+                # 사용자별 자격증명({{user_jwt}} 등)을 요구하는 서버는 시스템 작업에 사용자 값이 없으므로 뺀다.
+                if any(ph in json.dumps({k: tool_config.get(k) for k in ("headers", "env")}) for ph in ("{{user_jwt}}", "{{user_email}}")):
+                    print(f"[INFO] MCP server needs per-user credentials, skipping in service task: {tool_name}")
+                    continue
+                available_tools[tool_name] = tool_config
+                print(f"[INFO] Found MCP tool: {tool_name} for agent: {agent_info.get('id')}")
+
             return available_tools
             
         except Exception as e:
             print(f"[ERROR] Failed to get MCP tools from tenant: {str(e)}")
             return {}
     
+    async def _hub_allowed_servers(self, tenant_id: str, agent_info: Dict[str, Any]):
+        """mcp-hub 에 허용 서버·툴을 물어본다. 닿지 못하면 None(=폴백)."""
+        agent_id = str(agent_info.get("id") or "").strip()
+        if not (MCP_HUB_ENABLED and tenant_id and agent_id):
+            return None
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"{MCP_HUB_URL}/agents/{agent_id}/tools",
+                    headers={"X-Tenant-Id": tenant_id},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            print(f"[INFO] mcp-hub lookup failed ({e}) — falling back to tenants.mcp")
+            return None
+        return {s["server_name"]: s.get("allowed_tools") for s in data.get("servers", [])}
+
     async def initialize_mcp_client(self, tenant_id: str, agent_info: Dict[str, Any]) -> bool:
         """
         MultiServerMCPClient를 초기화하고 MCP 도구들을 로드합니다.
+
+        서버별로 나눠 로드한다 — 한 번에 get_tools() 하면 어떤 도구가 어느
+        서버에서 왔는지 유실돼 호출 로그를 서버에 귀속시킬 수 없다.
         """
         try:
             available_tools = await self.get_mcp_tools_from_tenant(tenant_id, agent_info)
             if not available_tools:
                 return False
-            
+
             for tool_name, tool_config in available_tools.items():
                 self.mcp_configs[tool_name] = tool_config
-            
-            # MultiServerMCPClient 초기화
-            self.mcp_client = MultiServerMCPClient(self.mcp_configs)
-            
-            # MCP 도구들 로드
-            self.mcp_tools = await self.mcp_client.get_tools()
 
-            return True
-            
+            self.mcp_client = MultiServerMCPClient(self.mcp_configs)
+
+            allowed = await self._hub_allowed_servers(tenant_id, agent_info)
+            ctx = get_context()
+            loaded = []
+            self.tool_servers = {}
+            for server_name in self.mcp_configs:
+                try:
+                    srv_tools = await self.mcp_client.get_tools(server_name=server_name)
+                except Exception as e:
+                    print(f"[ERROR] Failed to load tools from {server_name}: {e}")
+                    continue
+                permitted = (allowed or {}).get(server_name)
+                if permitted is not None:
+                    allow_set = set(permitted)
+                    srv_tools = [t for t in srv_tools if getattr(t, "name", "") in allow_set]
+                srv_tools = observe_tools(srv_tools, server_name, ctx)
+                for t in srv_tools:
+                    self.tool_servers[getattr(t, "name", "")] = server_name
+                loaded.extend(srv_tools)
+
+            self.mcp_tools = loaded
+            return bool(loaded)
+
         except Exception as e:
             print(f"[ERROR] Failed to initialize MCP client: {str(e)}")
             return False

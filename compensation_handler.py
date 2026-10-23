@@ -106,6 +106,19 @@ def build_tool_index_from_tenant(tenant_id: str) -> Dict[str, str]:
     try:
         mcp = fetch_tenant_mcp_config(tenant_id) or {}
         servers = (mcp or {}).get("mcpServers", mcp)
+        # 런타임 전용 enabled 속성은 MCP 클라이언트 설정이 아니다 — 비활성 서버는 빼고 속성만 지운다(DeepAgents replay 와 같음).
+        def _client_cfg(v: Dict[str, Any]) -> Dict[str, Any]:
+            # fastmcp 2.x 는 정의되지 않은 키(type·is_default 등)를 거부한다 — 원격은 url·headers·transport, 로컬은 command 계열만.
+            if v.get("url"):
+                cfg = {"url": v["url"]}
+                if v.get("headers"):
+                    cfg["headers"] = v["headers"]
+                if v.get("transport") or v.get("type"):
+                    cfg["transport"] = v.get("transport") or v.get("type")
+                return cfg
+            return {kk: vv for kk, vv in v.items() if kk in ("command", "args", "env", "cwd")}
+
+        servers = {k: _client_cfg(v) for k, v in servers.items() if isinstance(v, dict) and v.get("enabled", True) is not False}
         try:
             from fastmcp import Client as McpClient  # type: ignore
             import asyncio as _a
@@ -120,7 +133,7 @@ def build_tool_index_from_tenant(tenant_id: str) -> Dict[str, str]:
                         tool_to_server[t.name] = server_k
 
             async def _run_all():
-                await _a.gather(*[_list_for_server(k, v) for k, v in servers.items()])
+                await _a.gather(*[_list_for_server(k, v) for k, v in servers.items()], return_exceptions=True)
 
             try:
                 loop = _a.get_event_loop()
@@ -240,12 +253,14 @@ async def generate_compensation(workitem, new_workitem):
         if len(events) == 0:
             return
         
+        # 보상 코드는 테넌트 MCP 도구로만 되돌린다 — 실행기 내장 도구(task·read_file 등)는 입력에서 뺀다.
+        mcp_tools = set(build_tool_index_from_tenant(workitem.tenant_id).keys())
         event_logs: List[Dict[str, Any]] = []
         for event in events:
-            # Only include finished tool usage actions
+            # Only include finished tool usage actions (CrewAI Action · DeepAgents)
             if event.get("event_type") != "tool_usage_finished":
                 continue
-            if event.get("crew_type") != "action":
+            if event.get("crew_type") not in ("action", "deepagents"):
                 continue
 
             data_raw = event.get("data")
@@ -257,6 +272,8 @@ async def generate_compensation(workitem, new_workitem):
             args = (data or {}).get("args") or {}
 
             if not tool_name:
+                continue
+            if event.get("crew_type") == "deepagents" and mcp_tools and tool_name not in mcp_tools:
                 continue
             # Exclude specific tools
             if tool_name in ("mem0", "memento", "human_asked", "dmn_rule"):
@@ -311,7 +328,8 @@ async def generate_compensation(workitem, new_workitem):
                 "status": "IN_PROGRESS",
                 "user_id": user_id,
                 "username": user_name,
-                "agent_orch": "crewai-action",
+                # 원래 실행기를 유지한다 — DeepAgents 활동은 DeepAgents 가 undo → 순방향을 실행한다(deepagents_deterministic-replay-undo).
+                "agent_orch": getattr(workitem, "agent_orch", None) or "crewai-action",
                 "log": "Compensation Handling..."
             })
 

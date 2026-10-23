@@ -5218,7 +5218,27 @@ async def handle_service_workitem(workitem):
             }, tenant_id)
             return
 
+        # MCP/LLM 스팬 상관키. 워크아이템 실행 직전이 proc_inst_id·todo_id·
+        # agent_id 가 모두 확보되는 지점이다.
+        try:
+            from observability import MCPContext, set_context as _set_mcp_ctx
+            _set_mcp_ctx(MCPContext(
+                tenant_id=tenant_id,
+                engine="completion",
+                proc_inst_id=workitem.get("proc_inst_id"),
+                todo_id=str(workitem.get("id") or "") or None,
+                agent_id=str(agent_info.get("id") or "") or None,
+            ))
+        except Exception as _e:
+            print(f"[WARNING] MCP trace context setup failed: {_e}")
+
         results = await mcp_processor.execute_mcp_tools(workitem, agent_info, tenant_id)
+
+        try:
+            from observability import flush as _mcp_flush
+            await _mcp_flush()
+        except Exception:
+            pass
         messages = results.get("messages", [])
         
         if messages:

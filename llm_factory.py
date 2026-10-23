@@ -59,6 +59,16 @@ def openai_compatible_client_config() -> dict[str, str]:
     }
 
 
+def _tracing_clients() -> dict:
+    """상관키를 붙이는 httpx 클라이언트. 실패하면 빈 dict(계측 없이 동작)."""
+    try:
+        from observability import tracing_http_clients
+
+        return tracing_http_clients()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def create_llm(
     model: Optional[str] = None,
     streaming: bool = False,
@@ -76,6 +86,11 @@ def create_llm(
 
     base_url = kwargs.pop("base_url", None) or _proxy_base_url()
     api_key = kwargs.pop("api_key", None) or _proxy_api_key()
+
+    # LiteLLM 프록시 콜백이 읽을 상관키를 매 요청마다 헤더로 붙인다.
+    # (default_headers 로 넣으면 LLM 객체가 재사용될 때 낡은 trace 가 남는다.)
+    for _k, _v in _tracing_clients().items():
+        kwargs.setdefault(_k, _v)
 
     return ChatOpenAI(
         model=resolved_model,
