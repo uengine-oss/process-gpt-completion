@@ -1,3 +1,4 @@
+import json
 from typing import Dict, Any
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
@@ -81,6 +82,10 @@ class MCPProcessor:
             for tool_name in agent_tools:
                 if tool_name in mcp_servers:
                     tool_config = mcp_servers[tool_name]
+                    # 사용자별 자격증명({{user_jwt}} 등)을 요구하는 서버는 서비스 태스크에 사용자 값이 없으므로 뺀다.
+                    if any(ph in json.dumps({k: tool_config.get(k) for k in ("headers", "env")}) for ph in ("{{user_jwt}}", "{{user_email}}")):
+                        print(f"[INFO] MCP server needs per-user credentials, skipping in service task: {tool_name}")
+                        continue
                     available_tools[tool_name] = tool_config
                     print(f"[INFO] Found MCP tool: {tool_name} for agent: {agent_info.get('id')}")
                 else:
