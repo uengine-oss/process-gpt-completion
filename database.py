@@ -396,9 +396,68 @@ def fetch_process_definition_version_by_arcv_id(def_id, arcv_id, tenant_id: Opti
 
         response = supabase.table('proc_def_arcv').select('*').eq('proc_def_id', def_id.lower()).eq('arcv_id', arcv_id).eq('tenant_id', tenant_id).execute()
         
-        return response.data
+        # versions are saved in proc_def_version (process-gpt's save path); proc_def_arcv is legacy
+        return response.data or _pinned_version_rows(supabase, def_id, arcv_id, tenant_id)
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"No process definition version found with ID {def_id} and version {arcv_id}: {e}")
+
+
+def _pinned_version_rows(supabase, def_id, arcv_id, tenant_id) -> List[dict]:
+    """A saved version (proc_def_version.arcv_id) an instance was pinned to when it started.
+
+    The instance keeps running on that version once a newer version has been saved; while it is
+    still the newest saved version, nothing is returned and the current definition
+    (proc_def.definition) is used as before. Drafts (e.g. a mining proposal) never pin.
+    """
+    if not arcv_id or not def_id:
+        return []
+    rows = (
+        supabase.table("proc_def_version").select("*")
+        .eq("proc_def_id", def_id.lower()).eq("arcv_id", arcv_id).eq("tenant_id", tenant_id)
+        .execute().data
+        or []
+    )
+    rows = [r for r in rows if not r.get("is_draft") and r.get("definition")]
+    if not rows or not rows[0].get("timeStamp"):
+        return []
+    newer = (
+        supabase.table("proc_def_version").select("arcv_id,is_draft")
+        .eq("proc_def_id", def_id.lower()).eq("tenant_id", tenant_id)
+        .gt("timeStamp", rows[0]["timeStamp"])
+        .execute().data
+        or []
+    )
+    return rows[:1] if any(not r.get("is_draft") for r in newer) else []
+
+
+def _instance_version(process_instance, supabase, tenant_id) -> Optional[str]:
+    """The version an instance runs on: stamped once, when it starts, and kept after that.
+
+    Re-stamping the latest version on every save moved running instances onto a version saved
+    after they started (their next steps then followed the new definition).
+    """
+    pinned = getattr(process_instance, "proc_def_version", None)
+    if pinned:
+        return pinned
+    try:
+        cur = (
+            supabase.table("bpm_proc_inst").select("proc_def_version")
+            .eq("proc_inst_id", process_instance.proc_inst_id).eq("tenant_id", tenant_id)
+            .limit(1).execute().data
+            or []
+        )
+        if cur and cur[0].get("proc_def_version"):
+            return cur[0]["proc_def_version"]
+    except Exception as e:
+        print(f"[WARN] instance version lookup failed for {process_instance.proc_inst_id}: {e}")
+    rows = (
+        supabase.table("proc_def_version").select("arcv_id,is_draft")
+        .eq("proc_def_id", process_instance.get_def_id().lower()).eq("tenant_id", tenant_id)
+        .order("version", desc=True).execute().data
+        or []
+    )
+    released = [r for r in rows if not r.get("is_draft")]
+    return released[0].get("arcv_id") if released else None
 
 
 def fetch_process_definition_latest_version(def_id, tenant_id: Optional[str] = None):
@@ -678,11 +737,8 @@ def upsert_process_instance(process_instance: ProcessInstance, tenant_id: Option
         if not tenant_id:
             tenant_id = subdomain_var.get()
             
-        process_definition_version = fetch_process_definition_latest_version(process_instance.get_def_id(), tenant_id)
-        if process_definition_version:
-            arcv_id = process_definition_version.get('arcv_id', None)
-        else:
-            arcv_id = None
+        # pinned at start: a running instance keeps its version, a new one gets the latest
+        arcv_id = _instance_version(process_instance, supabase, tenant_id)
 
         response = supabase.table('bpm_proc_inst').upsert({
             'proc_inst_id': process_instance.proc_inst_id,
