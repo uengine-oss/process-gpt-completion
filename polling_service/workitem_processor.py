@@ -28,7 +28,7 @@ from database import (
     fetch_todolist_by_proc_inst_id, execute_rpc, upsert_cancelled_workitem, insert_process_instance,
     fetch_child_instances_by_parent, fetch_organization_chart, fetch_workitems_by_root_proc_inst_id,
     get_field_value, group_fields_by_form, get_input_data, update_proc_def_prod_version,
-    insert_events, supabase_client_var
+    insert_events, supabase_client_var, setting_database
 )
 from decision_journal import (
     DecisionRecorder,
@@ -618,6 +618,8 @@ class ProcessResult(BaseModel):
 upsert_queue = queue.Queue()
 
 def upsert_worker():
+    # ContextVar 는 새 쓰레드로 전파되지 않으므로 이 쓰레드에서 클라이언트를 직접 설정한다
+    setting_database()
     last_upsert_time = 0
     last_item = None
     DEBOUNCE_SEC = 1  # 0.5초에 한 번만 upsert
@@ -630,7 +632,10 @@ def upsert_worker():
             pass  # 큐가 비어있으면 넘어감
         now = time.time()
         if last_item and (now - last_upsert_time) >= DEBOUNCE_SEC:
-            upsert_workitem(last_item[0], last_item[1])
+            try:
+                upsert_workitem(last_item[0], last_item[1])
+            except Exception as e:
+                print(f"[WARN] upsert_worker: {e}")
             last_upsert_time = now
             last_item = None
 
