@@ -916,7 +916,10 @@ def fetch_workitem_with_submitted_status(limit=10) -> Optional[List[dict]]:
         # Supabase Client API瑜??ъ슜?섏뿬 ?뚰겕?꾩씠??議고쉶 諛??낅뜲?댄듃
         # 癒쇱? SUBMITTED ?곹깭?닿퀬 consumer媛 NULL???뚰겕?꾩씠?쒕뱾??議고쉶
         # ?뚮꼳???섍꼍蹂?遺꾧린 ?놁씠 ???뚮꼳??怨듯넻 議곌굔?쇰줈 議고쉶
-        q = supabase.table('todolist').select('*').eq('status', 'SUBMITTED')
+        # 대화창 인계로 받은 할 일(proc_inst_id 없음)은 이어 갈 프로세스가 없다. 받은 쪽이 끝내면
+        # SUBMITTED 로 남는데, 이것까지 잡으면 정의를 못 찾아 매번 실패하면서 조회 한도를 다 차지해
+        # 실제 프로세스 워크아이템이 밀린다.
+        q = supabase.table('todolist').select('*').eq('status', 'SUBMITTED').not_.is_('proc_inst_id', 'null')
         if CONSUMER_FILTER:
             q = q.eq('consumer', CONSUMER_FILTER)
         else:
