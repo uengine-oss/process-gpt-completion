@@ -1699,42 +1699,6 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 workitem_dict["end_date"] = workitem.end_date.isoformat() if workitem.end_date else None
                 workitem_dict["due_date"] = workitem.due_date.isoformat() if workitem.due_date else None
 
-                # TEMP: 肄쒕큸 ?뚯뒪?몄퐫?쒕뱶 ?ㅼ쓬 ?낅Т ?앹꽦 ???뱀젙 ?대떦??frcp9408@gmail.com)?먭쾶 釉뚮씪?곗? 肄??몃━嫄?
-                try:
-                    target_email = "frcp9408@gmail.com"
-                    trigger_url = "https://monitor-faithful-slightly.ngrok-free.app/call/client"
-                    trigger_identity = "browser-user"
-                    status_val = (workitem_dict.get("status") or "").upper()
-                    assignee_id = workitem_dict.get("user_id")
-
-                    print(f"[TwilioTrigger][next] status={status_val} assignee_id={assignee_id} activity={workitem.activity_id}")
-
-                    if status_val in ("IN_PROGRESS", "TODO", "NEW") and isinstance(assignee_id, str):
-                        assignee_email = ""
-                        try:
-                            user_row = fetch_user_info(assignee_id)
-                            assignee_email = (user_row.get("email") or "").lower()
-                            print(f"[TwilioTrigger][next] resolved via user lookup -> email={assignee_email}")
-                        except Exception as e:
-                            print(f"[TwilioTrigger][next] user lookup failed ({assignee_id}): {e}")
-                            assignee_info = fetch_assignee_info(assignee_id) or {}
-                            assignee_email = (assignee_info.get("email") or assignee_id or "").lower()
-                            print(f"[TwilioTrigger][next] resolved via email fallback -> email={assignee_email}")
-
-                        if assignee_email == target_email and trigger_url:
-                            try:
-                                resp = requests.post(trigger_url, json={"identity": trigger_identity}, timeout=5)
-                                resp.raise_for_status()
-                                print(f"[TwilioTrigger][next] fired for {assignee_email} -> {trigger_url}")
-                            except Exception as exc:
-                                print(f"[TwilioTrigger][next] Failed trigger for {assignee_email}: {exc}")
-                        else:
-                            print(f"[TwilioTrigger][next] skipped: email mismatch or no trigger_url (email={assignee_email})")
-                    else:
-                        print(f"[TwilioTrigger][next] skipped: status={status_val}, assignee={assignee_id}")
-                except Exception as exc:
-                    print(f"[TwilioTrigger][next] Skipped trigger logic: {exc}")
-
                 # browser-automation-agent??寃쎌슦 ?곸꽭??description ?앹꽦
                 # if workitem.agent_orch == 'browser-automation-agent':
                 #     print(f"[DEBUG] Generating browser automation description for workitem: {workitem.id}")
