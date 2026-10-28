@@ -50,7 +50,8 @@ def _make_llm_call():
         resp = await client.chat.completions.create(
             model=model,
             messages=messages,
-            temperature=0.0,
+            # reasoning models (gpt-5/6, o-series) reject any temperature but the default
+            **({} if model.split("/")[-1].startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")) else {"temperature": 0.0}),
             # Current reasoning/chat models reject the legacy max_tokens field.
             max_completion_tokens=int(max_tokens or 4000),
             response_format={"type": "json_object"},

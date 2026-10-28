@@ -66,12 +66,14 @@ def create_llm(
 
     base_url = kwargs.pop("base_url", None) or _proxy_base_url()
     api_key = kwargs.pop("api_key", None) or _proxy_api_key()
+    # reasoning models (gpt-5/6, o-series) reject any temperature but the default
+    if not resolved_model.split("/")[-1].startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
+        kwargs["temperature"] = temperature
 
     return ChatOpenAI(
         model=resolved_model,
         base_url=base_url,
         api_key=api_key,
-        temperature=temperature,
         streaming=streaming,
         disable_streaming=not streaming,
         timeout=timeout,
