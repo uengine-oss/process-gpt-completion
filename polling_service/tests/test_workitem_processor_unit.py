@@ -1378,3 +1378,123 @@ async def test_rule_decided_sequences_are_not_resent_to_judge(wiproc):
         proc_def, activity_id="A1", workitem={"assignees": []}, sequence_condition_data=scd,
     )
     assert [p.get("nextActivityId") for p in payloads] == ["B1"]
+
+
+# ------------------------------------------------------------
+# 배타 갈림길에서 모델이 모든 길을 거짓으로 보면 한 번 더 묻는다
+# ------------------------------------------------------------
+class _SequencedConditionModel:
+    """호출마다 다음 답을 흘려보내는 가짜 판정 모델 — 받은 프롬프트를 남긴다."""
+
+    def __init__(self, *payloads):
+        self._texts = [json.dumps(p, ensure_ascii=False) for p in payloads]
+        self.prompts = []
+
+    async def astream(self, prompt, *_args, **_kwargs):
+        class _Chunk:
+            def __init__(self, content):
+                self.content = content
+
+        self.prompts.append(prompt)
+        yield _Chunk(self._texts[min(len(self.prompts), len(self._texts)) - 1])
+
+
+def _approval_gateway_definition(default_on=None):
+    gw = _Gateway("final_gateway", type="exclusiveGateway", name="최종 승인 결과")
+    gw.conditionData = []
+    props = {"s_send": None, "s_requote": None}
+    if default_on:
+        props[default_on] = json.dumps({"isDefault": True})
+    seqs = [
+        _Seq("s_in", source="first_approval", target="final_gateway", condition=""),
+        _Seq("s_send", source="final_gateway", target="send_to_customer", condition="최종 승인", properties=props["s_send"]),
+        _Seq("s_requote", source="final_gateway", target="calculate_quote", condition="반려(1차 또는 2차)", properties=props["s_requote"]),
+    ]
+    acts = [_Activity("first_approval"), _Activity("send_to_customer"), _Activity("calculate_quote")]
+    return _ProcDef(activities=acts, gateways=[gw], sequences=seqs)
+
+
+_ALL_FALSE = {"results": [
+    {"sequenceId": "s_send", "conditionMet": False, "reason": "판단 불가"},
+    {"sequenceId": "s_requote", "conditionMet": False, "reason": "판단 불가"},
+]}
+_SEND = {"results": [
+    {"sequenceId": "s_send", "conditionMet": True, "reason": "1차 승인 결정이 승인"},
+    {"sequenceId": "s_requote", "conditionMet": False, "reason": "반려 아님"},
+]}
+_APPROVED = {"first_approval_form": {"approval_decision": "approve"}}
+
+
+async def _judge(wiproc, proc_def, model):
+    scd = wiproc.get_sequence_condition_data(proc_def, "first_approval", ["send_to_customer", "calculate_quote"])
+    await wiproc._evaluate_sequence_conditions(model, None, proc_def, _APPROVED, {}, scd, [], workitem=None)
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="first_approval", workitem={"assignees": []}, sequence_condition_data=scd,
+    )
+    return scd, [p.get("nextActivityId") for p in payloads]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_all_false_is_rejudged_once(wiproc):
+    proc_def = _approval_gateway_definition()
+    model = _SequencedConditionModel(_ALL_FALSE, _SEND)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert len(model.prompts) == 2
+    second = json.loads(model.prompts[1])
+    assert "exactly one of them is satisfied" in second["instruction"]
+    assert [c["sequenceId"] for c in second["conditions"]] == ["s_send", "s_requote"]
+    assert scd["s_send"]["conditionEval"] is True
+    assert scd["s_send"]["conditionReason"].startswith("(재판정)")
+    assert next_ids == ["send_to_customer"]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_still_no_branch_after_rejudge_keeps_first_answer(wiproc):
+    proc_def = _approval_gateway_definition()
+    model = _SequencedConditionModel(_ALL_FALSE, _ALL_FALSE)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert len(model.prompts) == 2
+    assert scd["s_send"]["conditionEval"] is False and scd["s_requote"]["conditionEval"] is False
+    assert scd["s_send"]["conditionReason"] == "판단 불가"
+    assert next_ids == []
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_two_true_on_rejudge_is_not_used(wiproc):
+    proc_def = _approval_gateway_definition()
+    both = {"results": [
+        {"sequenceId": "s_send", "conditionMet": True},
+        {"sequenceId": "s_requote", "conditionMet": True},
+    ]}
+    model = _SequencedConditionModel(_ALL_FALSE, both)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert scd["s_send"]["conditionEval"] is False and scd["s_requote"]["conditionEval"] is False
+    assert next_ids == []
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_with_default_flow_is_not_rejudged(wiproc):
+    proc_def = _approval_gateway_definition(default_on="s_requote")
+    model = _SequencedConditionModel(_ALL_FALSE, _SEND)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert len(model.prompts) == 1
+    assert next_ids == ["calculate_quote"]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_with_a_true_branch_is_not_rejudged(wiproc):
+    proc_def = _approval_gateway_definition()
+    model = _SequencedConditionModel(_SEND, _ALL_FALSE)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert len(model.prompts) == 1
+    assert next_ids == ["send_to_customer"]
