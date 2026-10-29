@@ -30,6 +30,7 @@ from database import (
     get_field_value, group_fields_by_form, get_input_data, update_proc_def_prod_version
 )
 from process_definition import load_process_definition
+from condition_rules import evaluate_threshold_condition
 from code_executor import execute_python_code
 from smtp_handler import generate_email_template, send_email
 from mcp_processor import mcp_processor
@@ -2522,6 +2523,23 @@ async def _evaluate_sequence_conditions(model, parser, process_definition, all_w
                 condition_text = name_text
 
         if isinstance(condition_text, str) and condition_text.strip():
+            # "견적 총액 3,000만 원 미만" 처럼 한 필드를 한 숫자와 비교하는 조건은 규칙으로 판정한다.
+            # 판정 모델이 6,531,250 < 30,000,000 을 거짓으로 보아 두 갈래가 모두 막힌 일이 있었다
+            # (condition_rules 모듈 주석). 필드를 못 찾거나 숫자가 아니면 None — 예전처럼 모델이 판정한다.
+            try:
+                rule_result = evaluate_threshold_condition(
+                    condition_text,
+                    gateway_primary,
+                    [all_workitem_input_data, workitem_input_data],
+                    ui_definitions,
+                )
+            except Exception as e:
+                print(f"[WARN] rule evaluation failed on {sequence.id}: {e}")
+                rule_result = None
+            if rule_result is not None:
+                met, reason = rule_result
+                _set_condition_eval(sequence_condition_data, sequence.id, met, reason)
+                continue
             nl_condition_sequences.append((sequence.id, condition_text.strip(), gateway_primary))
 
     if nl_condition_sequences:
@@ -2660,6 +2678,10 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
         for sid, sdata in sequence_condition_data.items():
             sid_str = str(sid)
             if sid_str in existing_ids:
+                continue
+            # 이미 판정된 시퀀스(conditionFunction·규칙)는 모델에 다시 묻지 않는다. 물어도 답은
+            # 반영되지 않고(아래 id_resolver 에 없다) 토큰만 쓴다.
+            if isinstance(sdata, dict) and "conditionEval" in sdata:
                 continue
             cond_text = None
             name_text = None
