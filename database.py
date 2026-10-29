@@ -1230,6 +1230,13 @@ def upsert_chat_message(chat_room_id: str, data: Any, is_system: bool, tenant_id
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
+def _in_tenant(rows: list) -> Dict[str, str]:
+    """같은 id 의 사용자(에이전트)가 테넌트마다 한 줄씩 있을 수 있다(users 의 키는 id+tenant_id).
+    지금 테넌트의 줄을 고른다 — 아니면 다른 테넌트의 이름(예: 한국어 에이전트 이름)이 작업 항목에 적힌다."""
+    tenant = subdomain_var.get()
+    return next((r for r in rows if r.get("tenant_id") == tenant), rows[0])
+
+
 def fetch_user_info(email: str) -> Dict[str, str]:
     try:
         supabase = supabase_client_var.get()
@@ -1239,11 +1246,11 @@ def fetch_user_info(email: str) -> Dict[str, str]:
         response = supabase.table("users").select("*").eq('email', email).execute()
         
         if response.data and len(response.data) > 0:
-            return response.data[0]
+            return _in_tenant(response.data)
         else:
             response = supabase.table("users").select("*").eq('id', email).execute()
             if response.data and len(response.data) > 0:
-                return response.data[0]
+                return _in_tenant(response.data)
             else:
                 raise HTTPException(status_code=404, detail="User not found")
     except Exception as e:
