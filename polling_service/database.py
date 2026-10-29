@@ -1475,6 +1475,27 @@ def upsert_cancelled_workitem(process_instance_data, process_result_data, proces
     except Exception as e:
         print(f"[ERROR] upsert_cancelled_workitem: {str(e)}")
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+# 에이전트가 맡은 단계(COMPLETE)인데 정의에 orchestration 이 비었을 때 todolist 에 적을 실행기.
+# 예전에는 'crewai-deep-research' 로 박혀 있었는데, 공식 설치(process-gpt-infra-docker)에는
+# 그 값을 폴링하는 소비자가 없다 — todolist 를 폴링하는 범용 에이전트 실행기는 deepagents
+# (agent_orch='deepagents')이고, crewai-action 은 퇴역했다. 그래서 단계가 만들어지기만 하고
+# 아무도 집지 않았다. 다른 실행기를 쓰는 설치는 DEFAULT_AGENT_ORCH 로 바꾼다.
+_FALLBACK_AGENT_ORCH = "deepagents"
+
+
+def default_agent_orch() -> str:
+    value = (os.getenv("DEFAULT_AGENT_ORCH") or "").strip()
+    if value.lower() in ("", "none", "null"):
+        return _FALLBACK_AGENT_ORCH
+    return value
+
+
+def _is_empty_orch(value) -> bool:
+    return value is None or str(value).strip().lower() in ("", "none", "null")
+
+
 def safeget(obj, attr, default=None):
     return getattr(obj, attr, default)
 
@@ -1546,8 +1567,8 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
 
             if workitem.agent_mode == None:
                 workitem.agent_mode = determine_agent_mode(workitem.user_id, workitem.agent_mode)
-                if workitem.agent_mode == 'COMPLETE' and (workitem.agent_orch == 'none' or workitem.agent_orch == None):
-                    workitem.agent_orch = 'crewai-deep-research'
+                if workitem.agent_mode == 'COMPLETE' and _is_empty_orch(workitem.agent_orch):
+                    workitem.agent_orch = default_agent_orch()
             
             # ?낅젰 ?곗씠??異붽? (?뚯씪 ?뚯떛 ?ы븿)
             try:
@@ -1595,8 +1616,8 @@ def upsert_next_workitems(process_instance_data, process_result_data, process_de
                 agent_orch = safeget(activity, 'orchestration', None)
                 if agent_orch is None or agent_orch == 'none' or agent_orch == 'None' or agent_orch == '':
                     agent_orch = None
-                if agent_mode == 'COMPLETE' and (safeget(activity, 'orchestration', None) == 'none' or safeget(activity, 'orchestration', None) == None):
-                    agent_orch = 'crewai-deep-research'
+                if agent_mode == 'COMPLETE' and agent_orch is None:
+                    agent_orch = default_agent_orch()
                 
                 user_id = None
                 if next_user_email:
@@ -1906,8 +1927,8 @@ def upsert_todo_workitems(process_instance_data, process_result_data, process_de
                 agent_orch = safeget(activity, 'orchestration', None)
                 if agent_orch is None or agent_orch == 'none' or agent_orch == 'None' or agent_orch == '':
                     agent_orch = None
-                if agent_mode == 'COMPLETE' and (safeget(activity, 'orchestration', None) == 'none' or safeget(activity, 'orchestration', None) == None):
-                    agent_orch = 'crewai-deep-research'
+                if agent_mode == 'COMPLETE' and agent_orch is None:
+                    agent_orch = default_agent_orch()
                     
                 if agent_mode is not None and agent_mode != "none" and agent_mode != "None" and agent_mode != "":
                     agent_mode = agent_mode.upper()
