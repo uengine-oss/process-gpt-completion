@@ -2725,6 +2725,66 @@ def group_fields_by_form(field_values: dict) -> dict:
     
     return {form_id: fields for form_id, fields in form_groups.items() if fields}
 
+
+# 산출물이 확정된 워크아이템 상태(사람이 제출했거나 엔진이 끝낸 것)
+_COMPLETED_WORKITEM_STATUSES = ("DONE", "SUBMITTED", "COMPLETED")
+
+
+def _is_form_field_ref(entry: Any) -> bool:
+    """inputData 항목이 `<form_id>.<field>` 참조인가(get_field_value 가 읽을 수 있는 꼴)."""
+    if not isinstance(entry, str):
+        return False
+    form_id, dot, field_id = entry.strip().partition('.')
+    return bool(dot and form_id and field_id)
+
+
+def _completed_instance_outputs(workitem: dict) -> dict:
+    """같은 인스턴스에서 지금까지 완료된 다른 워크아이템의 산출물을 폼 id 별로 모은다.
+
+    output 은 보통 {form_id: {필드: 값}} 이라 그대로 합친다. 폼 id 로 감싸지 않은(평면) 산출물은
+    그 워크아이템의 폼 id(tool) — 없으면 activity id — 아래에 둔다(다른 단계의 같은 이름 칸과 섞이지 않게).
+    끝난 순서로 합쳐, 같은 폼이 두 번 끝났으면(반려 후 다시 작성) 나중 것이 남는다.
+    """
+    proc_inst_id = workitem.get('proc_inst_id')
+    if not proc_inst_id:
+        return {}
+    try:
+        rows = fetch_workitems_by_proc_inst_id(proc_inst_id, workitem.get('tenant_id')) or []
+    except Exception as e:
+        print(f"[WARNING][get_input_data] completed outputs lookup failed: {str(e)}")
+        return {}
+
+    def _attr(wi: Any, key: str) -> Any:
+        return getattr(wi, key, None) if not isinstance(wi, dict) else wi.get(key)
+
+    done = [
+        wi for wi in rows
+        if _attr(wi, 'id') != workitem.get('id')
+        and str(_attr(wi, 'status') or '').upper() in _COMPLETED_WORKITEM_STATUSES
+        and _attr(wi, 'output')
+    ]
+    done.sort(key=lambda wi: str(_attr(wi, 'end_date') or _attr(wi, 'start_date') or ''))
+
+    merged: dict = {}
+    for wi in done:
+        output = _attr(wi, 'output')
+        if isinstance(output, str):
+            try:
+                output = json.loads(output)
+            except Exception:
+                continue
+        if not isinstance(output, dict) or not output:
+            continue
+        tool = str(_attr(wi, 'tool') or '')
+        form_key = tool.split(':', 1)[1].strip() if tool.startswith('formHandler:') else ''
+        form_key = form_key or str(_attr(wi, 'activity_id') or '')
+        if form_key and form_key not in output:
+            merged[form_key] = output
+        else:
+            merged.update(output)
+    return merged
+
+
 def get_input_data(workitem: dict, process_definition: Any):
     """
     ?뚰겕?꾩씠???ㅽ뻾???꾩슂???낅젰 ?곗씠??異붿텧
@@ -2743,13 +2803,30 @@ def get_input_data(workitem: dict, process_definition: Any):
         input_fields = activity.inputData
         if len(input_fields) != 0:
             field_values = {}
+            named_inputs = []
             for input_field in input_fields:
+                if not _is_form_field_ref(input_field):
+                    named_inputs.append(input_field)
+                    continue
                 field_value = get_field_value(input_field, process_definition, workitem.get('proc_inst_id'), workitem.get('tenant_id'))
                 if field_value is not None:
                     field_values[input_field] = field_value
 
             grouped_data = group_fields_by_form(field_values)
             input_data.update(grouped_data)
+
+            # 폼 필드 참조(<form_id>.<field>)가 아닌 항목 — 데이터 이름(「견적요청서」) 등. 어느 폼의 어느
+            # 칸인지 알 수 없으니 이 인스턴스에서 지금까지 완료된 산출물을 모두 넘긴다. 예전에는 이런 항목이
+            # 하나도 읽히지 않아 바로 앞 단계 산출물만 넘어갔고, 견적 산출 에이전트가 두 단계 앞 요청서의
+            # 제품·수량을 못 받아 0원 견적을 냈다. 참조로 고른 폼은 고른 칸만 그대로 둔다.
+            if named_inputs:
+                completed = _completed_instance_outputs(workitem)
+                for form_key, value in completed.items():
+                    input_data.setdefault(form_key, value)
+                print(
+                    f"[INFO][get_input_data] activity={activity_id} non-ref inputData={named_inputs} "
+                    f"-> completed outputs of the instance: {list(completed.keys())}"
+                )
 
         if not input_data and not process_definition.is_starting_activity(activity_id):
             input_data = _get_prev_activity_form_data(workitem, process_definition)
