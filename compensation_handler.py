@@ -6,8 +6,10 @@ import os
 from llm_factory import create_llm
 from database import fetch_tenant_mcp_config, fetch_mcp_python_code, upsert_mcp_python_code, fetch_events_by_proc_inst_id_until_activity, upsert_workitem, fetch_user_info_by_uid
 
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
+# trace to LangSmith only when a key is set (otherwise every run logs a 401)
+if os.getenv("LANGSMITH_API_KEY"):
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 
 TEMPLATE = """# -*- coding: utf-8 -*-
 import os

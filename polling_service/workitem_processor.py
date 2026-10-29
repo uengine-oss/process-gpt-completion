@@ -2091,6 +2091,9 @@ def _role_binding_child_role(spec: Dict[str, Any]) -> Optional[str]:
 MEMENTO_SERVICE_URL = os.getenv("MEMENTO_SERVICE_URL", "http://memento-service:8005")
 
 def process_output(workitem, tenant_id):
+    # an install without Memento sets MEMENTO_SERVICE_URL to empty
+    if not MEMENTO_SERVICE_URL:
+        return None
     try:
         if workitem["output"] is None or workitem["output"] == {}:
             return

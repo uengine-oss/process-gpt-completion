@@ -28,8 +28,10 @@ if os.getenv("ENV") != "production":
     from langchain.globals import set_llm_cache
     set_llm_cache(SQLiteCache(database_path=".langchain.db"))
 
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
+# trace to LangSmith only when a key is set (otherwise every run logs a 401)
+if os.getenv("LANGSMITH_API_KEY"):
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 
 
 app = FastAPI(
