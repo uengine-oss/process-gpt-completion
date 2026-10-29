@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pytest
 
-from semantic_naming import fallback_semantic_name, generate_semantic_name
+from semantic_naming import fallback_semantic_name, generate_semantic_name, source_language
 from task_deadline import ensure_minimum_task_due_date
 
 
@@ -95,3 +95,23 @@ def test_instance_creation_day_wins_over_invalid_earlier_task_date():
     ensure_minimum_task_due_date(task, "2026-07-14T08:00:00+09:00")
     due = datetime.fromisoformat(task["due_date"])
     assert due.date().isoformat() == "2026-07-14"
+
+
+class CapturingModel:
+    def __init__(self):
+        self.prompt = ""
+
+    async def ainvoke(self, prompt):
+        self.prompt = prompt
+        return FakeChatResponse()
+
+
+@pytest.mark.asyncio
+async def test_chat_name_follows_message_language():
+    assert source_language("Create a sales proposal process.\n[ExecutionPolicy]\n- 한국어 지시") == "en"
+    assert source_language("영업 제안서 프로세스를 만들어 줘") == "ko"
+    en, ko = CapturingModel(), CapturingModel()
+    await generate_semantic_name(en, kind="chat", source="Create a sales proposal process for our customers")
+    await generate_semantic_name(ko, kind="chat", source="영업 제안서 프로세스를 만들어 줘")
+    assert "제목도 영어로" in en.prompt and "한국어 기준 30자" not in en.prompt
+    assert "한국어 기준 30자" in ko.prompt and "제목도 영어로" not in ko.prompt

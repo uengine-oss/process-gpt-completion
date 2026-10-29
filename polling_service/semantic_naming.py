@@ -36,6 +36,19 @@ def fallback_semantic_name(kind: str, source: Any, process_name: str = "") -> st
     return sanitize_generated_name(summary, max_length=50) or "새 대화"
 
 
+# 프론트가 사용자 글 뒤에 붙이는 시스템 블록(한국어 지시문) — 언어 판단에서 뺀다
+_SYSTEM_BLOCK = re.compile(r"\n?\[(?:ExecutionPolicy|InputData|OpenUIForm)\]")
+
+
+def source_language(text: str) -> str:
+    """첫 메시지의 언어 — 한글이 없고 영문자가 3자 이상이면 'en', 아니면 'ko'.
+    영어로 요청해도 제목 규칙·예시가 한국어라 대화 목록에 한국어 제목이 붙었다."""
+    head = _SYSTEM_BLOCK.split(str(text or ""), maxsplit=1)[0]
+    if re.search(r"[가-힣]", head):
+        return "ko"
+    return "en" if len(re.findall(r"[A-Za-z]", head)) >= 3 else "ko"
+
+
 def _response_content(response: Any) -> str:
     content = getattr(response, "content", response)
     if isinstance(content, list):
@@ -61,10 +74,18 @@ async def generate_semantic_name(model: Any, *, kind: str, source: Any, process_
     else:
         rule = "사용자의 첫 요청에서 업무 목적과 핵심 대상을 직접 추출해 제목으로 요약하세요."
 
+    if source_language(source_text) == "en":
+        length_rule = (
+            "- 첫 메시지가 영어이므로 제목도 영어로, 40자 이내 2~6개 단어의 구체적인 명사구로 작성합니다.\n"
+            "- 예: 'Create a vacation request process' → {\"name\":\"Vacation request process design\"}"
+        )
+    else:
+        length_rule = "- 한국어 기준 30자 이내, 2~6개 단어의 구체적인 명사구로 작성합니다."
+
     prompt = f"""당신은 업무 목록의 짧은 제목을 만드는 도우미입니다.
 {rule}
 - 입력 문장은 아래 '첫 메시지'에 있으며, 반드시 그 내용을 직접 읽고 분석합니다.
-- 한국어 기준 30자 이내, 2~6개 단어의 구체적인 명사구로 작성합니다.
+{length_rule}
 - 인사말, 설명, 따옴표, 번호, 마침표를 넣지 않습니다.
 - 입력에 없는 사실을 만들지 않습니다.
 - '목적 미상', '대상 미상', '새 요청', '사용자 요청' 같은 일반 문구는 금지합니다.
