@@ -1260,3 +1260,241 @@ async def test_nl_condition_applies_with_whitespace_and_case_and_isMet_key(wipro
         sequence_condition_data=sequence_condition_data,
     )
     assert [p.get("nextActivityId") for p in payloads] == ["B1"]
+
+
+# ------------------------------------------------------------
+# 금액 갈림길: 「한빛오피스 대량 주문 견적 승인」 의 견적 산출(에이전트) → 1차 승인 여부 결정
+# ------------------------------------------------------------
+class _RecordingConditionModel(_FakeConditionModel):
+    """가짜 판정 모델 — 받은 프롬프트를 남긴다."""
+
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.prompts = []
+
+    async def astream(self, prompt, *_args, **_kwargs):
+        self.prompts.append(prompt)
+        async for chunk in super().astream(prompt):
+            yield chunk
+
+
+_QUOTE_FORM = "df017161-1553-4173-a7b2-bb339e2d1859_calculate_quote_form"
+
+
+def _quote_gateway_definition():
+    gw1 = _Gateway("approval_gateway_1", type="exclusiveGateway", name="1차 승인 여부 결정(3,000만 원 미만)")
+    # 생성된 정의 그대로: 산출 폼에 없는 칸을 가리킨다
+    gw1.conditionData = [f"{_QUOTE_FORM}.approval_gateway_1_decision"]
+    gw2 = _Gateway("approval_gateway_2", type="exclusiveGateway", name="2차 승인 여부 결정(3,000만 원 이상)")
+    gw2.conditionData = []
+    seqs = [
+        _Seq("seq_quote_gateway1", source="calculate_quote", target="approval_gateway_1", condition=""),
+        _Seq("seq_gateway1_firstappr", source="approval_gateway_1", target="first_approval", condition="견적 총액 3,000만 원 미만"),
+        _Seq("seq_gateway1_gateway2", source="approval_gateway_1", target="approval_gateway_2", condition="견적 총액 3,000만 원 이상"),
+        _Seq("seq_gateway2_secondappr", source="approval_gateway_2", target="second_approval", condition=""),
+    ]
+    acts = [
+        _Activity("calculate_quote", name="견적 산출"),
+        _Activity("first_approval", name="1차 승인(영업팀장)", role="영업팀장"),
+        _Activity("second_approval", name="2차 승인(재무 담당)", role="재무 담당"),
+    ]
+    return _ProcDef(activities=acts, gateways=[gw1, gw2], sequences=seqs)
+
+
+_QUOTE_UI = [
+    types.SimpleNamespace(
+        id=_QUOTE_FORM,
+        fields_json=[
+            {"key": "subtotal", "text": "제품별 합계"},
+            {"key": "total_price", "text": "견적 총액"},
+            {"key": "discount_rate", "text": "수량 할인율"},
+        ],
+    )
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("total, expected", [(6531250, ["first_approval"]), (45000000, ["second_approval"])])
+async def test_amount_gateway_after_agent_step_routes_by_rule_not_judge(wiproc, monkeypatch, total, expected):
+    """판정 모델이 두 갈래 모두 거짓이라 답해도(VM 에서 실제로 그랬다) 금액 비교는 규칙으로 정해져 1차 승인으로 간다."""
+    proc_def = _quote_gateway_definition()
+    monkeypatch.setattr(wiproc, "get_field_value", lambda *_a, **_k: None)  # approval_gateway_1_decision 칸은 없다
+    model = _RecordingConditionModel({
+        "results": [
+            {"sequenceId": "seq_gateway1_firstappr", "conditionMet": False, "reason": "3,000만 원 미만이 아님"},
+            {"sequenceId": "seq_gateway1_gateway2", "conditionMet": False, "reason": "3,000만 원 이상이 아님"},
+        ]
+    })
+    outputs = {_QUOTE_FORM: {"subtotal": 6875000, "total_price": total, "discount_rate": 5}}
+
+    scd = wiproc.get_sequence_condition_data(proc_def, "calculate_quote", ["first_approval", "second_approval"])
+    await wiproc._evaluate_sequence_conditions(
+        model, None, proc_def, outputs, {}, scd, _QUOTE_UI,
+        workitem={"id": "w1", "proc_inst_id": "p1", "tenant_id": "localhost"},
+    )
+
+    assert model.prompts == []  # 판정 모델을 부르지 않았다
+    assert "규칙으로 판정" in scd["seq_gateway1_firstappr"]["conditionReason"]
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="calculate_quote", workitem={"assignees": []}, sequence_condition_data=scd,
+    )
+    assert [p.get("nextActivityId") for p in payloads] == expected
+    decisions = wiproc.build_gateway_decisions(proc_def, scd)
+    assert len(decisions["approval_gateway_1"]["selected"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_rule_decided_sequences_are_not_resent_to_judge(wiproc):
+    """규칙으로 정한 시퀀스는 판정 모델 프롬프트에 다시 넣지 않는다 — 말로 된 조건만 묻는다."""
+    gw = _Gateway("G1", type="exclusiveGateway")
+    gw.conditionData = []
+    gw2 = _Gateway("G2", type="exclusiveGateway")
+    gw2.conditionData = []
+    seqs = [
+        _Seq("s0", source="A1", target="G1"),
+        _Seq("s_low", source="G1", target="G2", condition="견적 총액 3,000만 원 미만"),
+        _Seq("s_high", source="G1", target="B3", condition="견적 총액 3,000만 원 이상"),
+        _Seq("s_ok", source="G2", target="B1", condition="고객이 VIP 인 경우"),
+        _Seq("s_no", source="G2", target="B2", condition="고객이 VIP 가 아닌 경우"),
+    ]
+    acts = [_Activity("A1"), _Activity("B1"), _Activity("B2"), _Activity("B3")]
+    proc_def = _ProcDef(activities=acts, gateways=[gw, gw2], sequences=seqs)
+    model = _RecordingConditionModel({
+        "results": [
+            {"sequenceId": "s_ok", "conditionMet": True},
+            {"sequenceId": "s_no", "conditionMet": False},
+        ]
+    })
+    scd = wiproc.get_sequence_condition_data(proc_def, "A1", ["B1", "B2", "B3"])
+    await wiproc._evaluate_sequence_conditions(
+        model, None, proc_def, {_QUOTE_FORM: {"total_price": 6531250}}, {}, scd, _QUOTE_UI, workitem=None,
+    )
+
+    assert len(model.prompts) == 1
+    sent = json.loads(model.prompts[0])
+    assert [c["sequenceId"] for c in sent["conditions"]] == ["s_ok", "s_no"]
+    assert scd["s_low"]["conditionEval"] is True and scd["s_high"]["conditionEval"] is False
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="A1", workitem={"assignees": []}, sequence_condition_data=scd,
+    )
+    assert [p.get("nextActivityId") for p in payloads] == ["B1"]
+
+
+# ------------------------------------------------------------
+# 배타 갈림길에서 모델이 모든 길을 거짓으로 보면 한 번 더 묻는다
+# ------------------------------------------------------------
+class _SequencedConditionModel:
+    """호출마다 다음 답을 흘려보내는 가짜 판정 모델 — 받은 프롬프트를 남긴다."""
+
+    def __init__(self, *payloads):
+        self._texts = [json.dumps(p, ensure_ascii=False) for p in payloads]
+        self.prompts = []
+
+    async def astream(self, prompt, *_args, **_kwargs):
+        class _Chunk:
+            def __init__(self, content):
+                self.content = content
+
+        self.prompts.append(prompt)
+        yield _Chunk(self._texts[min(len(self.prompts), len(self._texts)) - 1])
+
+
+def _approval_gateway_definition(default_on=None):
+    gw = _Gateway("final_gateway", type="exclusiveGateway", name="최종 승인 결과")
+    gw.conditionData = []
+    props = {"s_send": None, "s_requote": None}
+    if default_on:
+        props[default_on] = json.dumps({"isDefault": True})
+    seqs = [
+        _Seq("s_in", source="first_approval", target="final_gateway", condition=""),
+        _Seq("s_send", source="final_gateway", target="send_to_customer", condition="최종 승인", properties=props["s_send"]),
+        _Seq("s_requote", source="final_gateway", target="calculate_quote", condition="반려(1차 또는 2차)", properties=props["s_requote"]),
+    ]
+    acts = [_Activity("first_approval"), _Activity("send_to_customer"), _Activity("calculate_quote")]
+    return _ProcDef(activities=acts, gateways=[gw], sequences=seqs)
+
+
+_ALL_FALSE = {"results": [
+    {"sequenceId": "s_send", "conditionMet": False, "reason": "판단 불가"},
+    {"sequenceId": "s_requote", "conditionMet": False, "reason": "판단 불가"},
+]}
+_SEND = {"results": [
+    {"sequenceId": "s_send", "conditionMet": True, "reason": "1차 승인 결정이 승인"},
+    {"sequenceId": "s_requote", "conditionMet": False, "reason": "반려 아님"},
+]}
+_APPROVED = {"first_approval_form": {"approval_decision": "approve"}}
+
+
+async def _judge(wiproc, proc_def, model):
+    scd = wiproc.get_sequence_condition_data(proc_def, "first_approval", ["send_to_customer", "calculate_quote"])
+    await wiproc._evaluate_sequence_conditions(model, None, proc_def, _APPROVED, {}, scd, [], workitem=None)
+    payloads = wiproc.resolve_next_activity_payloads(
+        proc_def, activity_id="first_approval", workitem={"assignees": []}, sequence_condition_data=scd,
+    )
+    return scd, [p.get("nextActivityId") for p in payloads]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_all_false_is_rejudged_once(wiproc):
+    proc_def = _approval_gateway_definition()
+    model = _SequencedConditionModel(_ALL_FALSE, _SEND)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert len(model.prompts) == 2
+    second = json.loads(model.prompts[1])
+    assert "exactly one of them is satisfied" in second["instruction"]
+    assert [c["sequenceId"] for c in second["conditions"]] == ["s_send", "s_requote"]
+    assert scd["s_send"]["conditionEval"] is True
+    assert scd["s_send"]["conditionReason"].startswith("(재판정)")
+    assert next_ids == ["send_to_customer"]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_still_no_branch_after_rejudge_keeps_first_answer(wiproc):
+    proc_def = _approval_gateway_definition()
+    model = _SequencedConditionModel(_ALL_FALSE, _ALL_FALSE)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert len(model.prompts) == 2
+    assert scd["s_send"]["conditionEval"] is False and scd["s_requote"]["conditionEval"] is False
+    assert scd["s_send"]["conditionReason"] == "판단 불가"
+    assert next_ids == []
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_two_true_on_rejudge_is_not_used(wiproc):
+    proc_def = _approval_gateway_definition()
+    both = {"results": [
+        {"sequenceId": "s_send", "conditionMet": True},
+        {"sequenceId": "s_requote", "conditionMet": True},
+    ]}
+    model = _SequencedConditionModel(_ALL_FALSE, both)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert scd["s_send"]["conditionEval"] is False and scd["s_requote"]["conditionEval"] is False
+    assert next_ids == []
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_with_default_flow_is_not_rejudged(wiproc):
+    proc_def = _approval_gateway_definition(default_on="s_requote")
+    model = _SequencedConditionModel(_ALL_FALSE, _SEND)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert len(model.prompts) == 1
+    assert next_ids == ["calculate_quote"]
+
+
+@pytest.mark.asyncio
+async def test_exclusive_gateway_with_a_true_branch_is_not_rejudged(wiproc):
+    proc_def = _approval_gateway_definition()
+    model = _SequencedConditionModel(_SEND, _ALL_FALSE)
+
+    scd, next_ids = await _judge(wiproc, proc_def, model)
+
+    assert len(model.prompts) == 1
+    assert next_ids == ["send_to_customer"]

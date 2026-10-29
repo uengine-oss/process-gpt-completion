@@ -30,6 +30,7 @@ from database import (
     get_field_value, group_fields_by_form, get_input_data, update_proc_def_prod_version
 )
 from process_definition import load_process_definition
+from condition_rules import evaluate_threshold_condition
 from code_executor import execute_python_code
 from smtp_handler import generate_email_template, send_email
 from mcp_processor import mcp_processor
@@ -2522,10 +2523,120 @@ async def _evaluate_sequence_conditions(model, parser, process_definition, all_w
                 condition_text = name_text
 
         if isinstance(condition_text, str) and condition_text.strip():
+            # "견적 총액 3,000만 원 미만" 처럼 한 필드를 한 숫자와 비교하는 조건은 규칙으로 판정한다.
+            # 판정 모델이 6,531,250 < 30,000,000 을 거짓으로 보아 두 갈래가 모두 막힌 일이 있었다
+            # (condition_rules 모듈 주석). 필드를 못 찾거나 숫자가 아니면 None — 예전처럼 모델이 판정한다.
+            try:
+                rule_result = evaluate_threshold_condition(
+                    condition_text,
+                    gateway_primary,
+                    [all_workitem_input_data, workitem_input_data],
+                    ui_definitions,
+                )
+            except Exception as e:
+                print(f"[WARN] rule evaluation failed on {sequence.id}: {e}")
+                rule_result = None
+            if rule_result is not None:
+                met, reason = rule_result
+                _set_condition_eval(sequence_condition_data, sequence.id, met, reason)
+                continue
             nl_condition_sequences.append((sequence.id, condition_text.strip(), gateway_primary))
 
     if nl_condition_sequences:
         await _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions)
+        await _rejudge_exclusive_gateways_without_branch(
+            model, parser, process_definition, all_workitem_input_data, workitem_input_data,
+            nl_condition_sequences, sequence_condition_data, ui_definitions,
+        )
+
+
+_XOR_REJUDGE_INSTRUCTION = (
+    "These conditions are the outgoing branches of ONE exclusive (XOR) gateway, so in a consistent process "
+    "exactly one of them is satisfied. A first evaluation marked every branch as not satisfied, which usually "
+    "means a misreading. Re-check each condition against the data. Before comparing amounts, write both sides "
+    "as plain integers (Korean units: 만 = 10,000, 억 = 100,000,000; e.g. 3,000만 원 = 30,000,000). "
+    "If the data really satisfies none of them, mark all of them as not satisfied."
+)
+
+
+def _is_default_sequence(seq: Any) -> bool:
+    """resolve_next_activity_payloads 와 같은 기준 — 기본 흐름이면 '모두 거짓' 도 정상 경로다."""
+    props = getattr(seq, "properties", None)
+    if isinstance(props, str):
+        try:
+            props = json.loads(props)
+        except Exception:
+            props = None
+    if not isinstance(props, dict):
+        return False
+    return any(isinstance(props.get(k), bool) and props.get(k) for k in ("default", "isDefault", "defaultFlow", "default_flow"))
+
+
+async def _rejudge_exclusive_gateways_without_branch(model, parser, process_definition, all_workitem_input_data,
+                                                    workitem_input_data, nl_condition_sequences,
+                                                    sequence_condition_data, ui_definitions):
+    """배타 갈림길의 나가는 길이 모두 모델 판정으로 거짓이면, 그 갈림길만 한 번 더 묻는다.
+
+    배타 갈림길은 길 하나를 골라야 한다. 기본 흐름 없이 모두 거짓이면 resolve_next_activity_payloads 가
+    다음 단계를 하나도 만들지 않아 인스턴스가 RUNNING · current_activity_ids {} 로 조용히 멈춘다.
+    판정 모델은 같은 입력에도 답이 흔들리므로(금액 비교를 세 번에 두 번 틀렸다), 「이 조건들 가운데
+    하나가 맞아야 한다」는 사실을 알려 주고 다시 묻는다. 다시 물어 정확히 하나가 참일 때만 그 답을 쓰고,
+    아니면 첫 판정을 그대로 둔다(데이터가 정말 어느 쪽에도 맞지 않을 수 있다).
+    """
+    if not process_definition or not nl_condition_sequences or not isinstance(sequence_condition_data, dict):
+        return
+    by_id = {t[0]: t for t in nl_condition_sequences if isinstance(t, (list, tuple)) and t and t[0]}
+    sequences = list(getattr(process_definition, "sequences", None) or [])
+    gateway_ids: list = []
+    for seq in sequences:
+        source = getattr(seq, "source", None)
+        if getattr(seq, "id", None) in by_id and source and source not in gateway_ids:
+            gateway_ids.append(source)
+
+    for gateway_id in gateway_ids:
+        try:
+            gateway = process_definition.find_gateway_by_id(gateway_id)
+            gw_type = str(getattr(gateway, "type", None) or "").lower() if gateway else ""
+            if not ("exclusive" in gw_type or gw_type in ("xor", "xorgateway")):
+                continue
+            outgoing = [s for s in sequences if getattr(s, "source", None) == gateway_id]
+            if len(outgoing) < 2 or any(_is_default_sequence(s) for s in outgoing):
+                continue
+            entries = [sequence_condition_data.get(s.id) for s in outgoing]
+            # 모든 길이 모델 판정을 받았고, 모두 거짓일 때만. 규칙·conditionFunction 으로 정한 길이 섞여
+            # 있으면 그 판정을 흔들지 않는다.
+            if not all(s.id in by_id for s in outgoing):
+                continue
+            if not all(isinstance(e, dict) and "conditionEval" in e for e in entries):
+                continue
+            if any(e.get("conditionEval") for e in entries):
+                continue
+
+            retry = {
+                s.id: {k: v for k, v in sequence_condition_data[s.id].items() if k not in ("conditionEval", "conditionReason")}
+                for s in outgoing
+            }
+            await _evaluate_nl_conditions(
+                model, parser, all_workitem_input_data, workitem_input_data,
+                [by_id[s.id] for s in outgoing], retry, ui_definitions,
+                extra_instruction=_XOR_REJUDGE_INSTRUCTION,
+            )
+            chosen = [sid for sid, entry in retry.items() if entry.get("conditionEval") is True]
+            if len(chosen) == 1:
+                for sid, entry in retry.items():
+                    reason = entry.get("conditionReason")
+                    _set_condition_eval(
+                        sequence_condition_data, sid, entry.get("conditionEval"),
+                        f"(재판정) {reason}" if reason else "(재판정)",
+                    )
+                print(f"[INFO] exclusive gateway {gateway_id}: no branch on the first judgement, re-judged -> {chosen[0]}")
+            else:
+                print(
+                    f"[WARN] exclusive gateway {gateway_id}: no outgoing condition met "
+                    f"(re-judged true={chosen}); the instance waits at this gateway"
+                )
+        except Exception as e:
+            print(f"[WARN] re-judging exclusive gateway {gateway_id} failed: {e}")
 
 
 def _set_condition_eval(sequence_condition_data, seq_id, condition_met, reason=None):
@@ -2608,7 +2719,7 @@ def _persist_gateway_decisions(workitem: dict, process_definition: Any,
         print(f"[WARN] Failed to persist gateway decisions for {workitem.get('id')}: {str(e)}")
 
 
-async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions):
+async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workitem_input_data, nl_condition_sequences, sequence_condition_data, ui_definitions, extra_instruction: Optional[str] = None):
     ui_field_keys = collect_ui_field_keys(ui_definitions)
     all_workitem_input_data = apply_field_name_annotation_recursively(all_workitem_input_data, ui_definitions, ui_field_keys)
     workitem_input_data = apply_field_name_annotation_recursively(workitem_input_data, ui_definitions, ui_field_keys)
@@ -2661,6 +2772,10 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
             sid_str = str(sid)
             if sid_str in existing_ids:
                 continue
+            # 이미 판정된 시퀀스(conditionFunction·규칙)는 모델에 다시 묻지 않는다. 물어도 답은
+            # 반영되지 않고(아래 id_resolver 에 없다) 토큰만 쓴다.
+            if isinstance(sdata, dict) and "conditionEval" in sdata:
+                continue
             cond_text = None
             name_text = None
             try:
@@ -2696,6 +2811,7 @@ async def _evaluate_nl_conditions(model, parser, all_workitem_input_data, workit
             "evaluate the condition USING ONLY that 'primaryData'. Treat empty / missing / null / 'no' / unchecked "
             "values literally — do NOT infer a positive answer from other forms or general context. "
             "If 'primaryData' is absent, use runtimeContext.current_output and runtimeContext.previous_outputs."
+            + (f" {extra_instruction}" if extra_instruction else "")
         ),
         "outputFormat": {"results": [{"sequenceId": "...", "conditionMet": True, "reason": "optional explanation"}]},
         "runtimeContext": runtime_context,
