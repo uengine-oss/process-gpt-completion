@@ -4,9 +4,9 @@ from typing import Optional, Dict, Any
 from uuid import uuid4
 from dotenv import load_dotenv
 from mem0_agent_client import process_mem0_message
+from agent_card_fetch import CardFetchError, fetch_agent_card
 from fastapi.responses import StreamingResponse, JSONResponse
 
-import requests
 import os
 
 if os.getenv("ENV") != "production":
@@ -51,15 +51,10 @@ async def health_check():
     return {"status": "healthy"}
 
 def fetch_data(agent_url: str = Query(..., description="Agent URL to fetch data from")):
-    """Fetch agent data endpoint."""
+    """Fetch the A2A agent card at agent_url (see agent_card_fetch for what is allowed)."""
     try:
-        if not agent_url.startswith(('http://', 'https://')):
-            agent_url = 'http://' + agent_url
-        agent_data = requests.get(
-            f'{agent_url}/.well-known/agent.json'
-        )
-        return agent_data.json()
-    except Exception as e:
-        print(f"Error in fetch_data endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return fetch_agent_card(agent_url)
+    except CardFetchError as e:
+        print(f"Error in fetch_data endpoint: {e}")
+        raise HTTPException(status_code=e.status, detail=str(e))
 
