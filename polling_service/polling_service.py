@@ -47,7 +47,8 @@ async def safe_handle_workitem(workitem):
             version = workitem.get('version')
             tenant_id = workitem['tenant_id']
             arcv_id = None
-            if not version_tag and not version and workitem.get('proc_inst_id'):
+            # a bare tag ('major') is not a pin: the instance's own version decides
+            if not version and workitem.get('proc_inst_id'):
                 try:
                     process_instance = fetch_process_instance(workitem['proc_inst_id'], tenant_id)
                     if process_instance and getattr(process_instance, "proc_def_version", None):

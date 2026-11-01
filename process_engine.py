@@ -615,7 +615,8 @@ async def handle_get_feedback(request: Request):
         version = body.get('version')
         tenant_id = getattr(workitem, "tenant_id", None) if workitem else None
         arcv_id = None
-        if workitem and not version_tag and not version:
+        # a bare tag ('major') is not a pin: the instance's own version decides
+        if workitem and not version:
             process_instance = fetch_process_instance(workitem.proc_inst_id)
             if process_instance and getattr(process_instance, "proc_def_version", None):
                 arcv_id = process_instance.proc_def_version
@@ -758,7 +759,8 @@ async def handle_get_feedback_diff(request: Request):
         version = body.get('version')
         tenant_id = workitem.tenant_id
         arcv_id = None
-        if not version_tag and not version:
+        # a bare tag ('major') is not a pin: the instance's own version decides
+        if not version:
             process_instance = fetch_process_instance(workitem.proc_inst_id)
             if process_instance and getattr(process_instance, "proc_def_version", None):
                 arcv_id = process_instance.proc_def_version
@@ -856,7 +858,8 @@ async def get_reference_workitems(workitem):
         version = getattr(workitem, "version", None)
         process_instance = fetch_process_instance(workitem.proc_inst_id)
         arcv_id = None
-        if not version_tag and not version:
+        # a bare tag ('major') is not a pin: the instance's own version decides
+        if not version:
             if process_instance and getattr(process_instance, "proc_def_version", None):
                 arcv_id = process_instance.proc_def_version
 
@@ -917,7 +920,8 @@ async def get_all_next_workitems(workitem):
         version = getattr(workitem, "version", None)
         process_instance = fetch_process_instance(workitem.proc_inst_id)
         arcv_id = None
-        if not version_tag and not version:
+        # a bare tag ('major') is not a pin: the instance's own version decides
+        if not version:
             if process_instance and getattr(process_instance, "proc_def_version", None):
                 arcv_id = process_instance.proc_def_version
 
