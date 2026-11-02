@@ -42,6 +42,17 @@ class CustomJsonOutputParser(SimpleJsonOutputParser):
 parser = CustomJsonOutputParser()
 
 
+def require_process_definition(process_definition_id, process_definition):
+    """정의를 못 찾으면 원인이 보이는 404 로 끝낸다. 테넌트가 어긋날 때 가장 흔히 나타난다."""
+    if process_definition:
+        return process_definition
+    from database import subdomain_var
+    raise HTTPException(
+        status_code=404,
+        detail=f"Process definition '{process_definition_id}' not found for tenant '{subdomain_var.get()}'",
+    )
+
+
 async def handle_submit(request: Request):
     try:
         json_data = await request.json()
@@ -191,6 +202,9 @@ async def submit_workitem(input: dict):
                 process_definition = load_process_definition(process_definition_json) if process_definition_json else process_definition
             except Exception as e:
                 print(f"[SUBMIT][{trace_id}] warn: failed to reload definition after task_id override: {e}")
+
+    if process_definition_id:
+        require_process_definition(process_definition_id, process_definition_json)
 
     # Resolve activity_id as early as possible (needed for matching existing todolist row)
     start_event_id = input.get('start_event_id')
@@ -433,6 +447,7 @@ async def handle_role_binding(request: Request):
                 version_tag,
                 version,
             )
+            require_process_definition(process_definition_id, process_definition)
             roles = process_definition.get('roles')
             if roles and isinstance(roles, list) and len(roles) > 0:
                 for role in roles:
@@ -477,6 +492,8 @@ async def handle_role_binding(request: Request):
 
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 ############# end of role binding #############
@@ -492,7 +509,9 @@ async def initiate_workitem(input: dict):
         version_tag,
         version,
     )
-    process_definition = load_process_definition(process_definition_json)
+    process_definition = load_process_definition(
+        require_process_definition(process_definition_id, process_definition_json)
+    )
     project_id = input.get('project_id')
     
     activity = process_definition.find_initial_activity()

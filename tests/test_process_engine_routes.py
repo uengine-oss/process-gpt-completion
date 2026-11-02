@@ -28,3 +28,33 @@ def test_handover_suggest_chain_is_built_lazily(monkeypatch):
     assert process_engine.handover_suggest_chain().invoke(
         {"artifacts": "[]", "recentMessages": "[]", "organizationChart": ""}
     ) == {"doneLabel": "a"}
+
+
+def _app(monkeypatch, tenant="localhost"):
+    from fastapi.testclient import TestClient
+    import database
+
+    app = FastAPI()
+    process_engine.add_routes_to_app(app)
+    monkeypatch.setattr(process_engine, "fetch_process_definition_by_version", lambda *a, **k: None)
+    database.subdomain_var.set(tenant)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_complete_reports_missing_definition_with_tenant(monkeypatch):
+    res = _app(monkeypatch).post("/complete", json={"input": {
+        "process_instance_id": "def.inst",
+        "process_definition_id": "def",
+        "activity_id": "task1",
+        "role_mappings": [{"name": "r", "endpoint": "u"}],
+    }})
+    assert res.status_code == 404
+    assert "'def'" in res.json()["detail"]
+    assert "tenant" in res.json()["detail"]
+
+
+def test_role_binding_reports_missing_definition(monkeypatch):
+    res = _app(monkeypatch).post("/role-binding", json={"input": {
+        "roles": [], "uuid": "u", "proc_def_id": "def",
+    }})
+    assert res.status_code == 404
