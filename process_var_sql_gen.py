@@ -1,10 +1,11 @@
 from fastapi import HTTPException, Request
 from langchain_core.prompts import PromptTemplate
 from langserve import add_routes
-from llm_factory import create_llm
+from llm_factory import create_llm, openai_compatible_client_config
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from database import fetch_all_process_definition_ids, execute_sql, generate_create_statement_for_table, fetch_all_process_definitions, upsert_chat_message, fetch_todolist_by_user_id, fetch_process_instance_list, subdomain_var, fetch_ui_definition, get_vector_store, fetch_all_ui_definition, fetch_organization_chart
 from process_engine import submit_workitem
+import os
 import re
 import json
 from decimal import Decimal
@@ -711,16 +712,18 @@ intent_classification_chain = (
 from langchain_core.runnables import RunnablePassthrough
 
 def generate_speech(part):
-    speech_file_path = Path(__file__).parent / "speech.mp3"
-    response = openai.audio.speech.create(
-        model="tts-1",
+    from openai import OpenAI
+
+    config = openai_compatible_client_config()
+    client = OpenAI(api_key=config["api_key"], base_url=config["openai_base_url"])
+    response = client.audio.speech.create(
+        # 프록시에 등록된 이름으로 바꿀 수 있게 환경변수로 뺀다 (STT_MODEL 과 같은 방식).
+        model=(os.getenv("TTS_MODEL") or "").strip() or "tts-1",
         voice="nova",  # alloy
         speed=1.2,
         input=part
     )
-    response.stream_to_file(speech_file_path)
-    with open(speech_file_path, 'rb') as file:
-        return file.read()
+    return response.content
 
 
 import uuid

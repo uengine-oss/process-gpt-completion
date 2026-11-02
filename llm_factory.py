@@ -59,6 +59,15 @@ def openai_compatible_client_config() -> dict[str, str]:
     }
 
 
+# 모든 LLM 호출은 프록시를 지난다. 호출부(요청의 modelConfig 포함)가 주소·키를 바꾸지 못한다.
+_ROUTING_KWARGS = ("base_url", "api_base", "openai_api_base", "api_key", "openai_api_key")
+
+
+def _drop_routing_overrides(kwargs: dict[str, Any]) -> None:
+    for name in _ROUTING_KWARGS:
+        kwargs.pop(name, None)
+
+
 def create_llm(
     model: Optional[str] = None,
     streaming: bool = False,
@@ -74,8 +83,9 @@ def create_llm(
 
     resolved_model = (model or "").strip() or get_llm_model()
 
-    base_url = kwargs.pop("base_url", None) or _proxy_base_url()
-    api_key = kwargs.pop("api_key", None) or _proxy_api_key()
+    _drop_routing_overrides(kwargs)
+    base_url = _proxy_base_url()
+    api_key = _proxy_api_key()
 
     return ChatOpenAI(
         model=resolved_model,
@@ -116,8 +126,9 @@ def create_embedding(
             "or at least `LLM_MODEL`."
         )
 
-    base_url = kwargs.pop("base_url", None) or _proxy_base_url()
-    api_key = kwargs.pop("api_key", None) or _proxy_api_key()
+    _drop_routing_overrides(kwargs)
+    base_url = _proxy_base_url()
+    api_key = _proxy_api_key()
 
     # Some setups require `deployment`; for LiteLLM OpenAI-compatible API,
     # passing the same model value is typically sufficient.
