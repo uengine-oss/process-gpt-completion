@@ -72,6 +72,7 @@ app.add_middleware(
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from database import update_tenant_id
+from tenant_resolver import resolve_tenant_id
 
 class StripPathPrefixMiddleware:
     def __init__(self, app: FastAPI, prefix: str = ""):
@@ -100,14 +101,7 @@ class StripPathPrefixMiddleware:
 
 class DBConfigMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        host_name = request.headers.get("X-Forwarded-Host")
-        if DEFAULT_TENANT_ID:
-            tenant_id = DEFAULT_TENANT_ID
-        elif host_name is None or "localhost" in host_name:
-            tenant_id = "localhost"
-        else:
-            tenant_id = host_name.split(".")[0]
-        await update_tenant_id(tenant_id)
+        await update_tenant_id(resolve_tenant_id(request.headers, DEFAULT_TENANT_ID))
         # 요청을 다음 미들웨어 또는 엔드포인트로 전달
         response = await call_next(request)
         return response
